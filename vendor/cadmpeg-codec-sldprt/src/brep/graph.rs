@@ -1,0 +1,11533 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Build IR arenas from parsed Parasolid topology records and carriers.
+//!
+//! The graph builder walks each face bridge through its loop and coedge rings,
+//! resolves edge and vertex uses, closes emitted loops, and groups faces under
+//! explicit body records. It derives one body hierarchy when those records are
+//! absent. It also derives supported pcurves and periodic seams.
+
+use cadmpeg_ir::features::FinitePoint3;
+use cadmpeg_ir::math::Point3;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+
+use cadmpeg_core::convert::f64_from_index;
+use cadmpeg_core::decode::{index_from_u32, u64_from_index, DecodeContext};
+use cadmpeg_ir::annotations::{AnnotationBuilder, Annotations, StreamHandle};
+use cadmpeg_ir::eval::{
+    analytic_surface_parameters, nurbs_curve_parameter_domain, nurbs_pcurve_uv,
+    nurbs_surface_isocurve,
+};
+use cadmpeg_ir::geometry::{
+    nurbs::SurfaceParameterAxis,
+    pcurve::{Pcurve, PcurveGeometry, PcurveNurbs, PolarPcurveNurbs},
+    BlendCrossSection, BlendRadiusLaw, BlendSupport, Curve, CurveGeometry, IntcurveSupportContext,
+    IntcurveSupportSide, ProceduralCurve, ProceduralCurveDefinition, ProceduralSurface,
+    ProceduralSurfaceDefinition, SolvedCurveGeometry, SolvedSurfaceGeometry, Surface,
+    SurfaceCurveFamily, SurfaceGeometry,
+};
+use cadmpeg_ir::ids::{
+    BodyId, CoedgeId, CurveId, EdgeId, FaceId, LoopId, PcurveId, PointId, ProceduralCurveId,
+    ProceduralSurfaceId, RegionId, ShellId, SurfaceId, VertexId,
+};
+use cadmpeg_ir::topology::{
+    Body, BodyKind, Coedge, Edge, Face, Loop, Point, Region, Sense, Shell, Vertex,
+};
+use cadmpeg_ir::unknown::UnknownRecord;
+use cadmpeg_ir::Exactness;
+
+use super::attrib;
+use super::blend::BlendSupportRef;
+use super::blend_surface;
+use super::entity;
+use super::evaluation::{
+    nurbs_surface_parameter_segment_chord_bound, nurbs_surface_parameter_within_tolerance,
+};
+use super::index::{
+    index_carriers_with_nodes, scan_carriers_for_role, CarrierIndex, IndexedCurve, NodeCarriers,
+};
+use super::offset::OffsetCarrier;
+use super::sweep::{self, SweepKind};
+use super::topology;
+use super::typed;
+use super::typed::RegionKind;
+use super::{CurveCarrier, LEN_TO_MM};
+use crate::parasolid::StreamHeader;
+
+const EPS_NORMAL_NONZERO: f64 = 1.0e-12;
+const EPS_PLANAR_DISTANCE: f64 = 1.0e-6;
+const EPS_GEOMETRY_RESIDUAL: f64 = 1.0e-9;
+const EPS_AXIS_ALIGNMENT: f64 = 1.0e-9;
+const EPS_CIRCLE_RADIUS_MATCH: f64 = 1.0e-6;
+const EPS_RADIUS_ABSOLUTE: f64 = 1.0e-6;
+const EPS_RADIUS_RELATIVE: f64 = 1.0e-9;
+const EPS_NURBS_WEIGHT: f64 = 1.0e-12;
+const EPS_POINT_DISTANCE: f64 = 1.0e-12;
+const EPS_SWEEP_EXTENT_ABSOLUTE_MM: f64 = 1.0e-6;
+const EPS_SWEEP_EXTENT_RELATIVE: f64 = 1.0e-3;
+
+/// Decoded B-rep arenas, provenance, and transfer statistics.
+#[derive(Default)]
+pub(crate) struct Brep {
+    pub(crate) approximations: super::approximation::ApproximationCounts,
+    /// Source locations for decoded entities.
+    pub(crate) annotations: Annotations,
+    /// Top-level solid or sheet bodies.
+    pub(crate) bodies: Vec<Body>,
+    /// Solid regions / sheet regions owned by each body.
+    pub(crate) regions: Vec<Region>,
+    /// Shells owned by each region.
+    pub(crate) shells: Vec<Shell>,
+    /// Faces reached through face-use bridge records.
+    pub(crate) faces: Vec<Face>,
+    /// Loops reached through `00 0f` loop heads.
+    pub(crate) loops: Vec<Loop>,
+    /// Source loops represented by a joined periodic seam loop.
+    pub(crate) merged_source_loops: HashSet<LoopId>,
+    /// Coedges in loop-ring order.
+    pub(crate) coedges: Vec<Coedge>,
+    /// Edges resolved from edge-use records.
+    pub(crate) edges: Vec<Edge>,
+    /// Vertices resolved from vertex-use and world-point records.
+    pub(crate) vertices: Vec<Vertex>,
+    /// World points converted to millimetres.
+    pub(crate) points: Vec<Point>,
+    /// Analytic, NURBS, or opaque support surfaces.
+    pub(crate) surfaces: Vec<Surface>,
+    /// Exact procedural constructions behind emitted support surfaces.
+    pub(crate) procedural_surfaces: Vec<ProceduralSurface>,
+    /// Analytic, NURBS, or opaque support curves.
+    pub(crate) curves: Vec<Curve>,
+    /// Parametric constructions behind emitted surface-parameter curves.
+    pub(crate) procedural_curves: Vec<ProceduralCurve>,
+    /// Pcurves derived for supported analytic and NURBS-boundary cases.
+    pub(crate) pcurves: Vec<Pcurve>,
+    /// Records whose carrier kind this codec does not type, retained as
+    /// opaque payloads.
+    pub(crate) unknowns: Vec<UnknownRecord>,
+    /// Per-face RGB colors resolved from native entity records.
+    pub(crate) face_colors: Vec<OwnedFaceColor>,
+    /// Per-face producing-feature identities resolved from Parasolid attributes.
+    pub(crate) face_atoms: Vec<attrib::FaceAtom>,
+    pub(crate) native_face_identities: Vec<attrib::NativeIdentity<FaceId>>,
+    /// Per-face `DisplayLists` table keys resolved from Parasolid attributes.
+    pub(crate) face_keys: Vec<(FaceId, u32)>,
+    pub(crate) native_body_identities: Vec<attrib::NativeIdentity<BodyId>>,
+    /// Source-local sequence-to-attribute links carried by face bridge
+    /// records. The decode boundary retains this map only for the active
+    /// source because SWIFT identifiers resolve in that source namespace.
+    pub(crate) face_bridge_sequences: Vec<(u32, u32)>,
+    /// Source-local sequence-to-attribute links carried by edge-use records.
+    /// The decode boundary retains this map only for the active source because
+    /// SWIFT identifiers resolve in that source namespace.
+    pub(crate) edge_use_sequences: Vec<(u32, u32)>,
+    /// Source-local sequence-to-attribute links carried by vertex-use records.
+    /// The decode boundary retains this map only for the active source because
+    /// SWIFT identifiers resolve in that source namespace.
+    pub(crate) vertex_use_sequences: Vec<(u32, u32)>,
+    /// Body-to-history ordinals resolved from Parasolid attributes.
+    pub(crate) body_modifiers: Vec<attrib::BodyModifier>,
+    /// Refusals charged while building this B-rep, each naming the instance
+    /// whose lane the reader refused. The model carries the absence of each
+    /// refused carrier, so the decode continues and reports the loss.
+    pub(crate) losses: Vec<cadmpeg_ir::report::loss::LossNote>,
+    /// Loss accounting for this decode.
+    pub(crate) stats: Stats,
+}
+
+/// A resolved face color retains the stream that admitted its source row.
+///
+/// Alternate configuration sites are merged into one B-rep, so the selected
+/// site cannot serve as a provenance owner for every color row.
+#[derive(Debug, Clone)]
+pub(crate) struct OwnedFaceColor {
+    pub(crate) value: entity::FaceColor,
+    pub(crate) source_stream: cadmpeg_ir::StreamName,
+    /// Site qualifier applied when this color came from an unselected site.
+    /// A color attribute is only site-local, so an unbound color still needs
+    /// this qualifier after alternate sites are merged.
+    pub(crate) site_key: Option<String>,
+}
+
+impl Brep {
+    pub(crate) fn neutral_entity_count(&self) -> Result<u64, cadmpeg_core::CodecError> {
+        let counts = [
+            self.bodies.len(),
+            self.regions.len(),
+            self.shells.len(),
+            self.faces.len(),
+            self.loops.len(),
+            self.coedges.len(),
+            self.edges.len(),
+            self.vertices.len(),
+            self.points.len(),
+            self.surfaces.len(),
+            self.procedural_surfaces.len(),
+            self.curves.len(),
+            self.procedural_curves.len(),
+            self.pcurves.len(),
+        ];
+        let total = counts.into_iter().try_fold(0_usize, |total, count| {
+            total.checked_add(count).ok_or_else(|| {
+                cadmpeg_core::CodecError::NotImplemented(
+                    "SLDPRT B-rep entity count exceeds usize".into(),
+                )
+            })
+        })?;
+        u64::try_from(total).map_err(|_| {
+            cadmpeg_core::CodecError::NotImplemented("SLDPRT B-rep entity count exceeds u64".into())
+        })
+    }
+
+    /// Qualify every document-arena identity and internal reference by one site key.
+    pub(crate) fn qualify_ids(&mut self, site: &str) -> Result<(), cadmpeg_core::CodecError> {
+        // The site qualifier is admitted once, here, as a key tail. Appending
+        // an admitted tail to an admitted key cannot leave the grammar, so no
+        // identity below is rebuilt from text.
+        let tail =
+            cadmpeg_ir::ids::IdentityKeyTail::try_new(format!("@{site}")).map_err(|error| {
+                cadmpeg_core::CodecError::malformed(format_args!(
+                    "SLDPRT site qualifier is not identity key text: {error}"
+                ))
+            })?;
+        for body in &mut self.bodies {
+            body.id = qualified(&body.id, &tail)?;
+            for id in &mut body.regions {
+                *id = qualified(id, &tail)?;
+            }
+        }
+        for region in &mut self.regions {
+            region.id = qualified(&region.id, &tail)?;
+            region.body = qualified(&region.body, &tail)?;
+            for id in &mut region.shells {
+                *id = qualified(id, &tail)?;
+            }
+        }
+        for shell in &mut self.shells {
+            let id = qualified(&shell.id, &tail)?;
+            let region = qualified(&shell.region, &tail)?;
+            let faces = qualified_ids(shell.faces(), &tail)?;
+            let wire_edges = qualified_ids(shell.wire_edges(), &tail)?;
+            let free_vertices = qualified_ids(shell.free_vertices(), &tail)?;
+            *shell = Shell::new(id, region, faces, wire_edges, free_vertices).map_err(|error| {
+                cadmpeg_core::CodecError::malformed(format_args!(
+                    "qualified shell topology is invalid: {error}"
+                ))
+            })?;
+        }
+        for face in &mut self.faces {
+            face.id = qualified(&face.id, &tail)?;
+            face.shell = qualified(&face.shell, &tail)?;
+            face.surface = qualified(&face.surface, &tail)?;
+            face.loops = match &face.loops {
+                cadmpeg_ir::topology::FaceLoops::Unspecified { loops } => {
+                    cadmpeg_ir::topology::FaceLoops::unspecified(qualified_ids(loops, &tail)?)
+                }
+                cadmpeg_ir::topology::FaceLoops::Classified { outer, inner } => {
+                    cadmpeg_ir::topology::FaceLoops::classified(
+                        qualified(outer, &tail)?,
+                        qualified_ids(inner, &tail)?,
+                    )
+                }
+            };
+        }
+        for loop_ in &mut self.loops {
+            loop_.id = qualified(&loop_.id, &tail)?;
+            loop_.face = qualified(&loop_.face, &tail)?;
+            match &mut loop_.boundary {
+                cadmpeg_ir::topology::LoopBoundary::Vertex { vertex, pcurves } => {
+                    *vertex = qualified(vertex, &tail)?;
+                    for pcurve in pcurves {
+                        pcurve.pcurve = qualified(&pcurve.pcurve, &tail)?;
+                    }
+                }
+                cadmpeg_ir::topology::LoopBoundary::Ring(ring) => {
+                    let coedges = qualified_ids(ring.coedges(), &tail)?;
+                    let mut vertex_uses = Vec::new();
+                    for vertex_use in ring.vertex_uses() {
+                        vertex_uses.push(cadmpeg_ir::topology::AnchoredVertexUse {
+                            vertex: qualified(&vertex_use.vertex, &tail)?,
+                            after: qualified(&vertex_use.after, &tail)?,
+                            pcurves: qualified_pcurve_uses(&vertex_use.pcurves, &tail)?,
+                        });
+                    }
+                    *ring = cadmpeg_ir::topology::LoopRing::new(coedges, vertex_uses).map_err(
+                        |error| {
+                            cadmpeg_core::CodecError::malformed(format_args!(
+                                "qualified loop ring is invalid: {error}"
+                            ))
+                        },
+                    )?;
+                }
+            }
+        }
+        for coedge in &mut self.coedges {
+            coedge.id = qualified(&coedge.id, &tail)?;
+            coedge.owner_loop = qualified(&coedge.owner_loop, &tail)?;
+            coedge.edge = qualified(&coedge.edge, &tail)?;
+            coedge.radial_next = qualified(&coedge.radial_next, &tail)?;
+            for use_ in &mut coedge.pcurves {
+                use_.pcurve = qualified(&use_.pcurve, &tail)?;
+            }
+        }
+        for edge in &mut self.edges {
+            edge.id = qualified(&edge.id, &tail)?;
+            if let Some(curve) = edge.curve() {
+                let curve = qualified(curve, &tail)?;
+                edge.map_curve(|_| curve);
+            }
+            edge.start = qualified(&edge.start, &tail)?;
+            edge.end = qualified(&edge.end, &tail)?;
+        }
+        for vertex in &mut self.vertices {
+            vertex.id = qualified(&vertex.id, &tail)?;
+            vertex.point = qualified(&vertex.point, &tail)?;
+        }
+        for point in &mut self.points {
+            point.id = qualified(&point.id, &tail)?;
+        }
+        for surface in &mut self.surfaces {
+            surface.id = qualified(&surface.id, &tail)?;
+            match &mut surface.geometry {
+                SurfaceGeometry::Procedural { construction, .. } => {
+                    *construction = qualified(construction, &tail)?;
+                }
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Unknown {
+                    record: Some(record),
+                }) => {
+                    *record = qualified(record, &tail)?;
+                }
+                SurfaceGeometry::Solved(_) => {}
+            }
+        }
+        for procedural in &mut self.procedural_surfaces {
+            procedural.id = qualified(&procedural.id, &tail)?;
+            procedural.edit_definition(|definition| {
+                match definition {
+                    ProceduralSurfaceDefinition::Blend(definition_payload) => {
+                        let [first, second] =
+                            definition_payload.supports().each_ref().map(|support| {
+                                support
+                                    .as_ref()
+                                    .map(|support| {
+                                        qualified(&support.surface, &tail).map(|surface| {
+                                            cadmpeg_ir::geometry::BlendSupport {
+                                                surface,
+                                                reversed: support.reversed,
+                                            }
+                                        })
+                                    })
+                                    .transpose()
+                            });
+                        let spine = definition_payload
+                            .spine()
+                            .as_ref()
+                            .map(|spine| qualified(spine, &tail))
+                            .transpose()?;
+                        definition_payload.set_supports([first?, second?]);
+                        definition_payload.set_spine(spine);
+                    }
+                    ProceduralSurfaceDefinition::Offset(definition_payload) => {
+                        definition_payload
+                            .set_support(qualified(definition_payload.support(), &tail)?);
+                    }
+                    _ => {}
+                }
+                Ok::<_, cadmpeg_core::CodecError>(())
+            })?;
+        }
+        for curve in &mut self.curves {
+            curve.id = qualified(&curve.id, &tail)?;
+            match &mut curve.geometry {
+                CurveGeometry::Solved(SolvedCurveGeometry::Unknown {
+                    record: Some(record),
+                }) => {
+                    *record = qualified(record, &tail)?;
+                }
+                CurveGeometry::Procedural { construction, .. } => {
+                    *construction = qualified(construction, &tail)?;
+                }
+                CurveGeometry::Solved(_) => {}
+            }
+        }
+        for procedural in &mut self.procedural_curves {
+            procedural.id = qualified(&procedural.id, &tail)?;
+            procedural.edit_definition(|definition| {
+                if let ProceduralCurveDefinition::SurfaceCurve {
+                    family: SurfaceCurveFamily::Parametric { context, .. },
+                } = definition
+                {
+                    for side in 0..context.sides().len() {
+                        if let Some(surface) = &context.sides()[side].surface {
+                            let surface = qualified(surface, &tail)?;
+                            context.set_surface(side, Some(surface));
+                        }
+                    }
+                }
+                Ok::<_, cadmpeg_core::CodecError>(())
+            })?;
+        }
+        for pcurve in &mut self.pcurves {
+            pcurve.id = qualified(&pcurve.id, &tail)?;
+        }
+        for record in &mut self.unknowns {
+            let id = qualified(record.id(), &tail)?;
+            record.set_id(id);
+            for link in record.links_mut() {
+                *link = qualified_reference(link, site);
+            }
+        }
+        for color in &mut self.face_colors {
+            if let Some(target) = &mut color.value.target {
+                *target = qualified_reference(target, site);
+            }
+            color.site_key = Some(site.to_owned());
+        }
+        for atom in &mut self.face_atoms {
+            atom.face = qualified(&atom.face, &tail)?;
+        }
+        for identity in &mut self.native_face_identities {
+            identity.target = qualified(&identity.target, &tail)?;
+        }
+        for (face, _) in &mut self.face_keys {
+            *face = qualified(face, &tail)?;
+        }
+        for identity in &mut self.native_body_identities {
+            identity.target = qualified(&identity.target, &tail)?;
+        }
+        for modifier in &mut self.body_modifiers {
+            if let Some(target) = &mut modifier.target {
+                *target = qualified_reference(target, site);
+            }
+        }
+        self.annotations
+            .map_ids(|value| Ok(qualified_reference(value, site)))?
+            .map_err(cadmpeg_core::CodecError::from)?;
+        Ok(())
+    }
+}
+
+fn shell_face_components(out: &Brep, native_shell_id: &str) -> Vec<Vec<FaceId>> {
+    let mut candidates = Vec::new();
+    for face in &out.faces {
+        if face.shell.as_str() == native_shell_id {
+            candidates.push(&face.id);
+        }
+    }
+    let mut candidate_ids = HashSet::new();
+    for face in &candidates {
+        let key = face.as_str();
+        candidate_ids.insert(key);
+    }
+    let mut loop_faces = HashMap::new();
+    for loop_ in &out.loops {
+        if candidate_ids.contains(loop_.face.as_str()) {
+            let key = loop_.id.as_str();
+            loop_faces.insert(key, loop_.face.as_str());
+        }
+    }
+    let mut faces_by_edge = HashMap::<&str, HashSet<&str>>::new();
+    for coedge in &out.coedges {
+        if let Some(face) = loop_faces.get(coedge.owner_loop.as_str()) {
+            let key = coedge.edge.as_str();
+            let edge_faces = faces_by_edge.entry(key).or_default();
+            edge_faces.insert(*face);
+        }
+    }
+    let mut neighbors = HashMap::<&str, HashSet<&str>>::new();
+    for edge_faces in faces_by_edge.values() {
+        for &face in edge_faces {
+            let adjacent = neighbors.entry(face).or_default();
+            for &other in edge_faces {
+                if other != face {
+                    adjacent.insert(other);
+                }
+            }
+        }
+    }
+
+    // The walk moves over borrowed keys, so the face each key names is looked
+    // up rather than rebuilt from its text.
+    let mut faces_by_key = HashMap::new();
+    for face in &candidates {
+        let key = face.as_str();
+        faces_by_key.insert(key, *face);
+    }
+    let mut assigned = HashSet::new();
+    let mut components = Vec::new();
+    for face in &candidates {
+        let key = face.as_str();
+        if !assigned.insert(key) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut pending = Vec::new();
+        pending.push(key);
+        while let Some(current) = pending.pop() {
+            let Some(face) = faces_by_key.get(current) else {
+                continue;
+            };
+            component.push((*face).clone());
+            for &neighbor in neighbors.get(current).into_iter().flatten() {
+                if assigned.insert(neighbor) {
+                    pending.push(neighbor);
+                }
+            }
+        }
+        component.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        components.push(component);
+    }
+    components
+}
+
+#[derive(Debug, Clone)]
+struct BodyRecord {
+    attr: u32,
+    kind: BodyKind,
+    refs: Vec<u32>,
+    offset: usize,
+    regions: Vec<RegionRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct RegionRecord {
+    attr: u32,
+    offset: usize,
+    shells: Vec<ShellRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellRecord {
+    attr: u32,
+    offset: usize,
+    refs: Vec<u32>,
+}
+
+/// Transfer limitations found while building a [`Brep`].
+#[derive(Default)]
+pub(crate) struct Stats {
+    /// Framed top-level model entity records across the selected stream site.
+    pub(crate) source_entity_records: usize,
+    /// Face-color bindings withheld because current records conflict.
+    pub(crate) unresolved_face_colors: usize,
+    /// Referenced POINT identities withheld because complete records conflict.
+    pub(crate) unresolved_topology_points: usize,
+    /// Referenced LOOP identities withheld because complete records conflict.
+    pub(crate) unresolved_topology_loops: usize,
+    pub(crate) unresolved_topology_fins: usize,
+    pub(crate) unresolved_topology_vertices: usize,
+    /// Canonical edges withheld when a partner FIN contradicts the ring order
+    /// or an unwalked boundary-dummy canonical lacks partner corroboration.
+    pub(crate) withheld_fin_partners: usize,
+    /// Vertexless ring edges withheld by the strict admission gate.
+    pub(crate) withheld_ring_edges: usize,
+    /// Rings withheld because a FIN forward link is not reciprocal.
+    pub(crate) withheld_fin_links: usize,
+    /// Faces withheld with their surface because no loop of the face decodes.
+    pub(crate) withheld_faces: usize,
+    /// Faces withheld with their surface because a vertex loop of the face
+    /// names no resolved vertex.
+    pub(crate) withheld_vertex_loop_faces: usize,
+    /// Faces withheld with their surface because a loop of the face holds an
+    /// ambiguous FIN.
+    pub(crate) withheld_ambiguous_fin_faces: usize,
+    /// Canonical faces that no explicit body record claims.
+    pub(crate) unclaimed_faces: usize,
+    /// Faces on a support surface this codec does not type; emitted with an
+    /// unknown-geometry carrier.
+    pub(crate) unknown_surface_faces: usize,
+    /// Hidden procedural support surfaces whose carrier geometry remains opaque.
+    pub(crate) unknown_procedural_supports: usize,
+    /// Edges whose support curve is an untyped carrier (emitted with no curve).
+    pub(crate) unknown_curve_edges: usize,
+    /// Tolerant edges emitted with no curve, because their fin geometry is not read.
+    pub(crate) tolerant_edges_without_curve: usize,
+    /// Pcurves withheld because geometric inverse selection was ambiguous.
+    pub(crate) ambiguous_pcurve_parameters: usize,
+    /// Edges left without a range because their curve's records disagree on
+    /// orientation.
+    pub(crate) marker_conflict_edges: usize,
+    /// NURBS edge carriers whose vertex range is off their bound surface.
+    pub(crate) off_surface_nurbs_pcurves: usize,
+    /// Coedges whose derived pcurve stopped at `SURFACE_SOLVER_LOCAL_WORK`.
+    pub(crate) surface_solver_capped: crate::loss::NamedCount,
+    /// No explicit body record was available, so one body hierarchy was derived.
+    pub(crate) synthetic_body_grouping: bool,
+}
+
+/// The `sldprt:brep` shell namespace, which three routes mint under.
+fn shell_namespace() -> cadmpeg_ir::ids::IdentityNamespace {
+    cadmpeg_ir::identity_namespace!("sldprt", "brep", "shell")
+}
+
+/// The `sldprt:brep` region namespace.
+fn region_namespace() -> cadmpeg_ir::ids::IdentityNamespace {
+    cadmpeg_ir::identity_namespace!("sldprt", "brep", "region")
+}
+
+/// The `sldprt:brep` body namespace.
+fn body_namespace() -> cadmpeg_ir::ids::IdentityNamespace {
+    cadmpeg_ir::identity_namespace!("sldprt", "brep", "body")
+}
+
+/// The `sldprt:brep` pcurve namespace.
+fn pcurve_namespace() -> cadmpeg_ir::ids::IdentityNamespace {
+    cadmpeg_ir::identity_namespace!("sldprt", "brep", "pcurve")
+}
+
+/// The component split of one native shell: `<shell>.component-<ordinal>`.
+fn shell_component(shell: &ShellId, component: usize) -> Result<ShellId, cadmpeg_core::CodecError> {
+    let text = format!("{shell}.component-{component}");
+    ShellId::mint(text).map_err(cadmpeg_core::CodecError::malformed)
+}
+
+/// Append the site qualifier to one typed identity's key.
+///
+/// The admitted tail preserves the key grammar.
+fn qualified<T>(
+    id: &T,
+    site: &cadmpeg_ir::ids::IdentityKeyTail,
+) -> Result<T, cadmpeg_core::CodecError>
+where
+    T: std::fmt::Display + From<cadmpeg_ir::ids::Identity>,
+{
+    let text = format!("{id}{}", site.as_str());
+    let identity =
+        cadmpeg_ir::ids::Identity::new(text).map_err(cadmpeg_core::CodecError::malformed)?;
+    Ok(T::from(identity))
+}
+
+fn qualified_ids<T>(
+    ids: &[T],
+    site: &cadmpeg_ir::ids::IdentityKeyTail,
+) -> Result<Vec<T>, cadmpeg_core::CodecError>
+where
+    T: std::fmt::Display + From<cadmpeg_ir::ids::Identity>,
+{
+    let mut qualified_ids = Vec::new();
+    for id in ids {
+        qualified_ids.push(qualified(id, site)?);
+    }
+    Ok(qualified_ids)
+}
+
+fn qualified_pcurve_uses(
+    uses: &[cadmpeg_ir::topology::PcurveUse],
+    site: &cadmpeg_ir::ids::IdentityKeyTail,
+) -> Result<Vec<cadmpeg_ir::topology::PcurveUse>, cadmpeg_core::CodecError> {
+    let mut qualified_uses = Vec::new();
+    for use_ in uses {
+        qualified_uses.push(cadmpeg_ir::topology::PcurveUse {
+            pcurve: qualified(&use_.pcurve, site)?,
+            isoparametric: use_.isoparametric,
+            parameter_range: use_.parameter_range,
+        });
+    }
+    Ok(qualified_uses)
+}
+
+fn qualified_reference(value: &str, site: &str) -> String {
+    if value.contains('#') {
+        format!("{value}@{site}")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn id_face(a: u32) -> FaceId {
+    FaceId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "face"),
+        a,
+    )
+}
+fn id_surf(a: u32) -> SurfaceId {
+    SurfaceId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "surf"),
+        a,
+    )
+}
+fn id_loop(a: u32) -> LoopId {
+    LoopId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "loop"),
+        a,
+    )
+}
+fn id_coedge(a: u32) -> CoedgeId {
+    CoedgeId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "coedge"),
+        a,
+    )
+}
+fn id_edge(a: u32) -> EdgeId {
+    EdgeId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "edge"),
+        a,
+    )
+}
+fn id_curve(a: u32) -> CurveId {
+    CurveId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "curve"),
+        a,
+    )
+}
+fn id_vertex(a: u32) -> VertexId {
+    VertexId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "vertex"),
+        a,
+    )
+}
+fn id_point(a: u32) -> PointId {
+    PointId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "point"),
+        a,
+    )
+}
+fn id_closed_point(edge: u32) -> PointId {
+    PointId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "point"),
+        cadmpeg_ir::identity_key!("closed-circle-").then(edge),
+    )
+}
+fn id_closed_vertex(edge: u32) -> VertexId {
+    VertexId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "vertex"),
+        cadmpeg_ir::identity_key!("closed-circle-").then(edge),
+    )
+}
+
+/// One face-use's decoded loops: ordered coedge rings, keyed by loop attr.
+#[derive(Clone, PartialEq, Eq)]
+struct WalkedFace {
+    bridge_attr: u32,
+    surface_attr: u32,
+    sense: Sense,
+    /// `(loop_attr, ordered_coedge_attrs)` in sibling order.
+    loops: Vec<(u32, Vec<u32>)>,
+    /// `(loop_attr, vertex_use_attr)` of each vertex loop, in sibling order.
+    vertex_loops: Vec<(u32, u32)>,
+    unresolved_loop: Option<u32>,
+    unresolved_fins: Vec<u32>,
+    withheld_forward_links: usize,
+    /// Walked loops that are not forward linked.
+    unlinked_loops: HashSet<u32>,
+}
+
+impl WalkedFace {
+    /// The attrs of the ring loops, then of the vertex loops.
+    fn loop_attrs(&self) -> impl Iterator<Item = u32> + '_ {
+        self.loops
+            .iter()
+            .map(|(attr, _)| *attr)
+            .chain(self.vertex_loops.iter().map(|(attr, _)| *attr))
+    }
+}
+
+/// Resolve a face whose `refs[4]` carrier is a swept/spun construction to a
+/// solved NURBS patch. Returns `(geometry, record offset, annotation tag,
+/// derived exactness)`. A spun surface is exact for an exact profile; a swept
+/// surface patch is derived because its ruling extent comes from the face's
+/// vertex points rather than a stored interval.
+struct SweepSurfaceResolution {
+    geometry: SolvedSurfaceGeometry,
+    offset: usize,
+    tag: &'static str,
+    exactness: Option<Exactness>,
+}
+
+/// The solved geometry of one blend support.
+///
+/// A support face later in the walk has not emitted its surface yet, so this
+/// reads what the support's own record states. A swept or spun support states
+/// its ruling extent through the face it carries. `None` when the record
+/// states no solved surface, or no face carries the sweep.
+fn blend_support_geometry<'a>(
+    ctx: &DecodeContext<'_>,
+    carriers: &'a CarrierIndex,
+    tables: &topology::Tables,
+    faces: &[WalkedFace],
+    emitted_face_surface_by_carrier: &HashMap<u32, u32>,
+    attr: u32,
+) -> Result<Option<Cow<'a, SolvedSurfaceGeometry>>, cadmpeg_core::CodecError> {
+    if let Some(carrier) = carriers.surface(attr) {
+        return Ok(carrier.geometry.solved().map(Cow::Borrowed));
+    }
+    let face = emitted_face_surface_by_carrier
+        .get(&attr)
+        .and_then(|bridge| faces.iter().find(|face| face.bridge_attr == *bridge));
+    let Some(face) = face else {
+        return Ok(None);
+    };
+    // The face that carries the sweep reports its own refusal when it emits.
+    let mut refusal = crate::lane_refusal::LaneRefusals::new();
+    let resolved =
+        resolve_sweep_surface(ctx, carriers, tables, face, &mut refusal, &mut Vec::new())?;
+    Ok(resolved.map(|sweep| Cow::Owned(sweep.geometry)))
+}
+
+fn resolve_sweep_surface(
+    ctx: &DecodeContext<'_>,
+    carriers: &CarrierIndex,
+    tables: &topology::Tables,
+    face: &WalkedFace,
+    refusal: &mut crate::lane_refusal::LaneRefusals,
+    losses: &mut Vec<cadmpeg_ir::report::loss::LossNote>,
+) -> Result<Option<SweepSurfaceResolution>, cadmpeg_core::CodecError> {
+    let Some(construction) = carriers.sweep(face.surface_attr) else {
+        return Ok(None);
+    };
+    let Some(profile) = carriers.curve(construction.profile_attr) else {
+        return Ok(None);
+    };
+    let record = format!(
+        "sldprt sweep construction at byte {} for surface attr {}",
+        construction.offset, face.surface_attr
+    );
+    let mut profile_range = profile
+        .carrier()
+        .parameter_range
+        .map(cadmpeg_ir::units::FiniteVector::get);
+    if let SweepKind::Spun { profile_bounds, .. } = &construction.kind {
+        profile_range = sweep::stored_conic_interval(&profile.carrier().geometry, *profile_bounds);
+        if let [Some(low), Some(high)] = profile_bounds {
+            if profile_range.is_none()
+                && matches!(
+                    profile.carrier().geometry.solved(),
+                    Some(SolvedCurveGeometry::Circle(_) | SolvedCurveGeometry::Ellipse(_))
+                )
+            {
+                losses.push(crate::loss::SldprtLossCode::GeometrySpunProfileIntervalIgnored.note(
+                    format!("{record}: ignored stored profile interval [{low}, {high}]; revolve the whole profile"),
+                ));
+            }
+        }
+    }
+    let Some(curve) =
+        sweep::profile_nurbs(&profile.carrier().geometry, profile_range, &record, refusal)
+    else {
+        return Ok(None);
+    };
+    let profile_derived = matches!(profile, IndexedCurve::Derived(_));
+    let profile_knots = curve.knots().as_slice().len();
+    match &construction.kind {
+        SweepKind::Spun { base, axis, .. } => {
+            retain_surface_bytes(
+                ctx,
+                nurbs_surface_bytes(
+                    curve.pole_count(),
+                    sweep::SPUN_RING_POLES,
+                    profile_knots + sweep::SPUN_RING_KNOTS,
+                ),
+                "retain Parasolid spun surface",
+            )?;
+            Ok(
+                sweep::spun_nurbs(&curve, *base, *axis, &record, refusal).map(|surface| {
+                    SweepSurfaceResolution {
+                        geometry: SolvedSurfaceGeometry::Nurbs(surface),
+                        offset: construction.offset,
+                        tag: "00_44",
+                        exactness: profile_derived.then_some(Exactness::Derived),
+                    }
+                }),
+            )
+        }
+        SweepKind::Swept { direction } => {
+            let unit_direction = *direction;
+            let direction = direction.as_raw();
+            // Ruling extent: face vertex travel bracketed by the profile poles'
+            // own travel along the sweep direction, in millimetres.
+            let project = |p: &cadmpeg_ir::math::Point3| {
+                p.x * direction.x + p.y * direction.y + p.z * direction.z
+            };
+            let mut point_lo = f64::INFINITY;
+            let mut point_hi = f64::NEG_INFINITY;
+            for (_, ring) in &face.loops {
+                for ce_attr in ring {
+                    let Some(vuse) = tables.coedges().get(ce_attr).map(|ce| ce.refs[4]) else {
+                        continue;
+                    };
+                    let Some(coordinates) = tables
+                        .vertex_uses()
+                        .get(&vuse)
+                        .map(|vu| vu.refs[4])
+                        .and_then(|pa| tables.points().get(&pa))
+                        .map(|p| p.xyz_m)
+                    else {
+                        if let Some([low, high]) = tables
+                            .coedges()
+                            .get(ce_attr)
+                            .and_then(|fin| tables.edge_uses().get(&fin.refs[6]))
+                            .and_then(|edge| carriers.curve(edge.references.curve()))
+                            .and_then(|curve| {
+                                sweep::curve_projection_bounds(
+                                    &curve.carrier().geometry,
+                                    *direction,
+                                )
+                            })
+                        {
+                            point_lo = point_lo.min(low);
+                            point_hi = point_hi.max(high);
+                        }
+                        continue;
+                    };
+                    let travel = coordinates[0] * LEN_TO_MM * direction.x
+                        + coordinates[1] * LEN_TO_MM * direction.y
+                        + coordinates[2] * LEN_TO_MM * direction.z;
+                    point_lo = point_lo.min(travel);
+                    point_hi = point_hi.max(travel);
+                }
+            }
+            if point_lo > point_hi {
+                return Ok(None);
+            }
+            let mut pole_lo = f64::INFINITY;
+            let mut pole_hi = f64::NEG_INFINITY;
+            for index in 0..curve.pole_count() {
+                let point = match curve.pole_rows() {
+                    cadmpeg_ir::geometry::nurbs::NurbsPoles3::Polynomial { points } => {
+                        points[index].get()
+                    }
+                    cadmpeg_ir::geometry::nurbs::NurbsPoles3::Rational { points } => {
+                        points[index].point.get()
+                    }
+                };
+                let travel = project(&point);
+                pole_lo = pole_lo.min(travel);
+                pole_hi = pole_hi.max(travel);
+            }
+            let v_start = point_lo - pole_hi;
+            let v_end = point_hi - pole_lo;
+            // Two independently derived pads on the same swept extent: an
+            // absolute one in millimetres and one relative to the travel the
+            // poles and points state. The extent must clear both, so the
+            // looser is the pad.
+            let pad = looser_tolerance(
+                EPS_SWEEP_EXTENT_ABSOLUTE_MM,
+                (v_end - v_start) * EPS_SWEEP_EXTENT_RELATIVE,
+            );
+            retain_surface_bytes(
+                ctx,
+                nurbs_surface_bytes(
+                    curve.pole_count(),
+                    sweep::SWEPT_RULING_POLES,
+                    profile_knots + sweep::SWEPT_RULING_KNOTS,
+                ),
+                "retain Parasolid swept surface",
+            )?;
+            Ok(sweep::swept_nurbs(
+                &curve,
+                unit_direction,
+                v_start - pad,
+                v_end + pad,
+                closed_edge_start(ctx, Some(profile))?.is_some(),
+                &record,
+                refusal,
+            )
+            .map(|surface| SweepSurfaceResolution {
+                geometry: SolvedSurfaceGeometry::Nurbs(surface),
+                offset: construction.offset,
+                tag: "00_43",
+                exactness: Some(Exactness::Derived),
+            }))
+        }
+    }
+}
+
+fn id_hidden_support_surface(attr: u32) -> SurfaceId {
+    SurfaceId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "hidden-support-surf"),
+        attr,
+    )
+}
+
+fn id_offset_construction(attr: u32) -> ProceduralSurfaceId {
+    ProceduralSurfaceId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "offset-support-construction"),
+        attr,
+    )
+}
+
+struct BrepSink<'ctx, 'arena, 'out> {
+    ctx: &'ctx DecodeContext<'arena>,
+    out: &'out mut Brep,
+}
+
+fn emit_offset_surface(
+    sink: &mut BrepSink<'_, '_, '_>,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+    surface: SurfaceId,
+    construction: ProceduralSurfaceId,
+    support: SurfaceId,
+    offset: &OffsetCarrier,
+) -> Result<(), cadmpeg_core::CodecError> {
+    annotations.note(
+        surface.as_str(),
+        source_stream,
+        u64_from_index(offset.offset),
+        Some("00_3c"),
+    );
+    let payload = cadmpeg_ir::geometry::surface_payloads::OffsetSurfaceConstruction::legacy(
+        support,
+        offset.distance,
+        None,
+        None,
+        false,
+        cadmpeg_ir::geometry::LegacyExtensionFlags::Absent {},
+        None,
+    );
+    let procedural = ProceduralSurface::new(
+        construction.clone(),
+        ProceduralSurfaceDefinition::Offset(payload),
+        None,
+    );
+    admit_brep_entity(sink.ctx)?;
+    sink.out.procedural_surfaces.push(procedural);
+    let geometry = SurfaceGeometry::Procedural {
+        construction,
+        cache: None,
+    };
+    admit_brep_entity(sink.ctx)?;
+    sink.out.surfaces.push(Surface {
+        id: surface,
+        source_object: None,
+        geometry,
+    });
+    Ok(())
+}
+
+fn emit_sweep_support(
+    sink: &mut BrepSink<'_, '_, '_>,
+    attr: u32,
+    surface: SurfaceId,
+    carriers: &CarrierIndex,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<Option<SurfaceId>, cadmpeg_core::CodecError> {
+    let Some((sweep, profile)) = carriers.exact_swept_support(attr) else {
+        return Ok(None);
+    };
+    let SweepKind::Swept { direction } = &sweep.kind else {
+        return Ok(None);
+    };
+    if sink
+        .out
+        .surfaces
+        .iter()
+        .any(|candidate| candidate.id == surface)
+    {
+        return Ok(Some(surface));
+    }
+    if !sink
+        .out
+        .curves
+        .iter()
+        .any(|curve| curve.id == id_curve(profile.attr))
+    {
+        emit_curve(sink.ctx, sink.out, profile)?;
+    }
+    let directrix = id_curve(profile.attr);
+    let direction = direction.as_raw();
+    let definition = ProceduralSurfaceDefinition::LinearSweep(
+        cadmpeg_ir::geometry::surface_payloads::LinearSweepSurfaceConstruction::try_new(
+            directrix,
+            cadmpeg_ir::math::Vector3::new(
+                direction.x * LEN_TO_MM,
+                direction.y * LEN_TO_MM,
+                direction.z * LEN_TO_MM,
+            ),
+        )
+        .map_err(cadmpeg_core::CodecError::malformed)?,
+    );
+    let construction = ProceduralSurfaceId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "hidden-sweep-construction"),
+        attr,
+    );
+    annotations.note(
+        surface.as_str(),
+        source_stream,
+        u64_from_index(sweep.offset),
+        Some("procedural_support"),
+    );
+    admit_brep_entity(sink.ctx)?;
+    sink.out.procedural_surfaces.push(ProceduralSurface::new(
+        construction.clone(),
+        definition,
+        None,
+    ));
+    admit_brep_entity(sink.ctx)?;
+    sink.out.surfaces.push(Surface {
+        id: surface.clone(),
+        source_object: None,
+        geometry: SurfaceGeometry::Procedural {
+            construction,
+            cache: None,
+        },
+    });
+    Ok(Some(surface))
+}
+
+/// Whether one referenced support can be emitted without a procedural cycle.
+///
+/// An untyped reference is still a valid opaque support surface. Offset
+/// carriers recurse because a cycle cannot define a surface.
+fn support_is_acyclic(
+    ctx: &DecodeContext<'_>,
+    attr: u32,
+    carriers: &CarrierIndex,
+    resolving: &mut HashSet<u32>,
+) -> Result<bool, cadmpeg_core::CodecError> {
+    let _depth = ctx.enter_nested("check Parasolid surface support")?;
+    if !resolving.insert(attr) {
+        return Ok(false);
+    }
+    let acyclic = if carriers.surface(attr).is_some() {
+        Ok(true)
+    } else if let Some(offset) = carriers.offset(attr) {
+        support_is_acyclic(ctx, offset.support, carriers, resolving)
+    } else {
+        Ok(true)
+    };
+    resolving.remove(&attr);
+    acyclic
+}
+
+/// Resolve one carrier as a support of a procedural construction. A carrier
+/// owned by an emitted face reuses that face's surface identity. Otherwise the
+/// decoder emits a hidden analytic, NURBS, recursive offset, or opaque support
+/// surface. Offset cycles invalidate the complete construction.
+fn ensure_surface_support(
+    sink: &mut BrepSink<'_, '_, '_>,
+    attr: u32,
+    carriers: &CarrierIndex,
+    emitted_face_surface_by_carrier: &HashMap<u32, u32>,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+    resolving: &mut HashSet<u32>,
+) -> Result<Option<SurfaceId>, cadmpeg_core::CodecError> {
+    let _depth = sink.ctx.enter_nested("resolve Parasolid surface support")?;
+    if !resolving.insert(attr) {
+        return Ok(None);
+    }
+    let result = (|| -> Result<Option<SurfaceId>, cadmpeg_core::CodecError> {
+        if let Some(carrier) = carriers.surface(attr) {
+            let id = emitted_face_surface_by_carrier.get(&attr).map_or_else(
+                || id_hidden_support_surface(attr),
+                |bridge| id_surf(*bridge),
+            );
+            if !sink.out.surfaces.iter().any(|surface| surface.id == id)
+                && !emitted_face_surface_by_carrier.contains_key(&attr)
+            {
+                let geometry = retain_surface_geometry(sink.ctx, &carrier.geometry)?;
+                if let SurfaceGeometry::Solved(solved) = &geometry {
+                    match annotate_surface_frame(annotations, id.as_str(), solved) {
+                        Ok(()) => {}
+                        Err(error @ cadmpeg_core::CodecError::ResourceLimit(_)) => {
+                            return Err(error);
+                        }
+                        Err(_) => return Ok(None),
+                    }
+                }
+                annotations.note(
+                    id.as_str(),
+                    source_stream,
+                    u64_from_index(carrier.offset),
+                    Some("procedural_support"),
+                );
+                admit_brep_entity(sink.ctx)?;
+                sink.out.surfaces.push(Surface {
+                    id: id.clone(),
+                    source_object: None,
+                    geometry,
+                });
+            }
+            Ok(Some(id))
+        } else if let Some(offset) = carriers.offset(attr) {
+            let Some(support) = ensure_surface_support(
+                sink,
+                offset.support,
+                carriers,
+                emitted_face_surface_by_carrier,
+                annotations,
+                source_stream,
+                resolving,
+            )?
+            else {
+                return Ok(None);
+            };
+            let surface = emitted_face_surface_by_carrier.get(&attr).map_or_else(
+                || id_hidden_support_surface(attr),
+                |bridge| id_surf(*bridge),
+            );
+            if !emitted_face_surface_by_carrier.contains_key(&attr)
+                && !sink
+                    .out
+                    .surfaces
+                    .iter()
+                    .any(|candidate| candidate.id == surface)
+            {
+                let construction = id_offset_construction(attr);
+                emit_offset_surface(
+                    sink,
+                    annotations,
+                    source_stream,
+                    surface.clone(),
+                    construction,
+                    support,
+                    offset,
+                )?;
+            }
+            Ok(Some(surface))
+        } else {
+            if carriers.sweep(attr).is_some() {
+                if let Some(bridge) = emitted_face_surface_by_carrier.get(&attr) {
+                    return Ok(Some(id_surf(*bridge)));
+                }
+                if let Some(surface) = emit_sweep_support(
+                    sink,
+                    attr,
+                    id_hidden_support_surface(attr),
+                    carriers,
+                    annotations,
+                    source_stream,
+                )? {
+                    return Ok(Some(surface));
+                }
+            }
+            let surface = emitted_face_surface_by_carrier.get(&attr).map_or_else(
+                || id_hidden_support_surface(attr),
+                |bridge| id_surf(*bridge),
+            );
+            if !emitted_face_surface_by_carrier.contains_key(&attr)
+                && !sink
+                    .out
+                    .surfaces
+                    .iter()
+                    .any(|candidate| candidate.id == surface)
+            {
+                annotations.exactness(surface.as_str(), Exactness::Unknown);
+                sink.out.stats.unknown_procedural_supports += 1;
+                admit_brep_entity(sink.ctx)?;
+                sink.out.surfaces.push(Surface {
+                    id: surface.clone(),
+                    source_object: None,
+                    geometry: SurfaceGeometry::Solved(SolvedSurfaceGeometry::Unknown {
+                        record: None,
+                    }),
+                });
+            }
+            Ok(Some(surface))
+        }
+    })();
+    resolving.remove(&attr);
+    result
+}
+
+/// Whether a walked face enters the model with its surface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FaceAdmission {
+    Admitted,
+    VertexLoopUnresolved,
+    FinAmbiguous,
+    NoLoop,
+}
+
+fn face_admission(
+    face: &WalkedFace,
+    loop_set: &HashSet<u32>,
+    t: &topology::Tables,
+    carriers: &CarrierIndex,
+) -> FaceAdmission {
+    if face
+        .vertex_loops
+        .iter()
+        .any(|(loop_attr, _)| !loop_set.contains(loop_attr))
+    {
+        FaceAdmission::VertexLoopUnresolved
+    } else if !face.unresolved_fins.is_empty() {
+        FaceAdmission::FinAmbiguous
+    } else if face
+        .loop_attrs()
+        .any(|loop_attr| loop_set.contains(&loop_attr))
+        || covers_whole_closed_surface(face, t, carriers)
+    {
+        FaceAdmission::Admitted
+    } else {
+        FaceAdmission::NoLoop
+    }
+}
+
+fn face_has_exact_boundary(
+    face: &WalkedFace,
+    t: &topology::Tables,
+    exact_edges: &HashSet<u32>,
+) -> bool {
+    !face.loops.is_empty()
+        && face.vertex_loops.is_empty()
+        && face.unresolved_loop.is_none()
+        && face.unresolved_fins.is_empty()
+        && face.loops.iter().all(|(_, ring)| {
+            !ring.is_empty()
+                && ring.iter().all(|fin| {
+                    t.coedges()
+                        .get(fin)
+                        .is_some_and(|fin| exact_edges.contains(&fin.refs[6]))
+                })
+        })
+}
+
+fn offset_for_face<'a>(
+    face: &WalkedFace,
+    t: &topology::Tables,
+    carriers: &'a CarrierIndex,
+    exact_edges: &HashSet<u32>,
+) -> Option<&'a super::offset::OffsetCarrier> {
+    carriers.offset(face.surface_attr).filter(|offset| {
+        !offset.unchecked
+            || face_has_exact_boundary(face, t, exact_edges)
+            || covers_whole_offset(face, t, carriers)
+    })
+}
+
+fn sweep_face_can_alias(
+    ctx: &DecodeContext<'_>,
+    face: &WalkedFace,
+    t: &topology::Tables,
+    carriers: &CarrierIndex,
+    exact_edges: &HashSet<u32>,
+) -> Result<bool, cadmpeg_core::CodecError> {
+    if carriers.exact_swept_support(face.surface_attr).is_none()
+        || face_has_exact_boundary(face, t, exact_edges)
+    {
+        return Ok(true);
+    }
+    let mut refusal = crate::lane_refusal::LaneRefusals::new();
+    Ok(resolve_sweep_surface(ctx, carriers, t, face, &mut refusal, &mut Vec::new())?.is_some())
+}
+
+fn covers_whole_closed_surface(
+    face: &WalkedFace,
+    t: &topology::Tables,
+    carriers: &CarrierIndex,
+) -> bool {
+    face.loops.is_empty()
+        && t.bridges().get(&face.bridge_attr).is_some_and(|bridge| {
+            whole_closed_face(
+                bridge.refs[2],
+                carriers.surface(face.surface_attr),
+                t.has_looped_bridge_frame(face.bridge_attr),
+            ) || whole_closed_offset_face(
+                bridge.refs[2],
+                face.surface_attr,
+                carriers,
+                t.has_looped_bridge_frame(face.bridge_attr),
+            )
+        })
+        && !t.loops().values().any(|lp| lp.refs[2] == face.bridge_attr)
+}
+
+fn covers_whole_offset(face: &WalkedFace, t: &topology::Tables, carriers: &CarrierIndex) -> bool {
+    covers_whole_closed_surface(face, t, carriers)
+        && carriers.closed_offset_surface(face.surface_attr)
+}
+
+fn whole_closed_offset_face(
+    loop_attr: u32,
+    surface_attr: u32,
+    carriers: &CarrierIndex,
+    has_looped_bridge_frame: bool,
+) -> bool {
+    loop_attr <= 1 && !has_looped_bridge_frame && carriers.closed_offset_surface(surface_attr)
+}
+
+fn whole_closed_face(
+    loop_attr: u32,
+    carrier: Option<&super::SurfaceCarrier>,
+    has_looped_bridge_frame: bool,
+) -> bool {
+    loop_attr <= 1 && !has_looped_bridge_frame && loopless_surface(carrier)
+}
+
+fn loopless_surface(carrier: Option<&super::SurfaceCarrier>) -> bool {
+    carrier.is_some_and(|carrier| match &carrier.geometry {
+        SurfaceGeometry::Solved(
+            SolvedSurfaceGeometry::Sphere(_) | SolvedSurfaceGeometry::Torus(_),
+        ) => true,
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(surface)) => {
+            surface.u_periodic() && surface.v_periodic()
+        }
+        _ => false,
+    })
+}
+
+/// Follow the sibling loop-head chain of a bridge and each loop's coedge ring,
+/// returning the ordered structure with cycles guarded. A ring is walked
+/// along each coedge's `refs[3]` link. A ring whose FINs all carry a forward
+/// link is listed in forward order. Another ring is listed in traversal order.
+fn walk_face(bridge: &topology::Bridge, t: &topology::Tables) -> WalkedFace {
+    let surface_attr = bridge.refs[4];
+    let mut loops = Vec::new();
+    let mut vertex_loops = Vec::new();
+    let mut loop_ref = bridge.refs[2];
+    let mut unresolved_loop = None;
+    let mut unresolved_fins = Vec::new();
+    let mut withheld_forward_links = 0usize;
+    let mut unlinked_loops = HashSet::new();
+    let mut loop_guard = HashSet::new();
+    while loop_ref != 0 {
+        if !loop_guard.insert(loop_ref) {
+            break;
+        }
+        let Some(lp) = t.loops().get(&loop_ref) else {
+            if t.loop_is_ambiguous(loop_ref) {
+                unresolved_loop = Some(loop_ref);
+            }
+            break;
+        };
+        let owner_bridge = lp.refs[2];
+        if owner_bridge != bridge.attr {
+            break;
+        }
+        let first = lp.refs[1];
+        if let Some(fin) = t
+            .vertex_loop_fins()
+            .get(&first)
+            .filter(|fin| fin.loop_attr == loop_ref)
+        {
+            vertex_loops.push((loop_ref, fin.vertex));
+            loop_ref = lp.refs[3];
+            continue;
+        }
+        let mut ring = Vec::new();
+        let mut ce_ref = first;
+        let mut ce_guard = HashSet::new();
+        let mut ring_closed = false;
+        while ce_ref != 0 {
+            if !ce_guard.insert(ce_ref) {
+                break;
+            }
+            let Some(ce) = t.coedges().get(&ce_ref) else {
+                if t.coedge_is_ambiguous(ce_ref) {
+                    unresolved_fins.push(ce_ref);
+                }
+                break;
+            };
+            if ce.refs[1] != loop_ref {
+                break;
+            }
+            ring.push(ce_ref);
+            ce_ref = ce.refs[3];
+            if ce_ref == first {
+                ring_closed = true;
+                break;
+            }
+        }
+        if ring_closed && ring_forward_reciprocal(&ring, loop_ref, t) {
+            if ring_forward_linked(&ring, t) {
+                if let Some(rest) = ring.get_mut(1..) {
+                    rest.reverse();
+                }
+            } else {
+                unlinked_loops.insert(loop_ref);
+            }
+            loops.push((loop_ref, ring));
+        } else if ring_closed {
+            withheld_forward_links += 1;
+        }
+        loop_ref = lp.refs[3];
+    }
+    WalkedFace {
+        bridge_attr: bridge.attr,
+        surface_attr,
+        sense: bridge.sense,
+        loops,
+        vertex_loops,
+        unresolved_loop,
+        unresolved_fins,
+        withheld_forward_links,
+        unlinked_loops,
+    }
+}
+
+/// Whether every FIN of a ring carries a forward link.
+fn ring_forward_linked(ring: &[u32], t: &topology::Tables) -> bool {
+    ring.iter()
+        .all(|ce_attr| t.coedges().get(ce_attr).is_some_and(|ce| ce.refs[2] > 1))
+}
+
+fn closed_edge_start(
+    ctx: &DecodeContext<'_>,
+    curve: Option<&IndexedCurve>,
+) -> Result<Option<(cadmpeg_ir::math::Point3, [f64; 2])>, cadmpeg_core::CodecError> {
+    let Some(carrier) = curve.map(IndexedCurve::carrier) else {
+        return Ok(None);
+    };
+    let Some(geometry) = carrier.geometry.solved() else {
+        return Ok(None);
+    };
+    let Some(domain) = geometry.closed_traversal_range() else {
+        return Ok(None);
+    };
+    let domain = domain.endpoints();
+    let [low, high] = carrier
+        .parameter_range
+        .map_or(domain, cadmpeg_ir::units::FiniteVector::get);
+    if carrier.parameter_range.is_some() {
+        let full = match geometry {
+            SolvedCurveGeometry::Circle(_) | SolvedCurveGeometry::Ellipse(_) => {
+                high > low && high - low == domain[1] - domain[0]
+            }
+            _ => [low, high] == domain,
+        };
+        if !full {
+            return Ok(None);
+        }
+    }
+    let Some(first) = super::evaluation::curve_point(ctx, &carrier.geometry, low)? else {
+        return Ok(None);
+    };
+    if !matches!(
+        geometry,
+        SolvedCurveGeometry::Circle(_) | SolvedCurveGeometry::Ellipse(_)
+    ) {
+        let Some(last) = super::evaluation::curve_point(ctx, &carrier.geometry, high)? else {
+            return Ok(None);
+        };
+        if !cadmpeg_ir::eval::curve_endpoints_coincident([first.get(), last.get()], 0.0) {
+            return Ok(None);
+        }
+    }
+    Ok(Some((first.get(), [low, high])))
+}
+
+/// The model positions of the vertices a walked face's coedges start at.
+/// Share of the ball radius a fitted blend cache may miss a face vertex by;
+/// a larger miss is another branch of the rolling ball.
+const BLEND_VERTEX_MISS_RADIUS_FRACTION: f64 = 0.25;
+
+fn face_vertex_positions(t: &topology::Tables, face: &WalkedFace) -> Vec<cadmpeg_ir::math::Point3> {
+    let mut positions = Vec::new();
+    for (_, ring) in &face.loops {
+        for coedge in ring {
+            let Some(point) = t
+                .coedges()
+                .get(coedge)
+                .and_then(|coedge| t.vertex_uses().get(&coedge.refs[4]))
+                .and_then(|vertex_use| t.points().get(&vertex_use.refs[4]))
+            else {
+                continue;
+            };
+            let [x, y, z] = point.xyz_m;
+            positions.push(cadmpeg_ir::math::Point3::new(
+                x * LEN_TO_MM,
+                y * LEN_TO_MM,
+                z * LEN_TO_MM,
+            ));
+        }
+    }
+    positions
+}
+
+/// The angle of `point` on a circle or ellipse carrier in `[0, 2π)`, when
+/// `point` lies within `allowance` of the carrier.
+fn carrier_angle(
+    geometry: &CurveGeometry,
+    point: cadmpeg_ir::math::Point3,
+    allowance: f64,
+) -> Option<f64> {
+    let (center, frame, major, minor) = match geometry {
+        CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle)) => (
+            circle.center().get(),
+            circle.frame(),
+            circle.radius().get(),
+            circle.radius().get(),
+        ),
+        CurveGeometry::Solved(SolvedCurveGeometry::Ellipse(ellipse)) => (
+            ellipse.center().get(),
+            ellipse.frame(),
+            ellipse.major_radius().get(),
+            ellipse.minor_radius().get(),
+        ),
+        _ => return None,
+    };
+    let reference = *frame.reference().as_raw();
+    let binormal = *frame.binormal().as_raw();
+    let offset = point.vector_from(center);
+    let x = offset.dot(reference) / major;
+    let y = offset.dot(binormal) / minor;
+    let radius = x.hypot(y);
+    if radius.is_nan() || radius <= 0.0 {
+        return None;
+    }
+    let nearest = center
+        .translated(reference, major * x / radius)
+        .translated(binormal, minor * y / radius);
+    (point.distance(nearest) <= allowance).then(|| periodic_phase([y.atan2(x); 2])[0])
+}
+
+/// The range of a compact circle or ellipse edge from its vertex angles and
+/// marker (spec §7.2), and whether the marker reverses it. `allowances` bound
+/// how far each vertex may lie off the carrier.
+fn conic_edge_range(
+    geometry: &CurveGeometry,
+    marker_reversed: bool,
+    [start, end]: [cadmpeg_ir::math::Point3; 2],
+    allowances: [f64; 2],
+    closed: bool,
+) -> Option<([f64; 2], bool)> {
+    let tau = std::f64::consts::TAU;
+    let (start_angle, end_angle) = (
+        carrier_angle(geometry, start, allowances[0])?,
+        carrier_angle(geometry, end, allowances[1])?,
+    );
+    if closed {
+        return Some(([start_angle, start_angle + tau], marker_reversed));
+    }
+    if start.distance(end) <= LINEAR_RESOLUTION_MM {
+        return None;
+    }
+    Some(if marker_reversed {
+        (
+            [
+                end_angle,
+                end_angle + (start_angle - end_angle).rem_euclid(tau),
+            ],
+            true,
+        )
+    } else {
+        (
+            [
+                start_angle,
+                start_angle + (end_angle - start_angle).rem_euclid(tau),
+            ],
+            false,
+        )
+    })
+}
+
+/// The range of an edge carried directly by a chart (spec §7.3), whether it
+/// reverses, and the larger vertex distance from the chart.
+fn chart_edge_range(
+    ctx: &DecodeContext<'_>,
+    chart: &super::intersection::IntersectionCarrier,
+    endpoints: [cadmpeg_ir::math::Point3; 2],
+    allowance: f64,
+) -> Result<Option<([f64; 2], bool, f64)>, cadmpeg_core::CodecError> {
+    let geometry = &chart.carrier.geometry;
+    let CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(nurbs)) = geometry else {
+        return Ok(None);
+    };
+    let cadmpeg_ir::geometry::nurbs::NurbsPoles3::Polynomial { points } = nurbs.pole_rows() else {
+        return Ok(None);
+    };
+    let closed = matches!(
+        (points.first(), points.last()),
+        (Some(first), Some(last)) if first.get() == last.get()
+    );
+    let Some(domain) = nurbs_curve_parameter_domain(nurbs) else {
+        return Ok(None);
+    };
+    let [low, high] = domain.endpoints();
+    let mut breaks: Vec<f64> = nurbs.knots().as_slice().to_vec();
+    breaks.retain(|knot| (low..=high).contains(knot));
+    breaks.dedup();
+    let Some(samples) = f64_from_index(NURBS_CACHE_SAMPLES_PER_SPAN) else {
+        return Ok(None);
+    };
+    let mut parameters = [0.0; 2];
+    let mut gap: f64 = 0.0;
+    for (slot, target) in endpoints.into_iter().enumerate() {
+        let mut distance = |parameter: f64| {
+            super::evaluation::curve_point(ctx, geometry, parameter)
+                .map(|point| point.map(|point| point.get().distance(target)))
+        };
+        // The closest approach of each span, in span order.
+        let mut spans = Vec::with_capacity(breaks.len());
+        for pair in breaks.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let step = (b - a) / samples;
+            let mut nearest = (f64::INFINITY, a);
+            for index in 0..=NURBS_CACHE_SAMPLES_PER_SPAN {
+                let Some(position) = f64_from_index(index) else {
+                    return Ok(None);
+                };
+                let parameter = a + step * position;
+                if let Some(sampled) = distance(parameter)? {
+                    if sampled < nearest.0 {
+                        nearest = (sampled, parameter);
+                    }
+                }
+            }
+            let bracket = [(nearest.1 - step).max(a), (nearest.1 + step).min(b)];
+            spans.push(
+                golden_section_minimum(bracket[0], bracket[1], &mut distance)?
+                    .filter(|&(_, refined)| refined <= nearest.0)
+                    .map_or((nearest.1, nearest.0), |found| found),
+            );
+        }
+        let within = spans
+            .iter()
+            .map(|&(_, span_gap)| span_gap <= allowance)
+            .collect::<Vec<_>>();
+        let starts = (0..within.len())
+            .filter(|&index| within[index] && (index == 0 || !within[index - 1]))
+            .count();
+        let wraps = closed && within.len() > 1 && within[0] && within[within.len() - 1];
+        let runs = if wraps && starts > 1 {
+            starts - 1
+        } else {
+            starts
+        };
+        if runs != 1 {
+            return Ok(None);
+        }
+        let Some((nearest, &(parameter, span_gap))) = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, &(_, span_gap))| span_gap <= allowance)
+            .min_by(|left, right| left.1 .1.total_cmp(&right.1 .1))
+        else {
+            return Ok(None);
+        };
+        // At the seam of a closed chart the vertex has two parameters.
+        if wraps && starts > 1 && (nearest == 0 || nearest + 1 == spans.len()) {
+            return Ok(None);
+        }
+        parameters[slot] = parameter;
+        gap = gap.max(span_gap);
+    }
+    let [start, end] = parameters;
+    Ok(match start.partial_cmp(&end) {
+        Some(std::cmp::Ordering::Less) => Some(([start, end], false, gap)),
+        Some(std::cmp::Ordering::Greater) => Some(([end, start], true, gap)),
+        _ => None,
+    })
+}
+
+/// Whether every walked FIN's forward link is reciprocal when present.
+///
+/// A null forward link carries no claim. A present one must name a FIN of
+/// the same loop whose backward link returns. A contradiction drops the ring
+/// on the existing unclosed-ring path.
+fn ring_forward_reciprocal(ring: &[u32], loop_ref: u32, t: &topology::Tables) -> bool {
+    ring.iter().all(|ce_attr| {
+        let Some(forward) = t.coedges().get(ce_attr).map(|ce| ce.refs[2]) else {
+            return false;
+        };
+        if forward <= 1 {
+            return true;
+        }
+        t.coedges()
+            .get(&forward)
+            .is_some_and(|next| next.refs[1] == loop_ref && next.refs[3] == *ce_attr)
+    })
+}
+
+fn edge_parameter_range(
+    ctx: &DecodeContext<'_>,
+    carrier: &CurveCarrier,
+    endpoints: Option<[cadmpeg_ir::math::Point3; 2]>,
+    vertex_tolerances: [Option<f64>; 2],
+    closed: bool,
+    forward_linked: bool,
+) -> Result<Option<([f64; 2], bool)>, cadmpeg_core::CodecError> {
+    const TOLERANCE_MM: f64 = 1.0e-7;
+
+    let allowances = |exact: f64| {
+        vertex_tolerances.map(|tolerance| {
+            tolerance.map_or(exact, |tolerance| looser_tolerance(exact, tolerance))
+        })
+    };
+    let Some(range) = carrier.parameter_range else {
+        return Ok(endpoints.and_then(|endpoints| {
+            conic_edge_range(
+                &carrier.geometry,
+                carrier.runs_against_edges(forward_linked),
+                endpoints,
+                allowances(LINEAR_RESOLUTION_MM),
+                closed,
+            )
+        }));
+    };
+    let range = range.get();
+    let range = match &carrier.geometry {
+        CurveGeometry::Solved(SolvedCurveGeometry::Line(_)) => {
+            range.map(|parameter| parameter * LEN_TO_MM)
+        }
+        _ => range,
+    };
+    let range = if range[0] <= range[1] {
+        range
+    } else {
+        [range[1], range[0]]
+    };
+    let range = match &carrier.geometry {
+        CurveGeometry::Solved(SolvedCurveGeometry::Circle(_) | SolvedCurveGeometry::Ellipse(_)) => {
+            periodic_phase(range)
+        }
+        _ => range,
+    };
+    let Some(endpoints) = endpoints else {
+        return Ok(Some((range, false)));
+    };
+    let geometry = &carrier.geometry;
+    let first = super::evaluation::curve_point(ctx, geometry, range[0])?;
+    let second = super::evaluation::curve_point(ctx, geometry, range[1])?;
+    let (Some(first), Some(second)) = (first, second) else {
+        return Ok(None);
+    };
+    let distance = |left: cadmpeg_ir::math::Point3, right: cadmpeg_ir::math::Point3| {
+        (left.x - right.x)
+            .hypot(left.y - right.y)
+            .hypot(left.z - right.z)
+    };
+    let [start_allowance, end_allowance] = allowances(TOLERANCE_MM);
+    let forward = [
+        distance(first.get(), endpoints[0]),
+        distance(second.get(), endpoints[1]),
+    ];
+    let backward = [
+        distance(second.get(), endpoints[0]),
+        distance(first.get(), endpoints[1]),
+    ];
+    let fits = |[start, end]: [f64; 2]| start <= start_allowance && end <= end_allowance;
+    let worse = |[start, end]: [f64; 2]| start.max(end);
+    match (fits(forward), fits(backward)) {
+        (true, true) if worse(backward) < worse(forward) => Ok(Some((range, true))),
+        (true, _) => Ok(Some((range, false))),
+        (false, true) => Ok(Some((range, true))),
+        (false, false) => Ok(None),
+    }
+}
+
+/// The fin curve (`refs[7]`) a tolerant edge reads its geometry from (spec
+/// §7.6): the canonical fin's, else its partner's, a `decoded` one first.
+fn tolerant_edge_curve(
+    canonical: u32,
+    coedges: &HashMap<u32, topology::Coedge>,
+    decoded: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let fin = coedges.get(&canonical)?;
+    let partner = coedges
+        .get(&fin.refs[5])
+        .filter(|partner| partner.refs[6] == fin.refs[6]);
+    let curves = [Some(fin), partner]
+        .into_iter()
+        .flatten()
+        .map(|fin| fin.refs[7])
+        .filter(|curve| *curve > 1)
+        .collect::<Vec<_>>();
+    curves
+        .iter()
+        .copied()
+        .find(|curve| decoded(*curve))
+        .or_else(|| curves.first().copied())
+}
+
+/// [`tolerant_edge_curve`], taking a curve on a surface carrier first.
+fn tolerant_fin_curve(
+    canonical: u32,
+    coedges: &HashMap<u32, topology::Coedge>,
+    stated: impl Fn(u32) -> bool,
+    decodes: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    tolerant_edge_curve(canonical, coedges, &stated)
+        .filter(|curve| stated(*curve))
+        .or_else(|| tolerant_edge_curve(canonical, coedges, decodes))
+}
+
+/// Bare `SP_CURVE`s named by edge curve slots and admitted by their vertices
+/// (spec §7.6).
+fn bare_surface_curves(
+    ctx: &DecodeContext<'_>,
+    t: &topology::Tables,
+    carriers: &CarrierIndex,
+    edge_ends: &HashMap<u32, (u32, u32, u32, u32)>,
+) -> Result<HashMap<u32, super::sp_curve::SurfaceCurveCarrier>, cadmpeg_core::CodecError> {
+    let position = |vertex_use: u32| {
+        let point_attr = &t.vertex_uses().get(&vertex_use)?.refs[4];
+        let [x, y, z] = t.points().get(point_attr)?.xyz_m;
+        Some(Point3::new(x * LEN_TO_MM, y * LEN_TO_MM, z * LEN_TO_MM))
+    };
+    let mut admitted = HashMap::new();
+    let mut refused = HashSet::new();
+    for (edge, (start, end, attr, _)) in edge_ends {
+        let Some(curve) = carriers.sp_curve(*attr) else {
+            continue;
+        };
+        let own_slot = t
+            .edge_uses()
+            .get(edge)
+            .is_some_and(|edge_use| edge_use.references.curve() == *attr);
+        let mut carrier = None;
+        let resolved = carriers.sp_curve_support(curve.surface);
+        let support = resolved
+            .as_ref()
+            .map(super::sp_curve::ResolvedSupport::support);
+        if let (true, Some(support), Some(ends)) =
+            (own_slot, support, position(*start).zip(position(*end)))
+        {
+            if let Some(whole) = super::sp_curve::whole(ctx, curve, support)? {
+                if super::sp_curve::reaches(
+                    &whole,
+                    [ends.0, ends.1],
+                    super::subset::SURFACE_POINT_TOLERANCE_MM,
+                ) {
+                    carrier = Some(whole);
+                }
+            }
+        }
+        match carrier {
+            Some(carrier) => {
+                admitted.insert(*attr, carrier);
+            }
+            None => {
+                refused.insert(*attr);
+            }
+        }
+    }
+    admitted.retain(|attr, _| !refused.contains(attr));
+    Ok(admitted)
+}
+
+/// Distance within which a tolerant ring's two stored ends meet (spec §7.6).
+const RING_CLOSURE_MM: f64 = 1.0e-5;
+
+/// The seam point and range of a ring edge on a bounded `SP_CURVE` whose
+/// stored ends meet: the low end of its range (spec §7.6).
+fn surface_curve_ring_start(
+    carrier: &super::sp_curve::SurfaceCurveCarrier,
+) -> Option<(Point3, [f64; 2])> {
+    let [low, high] = surface_curve_ends(carrier);
+    let [first, second] = carrier.parameter_range;
+    cadmpeg_ir::eval::curve_endpoints_coincident([low, high], RING_CLOSURE_MM)
+        .then_some((low, [first.min(second), first.max(second)]))
+}
+
+/// A bounded `SP_CURVE`'s stored end points, the low end of its range first.
+fn surface_curve_ends(carrier: &super::sp_curve::SurfaceCurveCarrier) -> [Point3; 2] {
+    let [start, end] = carrier.points;
+    if carrier.parameter_range[0] <= carrier.parameter_range[1] {
+        [start, end]
+    } else {
+        [end, start]
+    }
+}
+
+/// Emit `carrier` as curve `attr` (spec §7.6): a parametric curve on the
+/// emitted support surface with a fitted cache; the fitted B-curve alone on a
+/// sweep or on an offset no face emits; else opaque.
+fn attach_surface_curve(
+    sink: &mut BrepSink<'_, '_, '_>,
+    annotations: &mut AnnotationBuilder,
+    carrier: &super::sp_curve::SurfaceCurveCarrier,
+    carriers: &CarrierIndex,
+    emitted_face_surface_by_carrier: &HashMap<u32, u32>,
+    attr: u32,
+    source_stream: &StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let curve_id = id_curve(attr);
+    let mut surface = emitted_face_surface_by_carrier
+        .get(&carrier.surface)
+        .map(|bridge| id_surf(*bridge))
+        .filter(|id| {
+            sink.out.surfaces.iter().any(|surface| {
+                surface.id == *id
+                    && !matches!(
+                        surface.geometry,
+                        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Unknown { .. })
+                    )
+            })
+        });
+    if surface.is_none()
+        && carrier.sweep.is_none()
+        && carrier.offset_support.is_none()
+        && carriers.surface(carrier.surface).is_some()
+    {
+        surface = ensure_surface_support(
+            sink,
+            carrier.surface,
+            carriers,
+            emitted_face_surface_by_carrier,
+            annotations,
+            source_stream,
+            &mut HashSet::new(),
+        )?;
+    }
+    let ctx = sink.ctx;
+    let out = &mut *sink.out;
+    let breaks: &[f64] = match &carrier.pcurve {
+        PcurveGeometry::Nurbs { nurbs } => nurbs.knots(),
+        _ => &[],
+    };
+    let [first, second] = carrier.parameter_range;
+    let parameter_range = [first.min(second), first.max(second)];
+    let fitted_only = match (&carrier.sweep, &carrier.offset_support, &surface) {
+        (Some(sweep), _, _) => Some((super::sp_curve::Support::Sweep(sweep), "sp_curve_on_sweep")),
+        (None, Some(offset), None) => Some((
+            super::sp_curve::Support::Offset(offset),
+            "sp_curve_on_offset",
+        )),
+        _ => None,
+    };
+    if let Some((support, fitted_note)) = fitted_only {
+        let fitted = super::fit::fit_curve(
+            |t| support.point(ctx, &carrier.pcurve, t),
+            parameter_range,
+            breaks,
+            |low, high| support.resolves(ctx, &carrier.pcurve, low, high),
+        )?;
+        let (geometry, note, exactness) = match fitted {
+            Some(fitted) => (
+                CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(fitted)),
+                fitted_note,
+                Exactness::Derived,
+            ),
+            None => (
+                CurveGeometry::Solved(SolvedCurveGeometry::Unknown { record: None }),
+                "unknown_curve",
+                Exactness::Unknown,
+            ),
+        };
+        annotations.note(
+            curve_id.as_str(),
+            source_stream,
+            u64_from_index(carrier.offset),
+            Some(note),
+        );
+        annotations.exactness(curve_id.as_str(), exactness);
+        admit_brep_entity(ctx)?;
+        out.curves.push(Curve {
+            parameter_range: None,
+            id: curve_id,
+            source_object: None,
+            geometry,
+        });
+        return Ok(());
+    }
+    let context = surface.and_then(|surface| {
+        IntcurveSupportContext::try_new(
+            [
+                IntcurveSupportSide {
+                    surface: Some(surface),
+                    pcurve: Some(carrier.pcurve.clone().into()),
+                },
+                IntcurveSupportSide {
+                    surface: None,
+                    pcurve: None,
+                },
+            ],
+            parameter_range,
+            [Vec::new(), Vec::new(), Vec::new()],
+        )
+        .ok()
+    });
+    let Some(context) = context else {
+        annotations.note(
+            curve_id.as_str(),
+            source_stream,
+            u64_from_index(carrier.offset),
+            Some("unknown_curve"),
+        );
+        annotations.exactness(curve_id.as_str(), Exactness::Unknown);
+        admit_brep_entity(ctx)?;
+        out.curves.push(Curve {
+            parameter_range: None,
+            id: curve_id,
+            source_object: None,
+            geometry: CurveGeometry::Solved(SolvedCurveGeometry::Unknown { record: None }),
+        });
+        return Ok(());
+    };
+    annotations.note(
+        curve_id.as_str(),
+        source_stream,
+        u64_from_index(carrier.offset),
+        Some("sp_curve"),
+    );
+    annotations.exactness(curve_id.as_str(), Exactness::Derived);
+    let support = context.sides()[0]
+        .surface
+        .as_ref()
+        .and_then(|id| out.surfaces.iter().find(|candidate| candidate.id == *id));
+    // An offset's emitted surface has no cache, so the fit evaluates the offset.
+    let support = match (&carrier.offset_support, support) {
+        (Some(offset), _) => Some(super::sp_curve::Support::Offset(offset)),
+        (None, Some(support)) => Some(super::sp_curve::Support::Surface(&support.geometry)),
+        (None, None) => None,
+    };
+    let cache = match support {
+        Some(support) => super::fit::fit_curve(
+            |t| support.point(ctx, &carrier.pcurve, t),
+            parameter_range,
+            breaks,
+            |low, high| support.resolves(ctx, &carrier.pcurve, low, high),
+        )?
+        .map(SolvedCurveGeometry::Nurbs),
+        None => None,
+    };
+    if cache.is_some() {
+        out.approximations
+            .surface_curve(super::fit::FIT_TOLERANCE_MM);
+    }
+    let construction = ProceduralCurveId::compose(
+        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "sp-curve"),
+        attr,
+    );
+    let definition = ProceduralCurveDefinition::SurfaceCurve {
+        family: SurfaceCurveFamily::Parametric {
+            context,
+            tail: cache.as_ref().and_then(|_| fitted_cache_tail()),
+        },
+    };
+    admit_brep_entity(ctx)?;
+    out.procedural_curves
+        .push(ProceduralCurve::new(construction.clone(), definition));
+    admit_brep_entity(ctx)?;
+    out.curves.push(Curve {
+        parameter_range: None,
+        id: curve_id,
+        source_object: None,
+        geometry: CurveGeometry::Procedural {
+            construction,
+            cache,
+        },
+    });
+    Ok(())
+}
+
+/// The solved-cache tail stating [`super::fit::FIT_TOLERANCE_MM`], with
+/// neutral values in its other fields.
+fn fitted_cache_tail() -> Option<
+    cadmpeg_ir::geometry::SurfaceCurveCacheFirst<cadmpeg_ir::geometry::ParametricSurfaceCurveFlags>,
+> {
+    let fit_tolerance =
+        cadmpeg_ir::geometry::FitTolerance::try_new(super::fit::FIT_TOLERANCE_MM).ok()?;
+    let form = cadmpeg_ir::geometry::SurfaceCurveTail::try_new(
+        0,
+        cadmpeg_ir::scalar::PositiveI64::new(1)?,
+        cadmpeg_ir::geometry::RevisionCacheForm::SolvedCache { fit_tolerance },
+        [[None; 4]; 2],
+        [None, None],
+    )
+    .ok()?;
+    Some(cadmpeg_ir::geometry::SurfaceCurveCacheFirst {
+        form,
+        flags: cadmpeg_ir::geometry::ParametricSurfaceCurveFlags {
+            flag: false,
+            second_flag: None,
+        },
+    })
+}
+
+/// The boundary of a face: its vertices (the ends of its edges), and the
+/// vertices with samples along the edges' curves.
+fn blend_boundary(
+    ctx: &DecodeContext<'_>,
+    t: &topology::Tables,
+    loops: &[(u32, Vec<u32>)],
+    carriers: &CarrierIndex,
+    edge_curve_spans: &HashMap<u32, (u32, Option<[f64; 2]>)>,
+    edge_endpoint_positions: &HashMap<u32, [Point3; 2]>,
+    closed_edge_starts: &HashMap<u32, Point3>,
+) -> Result<(Vec<Point3>, Vec<Point3>), cadmpeg_core::CodecError> {
+    let mut vertices = Vec::new();
+    let mut points = Vec::new();
+    for coedge in loops.iter().flat_map(|(_, ring)| ring) {
+        let Some(edge) = t.coedges().get(coedge).map(|coedge| coedge.refs[6]) else {
+            continue;
+        };
+        if let Some(ends) = edge_endpoint_positions.get(&edge) {
+            vertices.extend(ends);
+            points.extend(ends);
+        }
+        if let Some(start) = closed_edge_starts.get(&edge) {
+            vertices.push(*start);
+            points.push(*start);
+        }
+        let span = edge_curve_spans.get(&edge).and_then(|(curve_attr, range)| {
+            carriers
+                .curve(*curve_attr)
+                .map(|indexed| (&indexed.carrier().geometry, *range))
+        });
+        if let Some((curve, range)) = span {
+            points.extend(blend_surface::edge_samples(ctx, curve, range)?);
+        }
+    }
+    Ok((vertices, points))
+}
+
+/// Distance within which a curve end lies at a vertex without a stored
+/// tolerance: the stream's linear resolution, `1e-8` m.
+pub(super) const LINEAR_RESOLUTION_MM: f64 = 1.0e-5;
+
+/// Whether an edge runs against an open NURBS curve that stores no range, from
+/// the parameters of its two vertices on the curve (spec §7.2). `None` on a
+/// periodic curve, when the vertices coincide, when either vertex has no single
+/// parameter, or when the two parameters are equal.
+fn vertex_parameter_reversal(
+    ctx: &DecodeContext<'_>,
+    carrier: &CurveCarrier,
+    endpoints: Option<[cadmpeg_ir::math::Point3; 2]>,
+) -> Result<Option<bool>, cadmpeg_core::CodecError> {
+    let (Some([start, end]), Some(SolvedCurveGeometry::Nurbs(curve))) =
+        (endpoints, carrier.geometry.solved())
+    else {
+        return Ok(None);
+    };
+    if curve.periodic() || start.distance(end) <= LINEAR_RESOLUTION_MM {
+        return Ok(None);
+    }
+    Ok(
+        match (
+            nurbs_parameter_at_point(ctx, curve, start)?,
+            nurbs_parameter_at_point(ctx, curve, end)?,
+        ) {
+            (InverseResolution::Unique(first), InverseResolution::Unique(second))
+                if first != second =>
+            {
+                Some(second < first)
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Whether an edge runs against an open NURBS curve that stores no range,
+/// from the curve's points at the two ends of its knot domain. Each end
+/// matches a vertex within that vertex's `bounds` entry. When both orders
+/// match, the order whose worse end is nearer decides; `None` when neither
+/// order matches or both are equally near.
+fn domain_endpoint_reversal(
+    ctx: &DecodeContext<'_>,
+    carrier: &CurveCarrier,
+    endpoints: Option<[cadmpeg_ir::math::Point3; 2]>,
+    bounds: [f64; 2],
+) -> Result<Option<bool>, cadmpeg_core::CodecError> {
+    let (Some(endpoints), Some(SolvedCurveGeometry::Nurbs(curve))) =
+        (endpoints, carrier.geometry.solved())
+    else {
+        return Ok(None);
+    };
+    if curve.periodic() {
+        return Ok(None);
+    }
+    let Some(domain) = nurbs_curve_parameter_domain(curve) else {
+        return Ok(None);
+    };
+    let [low, high] = domain.endpoints();
+    let (Some(first), Some(last)) = (
+        super::evaluation::nurbs_curve_point(ctx, curve, low)?,
+        super::evaluation::nurbs_curve_point(ctx, curve, high)?,
+    ) else {
+        return Ok(None);
+    };
+    let ends = [first.get(), last.get()];
+    let worse_end = |order: [usize; 2]| {
+        ends.iter()
+            .zip(order)
+            .try_fold(0.0_f64, |worse, (end, vertex)| {
+                let distance = end.distance(endpoints[vertex]);
+                (distance <= bounds[vertex]).then(|| worse.max(distance))
+            })
+    };
+    Ok(match (worse_end([0, 1]), worse_end([1, 0])) {
+        (Some(_), None) => Some(false),
+        (None, Some(_)) => Some(true),
+        (Some(along), Some(against)) if along < against => Some(false),
+        (Some(along), Some(against)) if against < along => Some(true),
+        _ => None,
+    })
+}
+
+/// An angular range moved by whole turns so it starts within `[0, τ)`, the
+/// canonical phase of a circle or ellipse. A trim may store an arc on any
+/// equivalent branch, such as one ending at the seam from below as
+/// `[-1.47, 0]`; whole turns name the same points.
+fn periodic_phase([start, end]: [f64; 2]) -> [f64; 2] {
+    let tau = std::f64::consts::TAU;
+    let mut phase = start.rem_euclid(tau);
+    // `rem_euclid` can round a value just below zero up to exactly `τ`.
+    if phase >= tau {
+        phase = 0.0;
+    }
+    let shift = phase - start;
+    [phase, end + shift]
+}
+
+/// Resolve the coedge that defines an edge's stored direction.
+///
+/// Bare records carry an explicit coedge attr in `refs[0]`. Prefixed records
+/// carry no such slot. An absent or source-null slot is resolved only when exactly
+/// one same-edge forward coedge exists. A non-sentinel explicit reference is
+/// authoritative: a dangling, cross-edge, or reversed reference is rejected.
+fn canonical_coedge_attr(
+    edge_attr: u32,
+    edge_use: Option<&topology::EdgeUse>,
+    coedges: &HashMap<u32, topology::Coedge>,
+) -> Option<u32> {
+    if let Some(explicit) = edge_use
+        .and_then(|record| record.references.canonical())
+        .filter(|attr| *attr > 1)
+    {
+        let coedge = coedges.get(&explicit)?;
+        return (coedge.refs[6] == edge_attr && coedge.sense == Sense::Forward).then_some(explicit);
+    }
+
+    let mut candidates = coedges
+        .iter()
+        .filter(|(_, coedge)| coedge.refs[6] == edge_attr && coedge.sense == Sense::Forward);
+    let (&attr, _) = candidates.next()?;
+    candidates.next().is_none().then_some(attr)
+}
+
+/// Resolve the edge vertex-use that the ring order supplies for one
+/// canonical coedge.
+///
+/// A FIN's `refs[4]` gives one end of its edge, and the adjacent FIN in the
+/// ring gives the other end (`ring_vuse`). A mutual twin corroborates it: the
+/// twin runs the shared edge in the opposite direction, so its `refs[4]`
+/// names the ring end when its loop is of the same kind, and the canonical
+/// FIN's own end otherwise. A mutual twin that names another vertex
+/// contradicts the ring order, so the edge is withheld (`None`). An absent,
+/// dangling, or non-mutual twin leaves the ring order authoritative.
+fn edge_ring_vuse(
+    incidence: EdgeIncidence,
+    incidences: &[EdgeIncidence],
+    coedges: &HashMap<u32, topology::Coedge>,
+) -> Option<u32> {
+    let (canonical, ring_vuse) = (incidence.fin, incidence.ring_vuse);
+    let twin = coedges.get(&canonical).map(|coedge| coedge.refs[5])?;
+    if twin == canonical || twin <= 1 {
+        return Some(ring_vuse);
+    }
+    let twin_record = coedges.get(&twin);
+    let Some(twin_record) = twin_record else {
+        return Some(ring_vuse);
+    };
+    if twin_record.refs[5] != canonical {
+        return Some(ring_vuse);
+    }
+    let twin_forward_linked = incidences
+        .iter()
+        .find(|other| other.fin == twin)
+        .map_or(incidence.forward_linked, |other| other.forward_linked);
+    let expected = if twin_forward_linked == incidence.forward_linked {
+        ring_vuse
+    } else {
+        incidence.own_vuse
+    };
+    let twin_vuse = twin_record.refs[4];
+    if twin_vuse == expected || (twin_vuse <= 1 && expected <= 1) {
+        Some(ring_vuse)
+    } else {
+        None
+    }
+}
+
+/// One walked FIN of an edge: the FIN's attr, its own vertex-use, the
+/// vertex-use the ring order supplies, and whether its loop is forward
+/// linked. In a forward-linked loop the own vertex-use is the FIN's end and
+/// the previous FIN's end is its start. In another loop the own vertex-use
+/// is the FIN's start and the next walked FIN's start is its end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EdgeIncidence {
+    fin: u32,
+    own_vuse: u32,
+    ring_vuse: u32,
+    forward_linked: bool,
+}
+
+impl EdgeIncidence {
+    /// The edge `(start, end)` vertex-uses from the FIN's own vertex-use and
+    /// the other end.
+    fn ends(self, own: u32, other: u32) -> (u32, u32) {
+        if self.forward_linked {
+            (other, own)
+        } else {
+            (own, other)
+        }
+    }
+}
+
+/// Whether one FIN record is a sheet-boundary dummy: its loop and sibling
+/// links are all null sentinels, so it never walks in a face loop.
+fn is_boundary_dummy(fin: &topology::Coedge) -> bool {
+    fin.refs[1] <= 1 && fin.refs[2] <= 1 && fin.refs[3] <= 1
+}
+
+/// The outcome of sheet-boundary dummy-partner recovery for one edge whose
+/// canonical FIN has no walked incidence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DummyRecovery {
+    /// The partner corroborates both endpoints in ring order: start, end,
+    /// and the walked partner incidence.
+    Admitted(u32, u32, EdgeIncidence),
+    /// A dummy-partner candidate fails corroboration and is withheld.
+    Withheld,
+    /// No dummy-partner candidate exists; the edge stays silently dropped.
+    Absent,
+}
+
+fn recover_dummy_partner_edge(
+    edge_attr: u32,
+    canonical: u32,
+    incidences: &[EdgeIncidence],
+    t: &topology::Tables,
+) -> DummyRecovery {
+    let Some(fin) = t.coedges().get(&canonical) else {
+        return DummyRecovery::Absent;
+    };
+    if !is_boundary_dummy(fin) || fin.refs[6] != edge_attr {
+        return DummyRecovery::Absent;
+    }
+    let partner_attr = fin.refs[5];
+    if partner_attr <= 1 || partner_attr == canonical {
+        return DummyRecovery::Absent;
+    }
+    let Some(partner) = t.coedges().get(&partner_attr) else {
+        return DummyRecovery::Absent;
+    };
+    if partner.refs[5] != canonical || partner.refs[6] != edge_attr {
+        return DummyRecovery::Absent;
+    }
+    let Some(incidence) = incidences
+        .iter()
+        .find(|incidence| incidence.fin == partner_attr)
+    else {
+        return DummyRecovery::Absent;
+    };
+    let vertexless = fin.refs[4] <= 1 && partner.refs[4] <= 1 && incidence.ring_vuse <= 1;
+    if !vertexless
+        && (fin.refs[4] <= 1 || partner.refs[4] <= 1 || fin.refs[4] != incidence.ring_vuse)
+    {
+        return DummyRecovery::Withheld;
+    }
+    let (start, end) = incidence.ends(fin.refs[4], partner.refs[4]);
+    DummyRecovery::Admitted(start, end, *incidence)
+}
+
+fn admit_vertexless_ring_edge(
+    [edge_attr, fin_attr, curve_attr]: [u32; 3],
+    closes: bool,
+    faces: &[WalkedFace],
+    t: &topology::Tables,
+) -> bool {
+    let Some(fin) = t.coedges().get(&fin_attr) else {
+        return false;
+    };
+    if fin.refs[6] != edge_attr || fin.refs[4] > 1 {
+        return false;
+    }
+    let partner_attr = fin.refs[5];
+    if partner_attr <= 1 || partner_attr == fin_attr {
+        return false;
+    }
+    let Some(partner) = t.coedges().get(&partner_attr) else {
+        return false;
+    };
+    if partner.refs[5] != fin_attr
+        || partner.refs[6] != edge_attr
+        || partner.refs[4] > 1
+        || partner.sense == fin.sense
+    {
+        return false;
+    }
+    if !closes || curve_attr <= 1 {
+        return false;
+    }
+    let mut single = false;
+    for face in faces {
+        for (loop_attr, ring) in &face.loops {
+            if ring.len() == 1 && ring[0] == fin_attr {
+                single = t
+                    .loops()
+                    .get(loop_attr)
+                    .is_some_and(|lp| t.bridges().contains_key(&lp.refs[2]));
+            }
+        }
+    }
+    if !single {
+        return false;
+    }
+    let partner_single_or_dummy = is_boundary_dummy(partner)
+        || faces
+            .iter()
+            .flat_map(|face| &face.loops)
+            .any(|(_, ring)| ring.len() == 1 && ring[0] == partner_attr);
+    if !partner_single_or_dummy {
+        return false;
+    }
+    let dummies = t
+        .coedges()
+        .values()
+        .filter(|ce| ce.refs[6] == edge_attr && is_boundary_dummy(ce))
+        .count();
+    dummies <= 1
+}
+
+/// Record one edge's endpoints and keep its chain-reachable vertices.
+struct KeptTopology<'a> {
+    vertices: &'a mut HashSet<u32>,
+    points: &'a mut HashSet<u32>,
+    unresolved_points: &'a mut HashSet<u32>,
+}
+
+fn insert_edge_ends(
+    t: &topology::Tables,
+    edge_ends: &mut HashMap<u32, (u32, u32, u32, u32)>,
+    kept: &mut KeptTopology<'_>,
+    edge_attr: u32,
+    [start_vuse, end_vuse]: [u32; 2],
+    curve_attr: u32,
+    fin_attr: u32,
+) {
+    edge_ends.insert(edge_attr, (start_vuse, end_vuse, curve_attr, fin_attr));
+    for vuse in [start_vuse, end_vuse] {
+        keep_vertex_use(t, kept, vuse);
+    }
+}
+
+/// Keep a vertex use and its point when both resolve.
+fn keep_vertex_use(t: &topology::Tables, kept: &mut KeptTopology<'_>, vuse: u32) {
+    if vuse == 0 {
+        return;
+    }
+    if let Some(vu) = t.vertex_uses().get(&vuse) {
+        let point_attr = vu.refs[4];
+        if t.points().contains_key(&point_attr) {
+            kept.vertices.insert(vuse);
+            kept.points.insert(point_attr);
+        } else if t.point_is_ambiguous(point_attr) {
+            kept.unresolved_points.insert(point_attr);
+        }
+    }
+}
+
+fn surface_sense(sense: Sense, orientation_reversed: bool) -> Sense {
+    match (sense, orientation_reversed) {
+        (Sense::Forward, true) => Sense::Reversed,
+        (Sense::Reversed, true) => Sense::Forward,
+        (sense, false) => sense,
+    }
+}
+
+/// The body bytes a Parasolid stream header names.
+///
+/// # Errors
+///
+/// Refuses a body offset past the payload, naming the offset and the payload
+/// length: a header that states its body outside its own stream is a framing
+/// error, not an empty body.
+pub(crate) fn header_body<'a>(
+    payload: &'a [u8],
+    header: &StreamHeader,
+) -> Result<&'a [u8], cadmpeg_core::CodecError> {
+    payload.get(header.body_offset..).ok_or_else(|| {
+        cadmpeg_core::CodecError::malformed(format!(
+            "sldprt Parasolid stream header states body offset {} past its {}-byte payload",
+            header.body_offset,
+            payload.len()
+        ))
+    })
+}
+
+/// Decode one parsed Parasolid stream into B-rep arenas.
+///
+/// `stream` names the provenance stream recorded in [`Brep::annotations`].
+pub(crate) fn decode(
+    ctx: &DecodeContext<'_>,
+    payload: &[u8],
+    header: &StreamHeader,
+    stream: &cadmpeg_ir::StreamName,
+) -> Result<Brep, cadmpeg_core::CodecError> {
+    decode_body(
+        ctx,
+        header_body(payload, header)?,
+        stream,
+        is_deltas_stream(header),
+    )
+}
+
+pub(super) fn is_deltas_stream(header: &StreamHeader) -> bool {
+    header
+        .description
+        .as_bytes()
+        .windows(b"deltas".len())
+        .any(|window| window.eq_ignore_ascii_case(b"deltas"))
+}
+
+fn append_entity_facts(target: &mut entity::Facts, mut source: entity::Facts) {
+    target.face_colors.append(&mut source.face_colors);
+    target
+        .face_color_versions
+        .append(&mut source.face_color_versions);
+    target.face_atoms.append(&mut source.face_atoms);
+    target.face_payloads.append(&mut source.face_payloads);
+    target.body_payloads.append(&mut source.body_payloads);
+    target.face_keys.append(&mut source.face_keys);
+    target.body_modifiers.append(&mut source.body_modifiers);
+    target.entity_count += source.entity_count;
+    target.unresolved_face_colors += source.unresolved_face_colors;
+}
+
+/// Decode related partition and deltas streams as one record source.
+///
+/// Partition records are the base set. Deltas records fill missing subordinate
+/// records. `stream` names the combined provenance source.
+pub(crate) fn decode_bodies(
+    ctx: &DecodeContext<'_>,
+    bodies: &[(&[u8], &StreamHeader)],
+    stream: &cadmpeg_ir::StreamName,
+) -> Result<Brep, cadmpeg_core::CodecError> {
+    let mut site = scan_site(ctx, bodies, &mut |_| {})?;
+    let mut decoded = decode_graph(
+        ctx,
+        &mut site.carriers,
+        &site.tables,
+        site.facts,
+        &site.typed_facts,
+        stream,
+    )?;
+    if !site.mesh_bodies.is_empty() {
+        decoded.losses.push(crate::loss::SldprtLossCode::GeometryMeshBodyNotTransferred.note(
+            format!(
+                "{} mesh body/bodies have Parasolid MESH face support; facet positions and triangle ownership remain unresolved. Mesh geometry is withheld.",
+                site.mesh_bodies.len(),
+            ),
+        ));
+    }
+    Ok(decoded)
+}
+
+/// The merged record state of one site.
+struct SiteState {
+    mesh_bodies: HashSet<u32>,
+    carriers: CarrierIndex,
+    tables: topology::Tables,
+    facts: entity::Facts,
+    typed_facts: typed::Facts,
+}
+
+/// The topology tables the site scan reads from one stream, before they
+/// merge into the site tables.
+pub(super) struct StreamTopology<'a> {
+    /// The position of the stream in the site's `bodies`.
+    pub(super) index: usize,
+    pub(super) body: &'a [u8],
+    /// Whether the tables come from the stream's node sequence.
+    pub(super) from_nodes: bool,
+    pub(super) tables: &'a topology::Tables,
+}
+
+/// Read the streams of one site into one record state. `observe` receives
+/// the topology tables of each stream in scan order.
+fn scan_site(
+    ctx: &DecodeContext<'_>,
+    bodies: &[(&[u8], &StreamHeader)],
+    observe: &mut dyn FnMut(StreamTopology<'_>),
+) -> Result<SiteState, cadmpeg_core::CodecError> {
+    let mut carriers = CarrierIndex::default();
+    let mut tables = topology::Tables::default();
+    let mut facts = entity::Facts::default();
+    let mut initialized = false;
+    let mut order: Vec<usize> = (0..bodies.len()).collect();
+    order.sort_by_key(|index| is_deltas_stream(bodies[*index].1));
+    let ordered: Vec<&(&[u8], &StreamHeader)> = order.iter().map(|index| &bodies[*index]).collect();
+    let mut entity_streams = Vec::new();
+    for (payload, header) in &ordered {
+        let body = header_body(payload, header)?;
+        entity_streams.push((body, is_deltas_stream(header)));
+    }
+    let framed: Vec<_> = ordered
+        .iter()
+        .zip(&entity_streams)
+        .map(|((payload, _), (_, prefixed))| {
+            prefixed
+                .then(|| cadmpeg_parasolid::records::DeltasRecords::read(payload).ok())
+                .flatten()
+        })
+        .collect();
+    let deltas_records: Vec<_> = framed
+        .iter()
+        .map(|records| {
+            records.as_ref().filter(|records| {
+                *records.end() == cadmpeg_parasolid::records::deltas::DeltasEnd::Complete
+            })
+        })
+        .collect();
+    let agreement = topology::nodes::DeltasAgreement::new(
+        framed
+            .iter()
+            .zip(&ordered)
+            .filter_map(|(records, (payload, _))| Some((records.as_ref()?, *payload))),
+    );
+    let mut typed_streams = Vec::new();
+    let mut node_tables = Vec::new();
+    let mut node_attributes = Vec::new();
+    let mut deltas_typed = Vec::new();
+    let mut deltas_blends = Vec::new();
+    let mut mesh_bodies = HashSet::new();
+    for (((payload, header), (body, prefixed)), deltas) in
+        ordered.iter().zip(&entity_streams).zip(&deltas_records)
+    {
+        let node_stream = (!prefixed)
+            .then(|| topology::nodes::sequence(payload))
+            .flatten()
+            .and_then(|records| {
+                mesh_bodies.extend(super::mesh::bodies(&records));
+                let tables = topology::nodes::tables(&records, payload, header.body_offset)?;
+                let mut lane_refusals = Vec::new();
+                let splines = super::spline::nodes::carriers(
+                    &records,
+                    header.body_offset,
+                    &mut lane_refusals,
+                );
+                if splines.is_none() {
+                    lane_refusals.clear();
+                }
+                let analytic = super::carrier_nodes::analytic(
+                    &records,
+                    header.body_offset,
+                    &mut lane_refusals,
+                );
+                let sp_curves = splines.as_ref().and_then(|splines| {
+                    super::sp_curve::from_nodes(&records, header.body_offset, &splines.pcurves)
+                });
+                Some((
+                    typed::nodes::facts(&records, header.body_offset)?,
+                    (
+                        attrib::Records::from_nodes(&records),
+                        entity::NodeEntities::from_nodes(&records, header.body_offset),
+                    ),
+                    (
+                        tables,
+                        Some(NodeCarriers {
+                            analytic,
+                            splines,
+                            offsets: super::offset::from_nodes(&records, header.body_offset),
+                            blends: super::blend::from_nodes(&records, header.body_offset),
+                            sweeps: super::sweep::from_nodes(&records, header.body_offset),
+                            sp_curves,
+                            bounded: super::subset::from_nodes(&records, header.body_offset),
+                            intersections: super::intersection::from_nodes(
+                                &records,
+                                header.body_offset,
+                            ),
+                            lane_refusals,
+                        }),
+                    ),
+                ))
+            });
+        let deltas_stream = deltas
+            .filter(|_| node_stream.is_none())
+            .and_then(|records| {
+                let offset = header.body_offset;
+                let nodes = topology::nodes::consistent_deltas_nodes(records, &agreement);
+                let facts = typed::nodes::facts_of(nodes.iter(), offset)?;
+                let tables = topology::nodes::deltas_tables(records, payload, offset, &agreement)?;
+                let mut lane_refusals = Vec::new();
+                let splines = super::spline::nodes::carriers_of(&nodes, offset, &mut lane_refusals);
+                if splines.is_none() {
+                    lane_refusals.clear();
+                }
+                let sp_curves = splines.as_ref().and_then(|splines| {
+                    super::sp_curve::from_nodes_of(&nodes, offset, &splines.pcurves)
+                });
+                let analytic =
+                    super::carrier_nodes::analytic_of(&nodes, offset, &mut lane_refusals);
+                let carriers = NodeCarriers {
+                    analytic,
+                    splines,
+                    offsets: super::offset::from_nodes_of(&nodes, offset),
+                    blends: None,
+                    sweeps: super::sweep::from_nodes_of(&nodes, offset),
+                    sp_curves,
+                    bounded: super::subset::from_nodes_of(&nodes, offset),
+                    intersections: super::intersection::from_nodes_of(&nodes, offset),
+                    lane_refusals,
+                };
+                let blends = super::blend::from_nodes_of(&nodes, offset);
+                Some((facts, tables, carriers, blends))
+            });
+        if let Some((facts, attributes, node_records)) = node_stream {
+            typed_streams.push(facts);
+            node_attributes.push(attributes);
+            node_tables.push(Some(node_records));
+            deltas_typed.push(None);
+            deltas_blends.push(None);
+        } else if let Some((facts, tables, carriers, blends)) = deltas_stream {
+            deltas_blends.push(blends);
+            typed_streams.push(typed::scan_with_payload_exclusions(body, *prefixed));
+            deltas_typed.push(Some(facts));
+            node_attributes.push((None, None));
+            node_tables.push(Some((tables, Some(carriers))));
+        } else {
+            typed_streams.push(typed::scan_with_payload_exclusions(body, *prefixed));
+            node_attributes.push((None, None));
+            node_tables.push(None);
+            deltas_typed.push(None);
+            deltas_blends.push(None);
+        }
+    }
+    // Node-built and scanned Deltas frames start at different bytes, so one
+    // site's Deltas streams all read from nodes or all scan.
+    let deltas_from_nodes = entity_streams
+        .iter()
+        .zip(&node_tables)
+        .all(|((_, prefixed), tables)| !prefixed || tables.is_some());
+    if !deltas_from_nodes {
+        for ((_, prefixed), tables) in entity_streams.iter().zip(&mut node_tables) {
+            if *prefixed {
+                *tables = None;
+            }
+        }
+    }
+    // A Deltas typed node enters only when the partition's typed nodes reach
+    // it: Deltas streams retain historical versions of the current nodes.
+    if deltas_from_nodes {
+        let mut partition = typed::Facts::default();
+        for (facts, (_, prefixed)) in typed_streams.iter().zip(&entity_streams) {
+            if !prefixed {
+                partition.merge_missing(facts.clone());
+            }
+        }
+        let mut candidates = typed::Facts::default();
+        for node_facts in deltas_typed.iter().flatten() {
+            candidates.extend(node_facts.clone());
+        }
+        let admitted = candidates.reachable_from(&partition);
+        for (facts, node_facts) in typed_streams.iter_mut().zip(deltas_typed) {
+            if let Some(node_facts) = node_facts {
+                *facts = node_facts.restricted_to(&admitted);
+            }
+        }
+    }
+    let mut conflicted = agreement.conflicted_indices();
+    let no_conflicts = HashSet::new();
+    if !deltas_from_nodes {
+        let scanned = incomplete_deltas_identities(
+            ctx,
+            &ordered,
+            &deltas_records,
+            &typed_streams,
+            &node_tables,
+            &conflicted,
+        )?;
+        conflicted.extend(unframed_shared(&entity_streams, &framed, scanned));
+        for (facts, (_, prefixed)) in typed_streams.iter_mut().zip(&entity_streams) {
+            if *prefixed {
+                *facts = std::mem::take(facts).without(&conflicted);
+            }
+        }
+    }
+    let evidence = SiteEvidence::of(
+        &entity_streams,
+        &typed_streams,
+        ordered.iter().map(|(_, header)| {
+            !is_deltas_stream(header) && !crate::parasolid::is_body_stream(header)
+        }),
+    );
+    // A Deltas blend enters only when the current faces, edges, and carriers
+    // reach it, directly or through reached Deltas carriers.
+    let mut seeds: Vec<u32> = evidence
+        .typed
+        .faces
+        .iter()
+        .map(|face| face.refs[4])
+        .collect();
+    let mut deltas_edges = HashMap::<u32, Vec<u32>>::new();
+    let mut deltas_bridges = Vec::new();
+    let mut partition_bridges = 0;
+    for (entry, (_, prefixed)) in node_tables.iter().zip(&entity_streams) {
+        let Some((tables, carriers)) = entry else {
+            continue;
+        };
+        let references = carriers.iter().flat_map(NodeCarriers::reference_edges);
+        if *prefixed {
+            deltas_bridges.extend(tables.bridges().values().map(|bridge| bridge.refs[4]));
+            for (from, to) in references {
+                deltas_edges.entry(from).or_default().push(to);
+            }
+        } else {
+            partition_bridges += tables.bridges().len();
+            seeds.extend(tables.bridges().values().map(|bridge| bridge.refs[4]));
+            seeds.extend(
+                tables
+                    .edge_uses()
+                    .values()
+                    .map(|edge| edge.references.curve()),
+            );
+            seeds.extend(tables.coedges().values().map(|coedge| coedge.refs[7]));
+            seeds.extend(references.map(|(_, to)| to));
+        }
+    }
+    if partition_bridges == 0 && evidence.bridge_attrs.is_none() {
+        seeds.extend(deltas_bridges);
+    }
+    let mut referenced = HashSet::new();
+    while let Some(attr) = seeds.pop() {
+        if attr > 1 && referenced.insert(attr) {
+            seeds.extend(deltas_edges.get(&attr).into_iter().flatten().copied());
+        }
+    }
+    for (tables, blends) in node_tables.iter_mut().zip(deltas_blends) {
+        if let (Some((_, Some(carriers))), Some(blends)) = (tables, blends) {
+            carriers.blends = Some(blends.reached_from(&referenced));
+        }
+    }
+    for (
+        stream_order,
+        (((((payload, header), stream_typed_facts), node_tables), attributes), index),
+    ) in ordered
+        .into_iter()
+        .zip(typed_streams)
+        .zip(node_tables)
+        .zip(node_attributes)
+        .zip(order)
+        .enumerate()
+    {
+        let body = header_body(payload, header)?;
+        let is_deltas = is_deltas_stream(header);
+        let (node_tables, node_carriers) = node_tables.unzip();
+        let exclude = if is_deltas {
+            &conflicted
+        } else {
+            &no_conflicts
+        };
+        carriers.merge_missing(stream_carriers(
+            ctx,
+            body,
+            is_deltas,
+            node_carriers.flatten(),
+            exclude,
+        )?);
+        let from_nodes = node_tables.is_some();
+        let scanned_tables = stream_topology(
+            (body, header),
+            &stream_typed_facts,
+            node_tables,
+            &carriers,
+            &evidence,
+            &tables,
+            exclude,
+        );
+        observe(StreamTopology {
+            index,
+            body,
+            from_nodes,
+            tables: &scanned_tables,
+        });
+        let (attributes, entities) = attributes;
+        let attributes = attributes.unwrap_or_else(|| attrib::Records::scan(body));
+        let mut scanned_facts = entity::metadata(body, is_deltas, &attributes, entities);
+        for color in &mut scanned_facts.face_colors {
+            color.stream_order = stream_order;
+        }
+        for version in &mut scanned_facts.face_color_versions {
+            version.stream_order = stream_order;
+        }
+        if initialized {
+            tables.merge_deltas(scanned_tables, evidence.bridge_attrs.as_ref());
+            append_entity_facts(&mut facts, scanned_facts);
+        } else {
+            tables = scanned_tables;
+            facts = scanned_facts;
+            initialized = true;
+        }
+    }
+    Ok(SiteState {
+        mesh_bodies,
+        carriers,
+        tables,
+        facts,
+        typed_facts: evidence.typed,
+    })
+}
+
+/// Read the streams of one site as [`decode_bodies`] does, without building
+/// the B-rep. `observe` receives the topology tables of each stream.
+pub(super) fn observe_site(
+    ctx: &DecodeContext<'_>,
+    bodies: &[(&[u8], &StreamHeader)],
+    observe: &mut dyn FnMut(StreamTopology<'_>),
+) -> Result<(), cadmpeg_core::CodecError> {
+    scan_site(ctx, bodies, observe).map(|_| ())
+}
+
+/// The site-level evidence that the topology scan of each stream reads.
+struct SiteEvidence {
+    /// The typed facts of every stream of the site.
+    typed: typed::Facts,
+    owner_attrs: HashSet<u32>,
+    bridge_attrs: Option<HashSet<u32>>,
+    looped_bridge_attrs: HashSet<u32>,
+}
+
+impl SiteEvidence {
+    fn of(
+        entity_streams: &[(&[u8], bool)],
+        typed_streams: &[typed::Facts],
+        plain_streams: impl Iterator<Item = bool>,
+    ) -> Self {
+        let mut typed = typed::Facts::default();
+        for stream_typed_facts in typed_streams {
+            typed.merge_missing(stream_typed_facts.clone());
+        }
+        let owner_attrs = typed::topology_owner_attrs_for_streams(
+            entity_streams
+                .iter()
+                .zip(typed_streams)
+                .map(|((body, deltas), facts)| (facts, *body, *deltas)),
+        );
+        let bridge_attrs = typed.valid_ownership_face_attrs();
+        let looped_bridge_attrs = entity_streams
+            .iter()
+            .zip(plain_streams)
+            .flat_map(|((body, deltas), plain)| {
+                topology::framed_looped_bridge_attrs(body, *deltas, plain)
+            })
+            .collect();
+        Self {
+            typed,
+            owner_attrs,
+            bridge_attrs,
+            looped_bridge_attrs,
+        }
+    }
+}
+
+/// The carriers of one stream of a site.
+fn stream_carriers(
+    ctx: &DecodeContext<'_>,
+    body: &[u8],
+    is_deltas: bool,
+    node_carriers: Option<NodeCarriers>,
+    exclude: &HashSet<u32>,
+) -> Result<CarrierIndex, cadmpeg_core::CodecError> {
+    match node_carriers {
+        Some(carriers) => {
+            index_carriers_with_nodes(ctx, body, carriers, is_deltas.then_some(true), exclude)
+        }
+        None => scan_carriers_for_role(ctx, body, is_deltas, exclude),
+    }
+}
+
+/// The topology tables of one stream of a site. A scanned Deltas stream
+/// reads the site's carriers and the `base` tables of the streams before it.
+fn stream_topology(
+    (body, header): (&[u8], &StreamHeader),
+    stream_typed_facts: &typed::Facts,
+    node_tables: Option<topology::Tables>,
+    carriers: &CarrierIndex,
+    evidence: &SiteEvidence,
+    base: &topology::Tables,
+    exclude: &HashSet<u32>,
+) -> topology::Tables {
+    let mut typed_face_offsets =
+        stream_typed_facts.selected_face_offsets(evidence.bridge_attrs.as_ref());
+    for face in &stream_typed_facts.faces {
+        if whole_closed_face(
+            face.refs[2],
+            carriers.surface(face.refs[4]),
+            evidence.looped_bridge_attrs.contains(&face.attr),
+        ) || whole_closed_offset_face(
+            face.refs[2],
+            face.refs[4],
+            carriers,
+            evidence.looped_bridge_attrs.contains(&face.attr),
+        ) {
+            typed_face_offsets.remove(&face.offset);
+        }
+    }
+    let curve_attrs = carriers.curve_attrs();
+    let mut tables = if let Some(mut tables) = node_tables {
+        topology::nodes::own(&mut tables, &typed_face_offsets, &evidence.owner_attrs);
+        tables
+    } else if is_deltas_stream(header) {
+        let mut scanned = topology::scan_deltas_with_owner_attrs(
+            body,
+            &curve_attrs,
+            &typed_face_offsets,
+            base,
+            &evidence.owner_attrs,
+        );
+        scanned.remove_attrs(exclude);
+        scanned
+    } else if crate::parasolid::is_body_stream(header) {
+        topology::scan_with_owner_attrs(
+            body,
+            &curve_attrs,
+            &typed_face_offsets,
+            &evidence.owner_attrs,
+        )
+    } else {
+        topology::scan_plain_with_owner_attrs(
+            body,
+            &curve_attrs,
+            &typed_face_offsets,
+            &evidence.owner_attrs,
+        )
+    };
+    tables.record_looped_bridge_attrs(&evidence.looped_bridge_attrs);
+    tables
+}
+
+/// The typed-fact, carrier and topology identities of each Deltas stream of
+/// a site that has no complete node sequence. The streams are read in decode
+/// order with the site evidence and accumulated tables of the decode scan,
+/// excluding `exclude`.
+fn incomplete_deltas_identities(
+    ctx: &DecodeContext<'_>,
+    ordered: &[&(&[u8], &StreamHeader)],
+    complete: &[Option<&cadmpeg_parasolid::records::DeltasRecords<'_>>],
+    typed_streams: &[typed::Facts],
+    node_tables: &[Option<(topology::Tables, Option<NodeCarriers>)>],
+    exclude: &HashSet<u32>,
+) -> Result<Vec<HashSet<u32>>, cadmpeg_core::CodecError> {
+    let incomplete = |(entry, complete): (&&(&[u8], &StreamHeader), &Option<_>)| {
+        is_deltas_stream(entry.1) && complete.is_none()
+    };
+    let Some(last) = ordered.iter().zip(complete).rposition(incomplete) else {
+        return Ok(vec![HashSet::new(); ordered.len()]);
+    };
+    let mut entity_streams = Vec::new();
+    for (payload, header) in ordered {
+        entity_streams.push((header_body(payload, header)?, is_deltas_stream(header)));
+    }
+    let evidence = SiteEvidence::of(
+        &entity_streams,
+        typed_streams,
+        ordered.iter().map(|(_, header)| {
+            !is_deltas_stream(header) && !crate::parasolid::is_body_stream(header)
+        }),
+    );
+    let no_conflicts = HashSet::new();
+    let mut carriers = CarrierIndex::default();
+    let mut tables: Option<topology::Tables> = None;
+    let mut identities = vec![HashSet::new(); ordered.len()];
+    for (index, ((((_, header), complete), facts), node)) in ordered
+        .iter()
+        .zip(complete)
+        .zip(typed_streams)
+        .zip(node_tables)
+        .enumerate()
+        .take(last + 1)
+    {
+        let (body, is_deltas) = entity_streams[index];
+        let (node_tables, node_carriers) = node.clone().unzip();
+        let exclude = if is_deltas { exclude } else { &no_conflicts };
+        let stream_carriers =
+            stream_carriers(ctx, body, is_deltas, node_carriers.flatten(), exclude)?;
+        let scanned_carriers: HashSet<u32> = stream_carriers.attrs().collect();
+        carriers.merge_missing(stream_carriers);
+        let scanned = stream_topology(
+            (body, header),
+            facts,
+            node_tables,
+            &carriers,
+            &evidence,
+            tables.as_ref().unwrap_or(&topology::Tables::default()),
+            exclude,
+        );
+        if is_deltas && complete.is_none() {
+            identities[index] = facts
+                .attrs()
+                .chain(scanned_carriers)
+                .chain(scanned.attrs())
+                .collect();
+        }
+        match &mut tables {
+            Some(tables) => tables.merge_deltas(scanned, evidence.bridge_attrs.as_ref()),
+            None => tables = Some(scanned),
+        }
+    }
+    Ok(identities)
+}
+
+/// The identities that two Deltas streams of a site carry where one stream
+/// carries the identity outside its framed nodes. No comparison of framed
+/// versions establishes their agreement. `scanned` holds the identities of
+/// each incomplete Deltas stream.
+fn unframed_shared(
+    entity_streams: &[(&[u8], bool)],
+    framed: &[Option<cadmpeg_parasolid::records::DeltasRecords<'_>>],
+    scanned: Vec<HashSet<u32>>,
+) -> HashSet<u32> {
+    let mut streams = HashMap::<u32, usize>::new();
+    let mut unframed = HashSet::new();
+    for (((_, prefixed), framed), scanned) in entity_streams.iter().zip(framed).zip(scanned) {
+        if !prefixed {
+            continue;
+        }
+        let mut identities: HashSet<u32> = framed
+            .iter()
+            .flat_map(|records| records.nodes().map(|node| node.index()))
+            .collect();
+        for attr in scanned {
+            if identities.insert(attr) {
+                unframed.insert(attr);
+            }
+        }
+        for attr in identities {
+            *streams.entry(attr).or_default() += 1;
+        }
+    }
+    unframed.retain(|attr| streams.get(attr).is_some_and(|count| *count > 1));
+    unframed
+}
+
+fn decode_body(
+    ctx: &DecodeContext<'_>,
+    body: &[u8],
+    stream: &cadmpeg_ir::StreamName,
+    deltas: bool,
+) -> Result<Brep, cadmpeg_core::CodecError> {
+    let mut carriers = scan_carriers_for_role(ctx, body, deltas, &HashSet::new())?;
+    let curve_attrs = carriers.curve_attrs();
+    let typed_facts = typed::scan(body);
+    let owner_attrs = typed::topology_owner_attrs_for_streams([(&typed_facts, body, false)]);
+    let typed_face_attrs = typed_facts.valid_ownership_face_attrs();
+    let typed_face_offsets = typed_facts.selected_face_offsets(typed_face_attrs.as_ref());
+    let t = topology::scan_with_owner_attrs(body, &curve_attrs, &typed_face_offsets, &owner_attrs);
+    let entity_facts = entity::scan_metadata(body, false);
+    decode_graph(ctx, &mut carriers, &t, entity_facts, &typed_facts, stream)
+}
+
+fn admit_brep_entity(ctx: &DecodeContext<'_>) -> Result<(), cadmpeg_core::CodecError> {
+    ctx.charge_entities(1, "admit SLDPRT B-rep entity")?;
+    Ok(())
+}
+
+/// Bytes one NURBS surface keeps for `rows` × `columns` poles and `knots`
+/// knot values, or `None` past `u64`. Rational poles are the larger form, so
+/// the count bounds either form.
+fn nurbs_surface_bytes(rows: usize, columns: usize, knots: usize) -> Option<u64> {
+    type Pole = cadmpeg_ir::geometry::nurbs::WeightedPole3<FinitePoint3>;
+    let poles = rows
+        .checked_mul(columns)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<Pole>()));
+    let headers = rows.checked_mul(std::mem::size_of::<Vec<Pole>>());
+    let knots = knots.checked_mul(std::mem::size_of::<f64>());
+    poles
+        .zip(headers)
+        .and_then(|(poles, headers)| poles.checked_add(headers))
+        .zip(knots)
+        .and_then(|(bytes, knots)| bytes.checked_add(knots))
+        .map(u64_from_index)
+}
+
+/// Heap bytes a copy of solved surface geometry allocates, or `None` past
+/// `u64`.
+fn solved_surface_bytes(geometry: &SolvedSurfaceGeometry) -> Option<u64> {
+    match geometry {
+        SolvedSurfaceGeometry::Nurbs(surface) => nurbs_surface_bytes(
+            surface.u_count(),
+            surface.v_count(),
+            surface.u_knots().as_slice().len() + surface.v_knots().as_slice().len(),
+        ),
+        SolvedSurfaceGeometry::Polygonal(surface) => {
+            u64_from_index(std::mem::size_of_val(surface.vertices()))
+                .checked_add(u64_from_index(std::mem::size_of_val(surface.triangles())))
+        }
+        SolvedSurfaceGeometry::Transformed(placed) => solved_surface_bytes(placed.basis())?
+            .checked_add(u64_from_index(std::mem::size_of::<SolvedSurfaceGeometry>())),
+        SolvedSurfaceGeometry::Plane(_)
+        | SolvedSurfaceGeometry::Cylinder(_)
+        | SolvedSurfaceGeometry::Cone(_)
+        | SolvedSurfaceGeometry::Sphere(_)
+        | SolvedSurfaceGeometry::Torus(_)
+        | SolvedSurfaceGeometry::Unknown { .. } => Some(0),
+    }
+}
+
+/// Charges surface bytes to the retained ceiling. A size past `u64` exceeds
+/// every ceiling, so it is charged as `u64::MAX` and one more byte.
+fn retain_surface_bytes(
+    ctx: &DecodeContext<'_>,
+    bytes: Option<u64>,
+    operation: &'static str,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let Some(bytes) = bytes else {
+        ctx.retain_bytes(u64::MAX, operation)?;
+        return ctx.retain_bytes(1, operation);
+    };
+    ctx.retain_bytes(bytes, operation)
+}
+
+/// Copy carrier geometry into the decoded B-rep after charging the copy to
+/// the retained-byte ceiling.
+fn retain_surface_geometry(
+    ctx: &DecodeContext<'_>,
+    geometry: &SurfaceGeometry,
+) -> Result<SurfaceGeometry, cadmpeg_core::CodecError> {
+    let bytes = geometry.solved().map_or(Some(0), solved_surface_bytes);
+    retain_surface_bytes(ctx, bytes, "retain Parasolid surface geometry copy")?;
+    Ok(geometry.clone())
+}
+
+fn unique_body_modifiers(modifiers: Vec<attrib::BodyModifier>) -> Vec<attrib::BodyModifier> {
+    let mut by_attr = HashMap::<u32, Option<attrib::BodyModifier>>::new();
+    for modifier in modifiers {
+        match by_attr.entry(modifier.body_attr) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(modifier));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref().is_some_and(|previous| {
+                    previous.feature_source_id != modifier.feature_source_id
+                }) {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for modifier in by_attr.into_values().flatten() {
+        out.push(modifier);
+    }
+    out.sort_by_key(|record| record.body_attr);
+    out
+}
+
+fn unique_face_colors(
+    colors: Vec<entity::FaceColor>,
+    versions: Vec<entity::FaceColorVersion>,
+) -> (Vec<entity::FaceColor>, usize) {
+    let mut current_versions = HashMap::<u32, (u32, usize)>::new();
+    for version in versions {
+        current_versions
+            .entry(version.face_attr)
+            .and_modify(|current| {
+                *current = (*current).max((version.seq, version.stream_order));
+            })
+            .or_insert((version.seq, version.stream_order));
+    }
+
+    let mut by_face = HashMap::<u32, Vec<entity::FaceColor>>::new();
+    for color in colors {
+        if current_versions.get(&color.face_attr) == Some(&(color.face_seq, color.stream_order)) {
+            by_face.entry(color.face_attr).or_default().push(color);
+        }
+    }
+
+    let mut unresolved = 0;
+    let mut selected = Vec::new();
+    for mut candidates in by_face.into_values() {
+        let first = &candidates[0];
+        if candidates.iter().all(|candidate| {
+            candidate.color_attr == first.color_attr && candidate.color == first.color
+        }) {
+            selected.push(candidates.swap_remove(0));
+        } else {
+            unresolved += 1;
+        }
+    }
+
+    let mut by_color = HashMap::<u32, Vec<entity::FaceColor>>::new();
+    for color in selected {
+        by_color.entry(color.color_attr).or_default().push(color);
+    }
+    let mut out = Vec::new();
+    for candidates in by_color.into_values() {
+        let first = &candidates[0];
+        if candidates
+            .iter()
+            .all(|candidate| candidate.color == first.color)
+        {
+            out.extend(candidates);
+        } else {
+            unresolved += candidates.len();
+        }
+    }
+    out.sort_by_key(|color| (color.face_attr, color.offset));
+    (out, unresolved)
+}
+
+fn typed_body_records(facts: &typed::Facts, tables: &topology::Tables) -> Option<Vec<BodyRecord>> {
+    let mut bridge_attrs = HashSet::new();
+    for attr in tables.bridges().keys().copied() {
+        bridge_attrs.insert(attr);
+    }
+    let hierarchies = facts.hierarchies(&bridge_attrs)?;
+    let mut records = Vec::new();
+    for hierarchy in hierarchies {
+        let mut body_refs = Vec::new();
+        for attr in hierarchy
+            .regions
+            .iter()
+            .map(|region| region.attr)
+            .chain(hierarchy.shells.iter().map(|shell| shell.attr))
+            .chain(hierarchy.faces.iter().map(|(face, _)| *face))
+        {
+            body_refs.push(attr);
+        }
+        body_refs.sort_unstable();
+        body_refs.dedup();
+        let mut regions = Vec::new();
+        for region in &hierarchy.regions {
+            let mut shells = Vec::new();
+            for shell in hierarchy
+                .shells
+                .iter()
+                .filter(|shell| shell.refs[6] == region.attr)
+            {
+                let mut refs = Vec::new();
+                for face_attr in hierarchy
+                    .faces
+                    .iter()
+                    .filter(|(_, shell_attr)| *shell_attr == shell.attr)
+                    .map(|(face_attr, _)| *face_attr)
+                {
+                    refs.push(face_attr);
+                }
+                refs.sort_unstable();
+                refs.dedup();
+                shells.push(ShellRecord {
+                    attr: shell.attr,
+                    offset: shell.offset,
+                    refs,
+                });
+            }
+            shells.sort_by_key(|record| record.attr);
+            regions.push((
+                region.kind,
+                RegionRecord {
+                    attr: region.attr,
+                    offset: region.offset,
+                    shells,
+                },
+            ));
+        }
+        let owns_faces =
+            |record: &RegionRecord| record.shells.iter().any(|shell| !shell.refs.is_empty());
+        let body_has_material = regions
+            .iter()
+            .any(|(kind, record)| *kind == RegionKind::Solid || owns_faces(record));
+        // The faces of the neighbouring region's shell bound a void region that
+        // owns no faces, so that region has no neutral boundary of its own.
+        regions.retain(|(kind, record)| {
+            !body_has_material || *kind == RegionKind::Solid || owns_faces(record)
+        });
+        let mut regions: Vec<_> = regions.into_iter().map(|(_, record)| record).collect();
+        regions.sort_by_key(|record| record.attr);
+        records.push(BodyRecord {
+            attr: hierarchy.body.attr,
+            kind: hierarchy.body.kind,
+            refs: body_refs,
+            offset: hierarchy.body.offset,
+            regions,
+        });
+    }
+    records.sort_by_key(|record| record.attr);
+    (!records.is_empty()).then_some(records)
+}
+
+fn sorted_topology_sequences(pairs: impl IntoIterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
+    let mut sequences = Vec::new();
+    sequences.extend(pairs);
+    sequences.sort_unstable();
+    sequences.dedup();
+    sequences
+}
+
+fn sorted_graph_attrs(attrs: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut sorted = Vec::new();
+    sorted.extend(attrs);
+    sorted.sort_unstable();
+    sorted
+}
+
+fn report_withheld_ownership(out: &mut Brep, facts: &typed::Facts) {
+    let Some(attrs) = facts.valid_ownership_face_attrs() else {
+        return;
+    };
+    let face_ids: HashSet<_> = out.faces.iter().map(|face| face.id.as_str()).collect();
+    let faces = attrs
+        .iter()
+        .filter(|attr| {
+            let id = id_face(**attr);
+            !face_ids.contains(id.as_str())
+        })
+        .count();
+    let mut bodies = 0;
+    let mut shells = 0;
+    if let Some(hierarchies) = facts.hierarchies(&attrs) {
+        let body_ids: HashSet<_> = out.bodies.iter().map(|body| body.id.as_str()).collect();
+        let shell_ids: HashSet<_> = out.shells.iter().map(|shell| shell.id.as_str()).collect();
+        bodies = hierarchies
+            .iter()
+            .filter(|hierarchy| {
+                let id = BodyId::compose(&body_namespace(), hierarchy.body.attr);
+                !body_ids.contains(id.as_str())
+            })
+            .count();
+        shells = hierarchies
+            .iter()
+            .flat_map(|hierarchy| &hierarchy.shells)
+            .filter(|native| {
+                let id = ShellId::compose(&shell_namespace(), native.attr);
+                !shell_ids.contains(id.as_str())
+            })
+            .count();
+    }
+    let withheld = bodies + shells + faces;
+    if withheld > 0 {
+        out.losses.push(crate::loss::SldprtLossCode::TopologyOwnershipWithheld.note(format!(
+            "{withheld} current typed ownership node(s) are withheld: {bodies} body node(s), {shells} shell node(s), and {faces} face node(s)."
+        )));
+    }
+}
+
+fn decode_graph(
+    ctx: &DecodeContext<'_>,
+    carriers: &mut CarrierIndex,
+    t: &topology::Tables,
+    entity_facts: entity::Facts,
+    typed_facts: &typed::Facts,
+    stream: &cadmpeg_ir::StreamName,
+) -> Result<Brep, cadmpeg_core::CodecError> {
+    let mut out = decode_graph_inner(ctx, carriers, t, entity_facts, typed_facts, stream)?;
+    out.losses.extend(out.approximations.take_notes());
+    report_withheld_ownership(&mut out, typed_facts);
+    Ok(out)
+}
+
+fn decode_graph_inner(
+    ctx: &DecodeContext<'_>,
+    carriers: &mut CarrierIndex,
+    t: &topology::Tables,
+    entity_facts: entity::Facts,
+    typed_facts: &typed::Facts,
+    stream: &cadmpeg_ir::StreamName,
+) -> Result<Brep, cadmpeg_core::CodecError> {
+    carriers.refine_intersections(ctx)?;
+    let lane_refusals = std::mem::take(&mut carriers.lane_refusals);
+    let carriers: &CarrierIndex = carriers;
+    let typed_records = typed_body_records(typed_facts, t);
+    let body_records = typed_records.unwrap_or_default();
+    let body_modifiers = unique_body_modifiers(entity_facts.body_modifiers);
+    let (face_colors, conflicting_face_colors) =
+        unique_face_colors(entity_facts.face_colors, entity_facts.face_color_versions);
+    let face_bridge_sequences = sorted_topology_sequences(
+        t.bridges()
+            .values()
+            .map(|bridge| (bridge.sequence, bridge.attr)),
+    );
+    let edge_use_sequences = sorted_topology_sequences(
+        t.edge_uses()
+            .values()
+            .map(|edge_use| (edge_use.sequence, edge_use.attr)),
+    );
+    let vertex_use_sequences = sorted_topology_sequences(
+        t.vertex_uses()
+            .values()
+            .map(|vertex_use| (vertex_use.sequence, vertex_use.attr)),
+    );
+
+    let mut owned_face_colors = Vec::new();
+    for value in face_colors {
+        owned_face_colors.push(OwnedFaceColor {
+            value,
+            source_stream: stream.clone(),
+            site_key: None,
+        });
+    }
+    let mut out = Brep {
+        face_colors: owned_face_colors,
+        face_bridge_sequences,
+        edge_use_sequences,
+        vertex_use_sequences,
+        body_modifiers,
+        losses: lane_refusals,
+        stats: Stats {
+            source_entity_records: entity_facts.entity_count,
+            unresolved_face_colors: entity_facts.unresolved_face_colors + conflicting_face_colors,
+            ..Stats::default()
+        },
+        ..Brep::default()
+    };
+    if carriers.has_unvalidated_offset() {
+        out.losses.push(crate::loss::SldprtLossCode::GeometryOffsetValidityUnresolved.note(
+            "Offset records with unresolved validity, sense, distance, or support graphs retain opaque geometry.",
+        ));
+    }
+    if carriers.has_surface_category_conflict() {
+        out.losses.push(crate::loss::SldprtLossCode::GeometrySurfaceCarrierAmbiguous.note(
+            "Multiple surface carrier categories claim one node index; conflicting typed surfaces remain untransferred.",
+        ));
+    }
+    let mut annotations = AnnotationBuilder::new();
+    let source_stream = StreamHandle::new(stream.clone());
+    if t.bridges().is_empty() {
+        return Ok(out);
+    }
+
+    let mut faces: Vec<_> = t
+        .bridges()
+        .values()
+        .map(|bridge| walk_face(bridge, t))
+        .collect();
+    faces.sort_by_key(|face| face.bridge_attr);
+    out.stats.unresolved_topology_loops = faces
+        .iter()
+        .filter_map(|face| face.unresolved_loop)
+        .collect::<HashSet<_>>()
+        .len();
+    out.stats.unresolved_topology_fins = faces
+        .iter()
+        .flat_map(|face| face.unresolved_fins.iter().copied())
+        .collect::<HashSet<_>>()
+        .len();
+    out.stats.withheld_fin_links = faces.iter().map(|face| face.withheld_forward_links).sum();
+
+    // Edge attr -> walked FINs of the edge. The ring order supplies one end of
+    // a boundary edge; a reciprocal twin corroborates it for a two-sided edge.
+    let mut edge_incidence: HashMap<u32, Vec<EdgeIncidence>> = HashMap::new();
+    let mut unresolved_vertices = HashSet::new();
+
+    for f in &faces {
+        for (_, vertex_use) in &f.vertex_loops {
+            if t.vertex_is_unresolved(*vertex_use) {
+                unresolved_vertices.insert(*vertex_use);
+            }
+        }
+        for (loop_attr, ring) in &f.loops {
+            let forward_linked = !f.unlinked_loops.contains(loop_attr);
+            let k = ring.len();
+            for (i, &ce_attr) in ring.iter().enumerate() {
+                let Some(ce) = t.coedges().get(&ce_attr) else {
+                    continue;
+                };
+                let adjacent_attr = if forward_linked {
+                    ring[(i + k - 1) % k]
+                } else {
+                    ring[(i + 1) % k]
+                };
+                let own_vuse = ce.refs[4];
+                if t.vertex_is_unresolved(own_vuse) {
+                    unresolved_vertices.insert(own_vuse);
+                }
+                let ring_vuse = t
+                    .coedges()
+                    .get(&adjacent_attr)
+                    .map_or(0, |adjacent| adjacent.refs[4]);
+                let edge_attr = ce.refs[6];
+                if edge_attr != 0 {
+                    edge_incidence
+                        .entry(edge_attr)
+                        .or_default()
+                        .push(EdgeIncidence {
+                            fin: ce_attr,
+                            own_vuse,
+                            ring_vuse,
+                            forward_linked,
+                        });
+                }
+            }
+        }
+    }
+
+    out.stats.unresolved_topology_vertices = unresolved_vertices.len();
+
+    // Kept-entity sets, so only chain-reachable records are emitted.
+    let mut kept_vertices: HashSet<u32> = HashSet::new();
+    let mut kept_points: HashSet<u32> = HashSet::new();
+    // Edge attr -> (canonical start vuse, canonical end vuse, curve carrier
+    // attr, walked FIN attr).
+    let mut edge_ends: HashMap<u32, (u32, u32, u32, u32)> = HashMap::new();
+    // Edges whose FIN lies in a loop that is not forward linked.
+    let mut unlinked_edges: HashSet<u32> = HashSet::new();
+    let mut tolerant_edge_tolerance_mm = HashMap::<u32, f64>::new();
+    let mut tolerant_edges: HashSet<EdgeId> = HashSet::new();
+
+    let mut unresolved_points = HashSet::new();
+    for (edge_attr, incidences) in edge_incidence {
+        let canonical =
+            canonical_coedge_attr(edge_attr, t.edge_uses().get(&edge_attr), t.coedges());
+        let Some(canonical) = canonical else {
+            continue;
+        };
+        let edge_use = t.edge_uses().get(&edge_attr);
+        let stored_curve = edge_use.map_or(0, |edge_use| edge_use.references.curve());
+        // A tolerant edge takes its fins' curve and carries its tolerance (spec §7.6).
+        let curve_attr = if stored_curve == 1 {
+            tolerant_edges.insert(id_edge(edge_attr));
+            if let Some(tolerance) = edge_use.and_then(|edge_use| edge_use.tolerance_m) {
+                tolerant_edge_tolerance_mm.insert(edge_attr, tolerance * LEN_TO_MM);
+            }
+            tolerant_fin_curve(
+                canonical,
+                t.coedges(),
+                |curve| {
+                    carriers.curve(curve).is_some()
+                        || carriers
+                            .surface_curve(curve)
+                            .is_some_and(|carrier| carrier.sweep.is_none())
+                },
+                |curve| carriers.curve(curve).is_some() || carriers.surface_curve(curve).is_some(),
+            )
+            .unwrap_or(0)
+        } else {
+            stored_curve
+        };
+        let mut kept = KeptTopology {
+            vertices: &mut kept_vertices,
+            points: &mut kept_points,
+            unresolved_points: &mut unresolved_points,
+        };
+        let Some(incidence) = incidences
+            .iter()
+            .find(|incidence| incidence.fin == canonical)
+            .copied()
+        else {
+            match recover_dummy_partner_edge(edge_attr, canonical, &incidences, t) {
+                DummyRecovery::Admitted(start_vuse, end_vuse, partner) => {
+                    if !partner.forward_linked {
+                        unlinked_edges.insert(edge_attr);
+                    }
+                    insert_edge_ends(
+                        t,
+                        &mut edge_ends,
+                        &mut kept,
+                        edge_attr,
+                        [start_vuse, end_vuse],
+                        curve_attr,
+                        partner.fin,
+                    );
+                }
+                DummyRecovery::Withheld => {
+                    out.stats.withheld_fin_partners += 1;
+                }
+                DummyRecovery::Absent => {}
+            }
+            continue;
+        };
+        let Some(ring_vuse) = edge_ring_vuse(incidence, &incidences, t.coedges()) else {
+            out.stats.withheld_fin_partners += 1;
+            continue;
+        };
+        if !incidence.forward_linked {
+            unlinked_edges.insert(edge_attr);
+        }
+        let (start_vuse, end_vuse) = incidence.ends(incidence.own_vuse, ring_vuse);
+        insert_edge_ends(
+            t,
+            &mut edge_ends,
+            &mut kept,
+            edge_attr,
+            [start_vuse, end_vuse],
+            curve_attr,
+            canonical,
+        );
+    }
+
+    for (_, vertex_use) in faces.iter().flat_map(|face| &face.vertex_loops) {
+        keep_vertex_use(
+            t,
+            &mut KeptTopology {
+                vertices: &mut kept_vertices,
+                points: &mut kept_points,
+                unresolved_points: &mut unresolved_points,
+            },
+            *vertex_use,
+        );
+    }
+
+    out.stats.unresolved_topology_points = unresolved_points.len();
+
+    let bare_surface_curves = bare_surface_curves(ctx, t, carriers, &edge_ends)?;
+    let surface_curve = |attr: u32| {
+        carriers
+            .surface_curve(attr)
+            .or_else(|| bare_surface_curves.get(&attr))
+    };
+
+    // Points.
+    let point_attrs = sorted_graph_attrs(kept_points.iter().copied());
+    for a in point_attrs {
+        let rec = &t.points()[&a];
+        annotations.note(
+            id_point(a).as_str(),
+            &source_stream,
+            u64_from_index(rec.offset),
+            Some("00_1d"),
+        );
+        let [x, y, z] = rec.xyz_m;
+        let finite_position = cadmpeg_ir::features::FinitePoint3::new(
+            cadmpeg_ir::math::Point3::new(x * LEN_TO_MM, y * LEN_TO_MM, z * LEN_TO_MM),
+        )
+        .ok_or(Point::NON_FINITE_POSITION)
+        .map_err(cadmpeg_core::CodecError::malformed)?;
+        admit_brep_entity(ctx)?;
+        out.points
+            .push(Point::new(id_point(a), finite_position, None));
+    }
+
+    // Vertices.
+    let vuse_attrs = sorted_graph_attrs(kept_vertices.iter().copied());
+    for a in vuse_attrs {
+        let rec = &t.vertex_uses()[&a];
+        let point_attr = rec.refs[4];
+        annotations.note(
+            id_vertex(a).as_str(),
+            &source_stream,
+            u64_from_index(rec.offset),
+            Some("00_12"),
+        );
+        admit_brep_entity(ctx)?;
+        out.vertices.push(Vertex {
+            id: id_vertex(a),
+            point: id_point(point_attr),
+            tolerance: rec
+                .tolerance_m
+                .map(|value| {
+                    cadmpeg_ir::scalar::PositiveReal::new(value * LEN_TO_MM).ok_or_else(|| {
+                        cadmpeg_core::CodecError::malformed(
+                            "VERTEX tolerance is outside finite millimetres",
+                        )
+                    })
+                })
+                .transpose()?,
+        });
+    }
+
+    // Curves and edges. An edge keeps a curve only when its carrier decodes to a
+    // curve kind; a nonzero-but-untyped carrier is counted as loss.
+    let mut emitted_curves: HashSet<u32> = HashSet::new();
+    let mut surface_curve_attrs = Vec::new();
+    let mut edge_set: HashSet<u32> = HashSet::new();
+    let mut edge_endpoint_positions = HashMap::<u32, [cadmpeg_ir::math::Point3; 2]>::new();
+    let mut edge_curve_spans = HashMap::<u32, (u32, Option<[f64; 2]>)>::new();
+    let mut closed_edge_starts = HashMap::<u32, cadmpeg_ir::math::Point3>::new();
+    let mut reversed_edge_orientation = HashSet::<u32>::new();
+    let edge_attrs = sorted_graph_attrs(edge_ends.keys().copied());
+    for e in edge_attrs {
+        let (start_v, end_v, curve_attr, fin_attr) = edge_ends[&e];
+        let resolved_endpoints = kept_vertices.contains(&start_v) && kept_vertices.contains(&end_v);
+        let vertexless = !resolved_endpoints && start_v <= 1 && end_v <= 1;
+        let closed_point = if vertexless {
+            match closed_edge_start(ctx, carriers.curve(curve_attr))? {
+                None => surface_curve(curve_attr).and_then(surface_curve_ring_start),
+                closed => closed,
+            }
+        } else {
+            None
+        };
+        if vertexless
+            && !admit_vertexless_ring_edge(
+                [e, fin_attr, curve_attr],
+                closed_point.is_some(),
+                &faces,
+                t,
+            )
+        {
+            out.stats.withheld_ring_edges += 1;
+            continue;
+        }
+        if !resolved_endpoints && closed_point.is_none() {
+            continue;
+        }
+        let (mut start_id, mut end_id) = if let Some((position, _)) = closed_point {
+            let point_id = id_closed_point(e);
+            let vertex_id = id_closed_vertex(e);
+            let seam_note = if carriers.curve(curve_attr).is_some_and(|curve| {
+                matches!(
+                    curve.carrier().geometry,
+                    CurveGeometry::Solved(SolvedCurveGeometry::Circle(_))
+                )
+            }) {
+                "derived_closed_circle_seam"
+            } else {
+                "derived_closed_curve_seam"
+            };
+            annotations.note(point_id.as_str(), &source_stream, 0, Some(seam_note));
+            annotations.exactness(point_id.as_str(), Exactness::Derived);
+            annotations.note(vertex_id.as_str(), &source_stream, 0, Some(seam_note));
+            annotations.exactness(vertex_id.as_str(), Exactness::Derived);
+            let finite_position = cadmpeg_ir::features::FinitePoint3::new(position)
+                .ok_or(Point::NON_FINITE_POSITION)
+                .map_err(cadmpeg_core::CodecError::malformed)?;
+            admit_brep_entity(ctx)?;
+            out.points
+                .push(Point::new(point_id.clone(), finite_position, None));
+            admit_brep_entity(ctx)?;
+            out.vertices.push(Vertex {
+                id: vertex_id.clone(),
+                point: point_id,
+                tolerance: None,
+            });
+            (vertex_id.clone(), vertex_id)
+        } else {
+            (id_vertex(start_v), id_vertex(end_v))
+        };
+        if resolved_endpoints {
+            let position = |vertex_use: u32| {
+                let point_attr = &t.vertex_uses().get(&vertex_use)?.refs[4];
+                let [x, y, z] = t.points().get(point_attr)?.xyz_m;
+                Some(cadmpeg_ir::math::Point3::new(
+                    x * LEN_TO_MM,
+                    y * LEN_TO_MM,
+                    z * LEN_TO_MM,
+                ))
+            };
+            if let (Some(start), Some(end)) = (position(start_v), position(end_v)) {
+                edge_endpoint_positions.insert(e, [start, end]);
+            }
+        }
+        let vertex_tolerance = |vertex_use: u32| {
+            t.vertex_uses()
+                .get(&vertex_use)
+                .and_then(|vertex| vertex.tolerance_m)
+                .map(|tolerance| tolerance * LEN_TO_MM)
+        };
+        let forward_linked = !unlinked_edges.contains(&e);
+        let marker_conflict = carriers.marker_conflict(curve_attr);
+        if marker_conflict {
+            out.stats.marker_conflict_edges += 1;
+        }
+        let mut chart_vertex_gap: f64 = 0.0;
+        let parameter_range = match carriers.curve(curve_attr) {
+            Some(IndexedCurve::Derived(chart)) if chart.carrier.parameter_range.is_none() => {
+                match edge_endpoint_positions.get(&e) {
+                    Some(endpoints) => {
+                        let allowance = [start_v, end_v]
+                            .map(vertex_tolerance)
+                            .into_iter()
+                            .flatten()
+                            .fold(
+                                carriers
+                                    .stored_chordal_error(curve_attr)
+                                    .or(chart.support_data.fit_tolerance_mm)
+                                    .unwrap_or(0.0),
+                                f64::max,
+                            );
+                        chart_edge_range(ctx, chart, *endpoints, allowance)?.map(
+                            |(range, reversed, gap)| {
+                                chart_vertex_gap = gap;
+                                (range, reversed)
+                            },
+                        )
+                    }
+                    None => None,
+                }
+            }
+            Some(_) if marker_conflict => None,
+            Some(carrier) => edge_parameter_range(
+                ctx,
+                carrier.carrier(),
+                edge_endpoint_positions.get(&e).copied(),
+                [start_v, end_v].map(vertex_tolerance),
+                start_v == end_v,
+                forward_linked,
+            )?,
+            None => None,
+        };
+        if let Some((start, _)) = closed_point {
+            closed_edge_starts.insert(e, start);
+        }
+        // A closed edge spans its carrier's whole domain (spec §7.3).
+        edge_curve_spans.insert(
+            e,
+            (
+                curve_attr,
+                parameter_range
+                    .map(|(range, _)| range)
+                    .or(closed_point.map(|(_, domain)| domain)),
+            ),
+        );
+        // An edge without a resolved range takes its direction from the ends of
+        // its curve's domain, else from its vertices' parameters on a NURBS
+        // curve, and else from a compact analytic curve's orientation marker.
+        let against_curve = match parameter_range {
+            Some((_, reversed)) => reversed,
+            None => {
+                let carrier = carriers.curve(curve_attr).map(IndexedCurve::carrier);
+                let vertex_bound = |vertex_use: u32| {
+                    vertex_tolerance(vertex_use).map_or(LINEAR_RESOLUTION_MM, |tolerance| {
+                        looser_tolerance(tolerance, LINEAR_RESOLUTION_MM)
+                    })
+                };
+                let domain_reversed = carrier
+                    .map(|carrier| {
+                        domain_endpoint_reversal(
+                            ctx,
+                            carrier,
+                            edge_endpoint_positions.get(&e).copied(),
+                            [vertex_bound(start_v), vertex_bound(end_v)],
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                let inverse_reversed = match domain_reversed {
+                    Some(reversed) => Some(reversed),
+                    None => carrier
+                        .map(|carrier| {
+                            vertex_parameter_reversal(
+                                ctx,
+                                carrier,
+                                edge_endpoint_positions.get(&e).copied(),
+                            )
+                        })
+                        .transpose()?
+                        .flatten(),
+                };
+                inverse_reversed.unwrap_or_else(|| {
+                    carrier.is_some_and(|carrier| carrier.runs_against_edges(forward_linked))
+                })
+            }
+        };
+        if against_curve {
+            std::mem::swap(&mut start_id, &mut end_id);
+            if let Some(endpoints) = edge_endpoint_positions.get_mut(&e) {
+                endpoints.swap(0, 1);
+            }
+            reversed_edge_orientation.insert(e);
+        }
+        // An SP_CURVE edge runs from the low end of its range (spec §7.6).
+        if let (None, Some(carrier), Some(endpoints)) = (
+            carriers.curve(curve_attr),
+            surface_curve(curve_attr),
+            edge_endpoint_positions.get(&e).copied(),
+        ) {
+            let [low, high] = surface_curve_ends(carrier);
+            let forward = low.distance(endpoints[0]) + high.distance(endpoints[1]);
+            let backward = low.distance(endpoints[1]) + high.distance(endpoints[0]);
+            if backward < forward {
+                std::mem::swap(&mut start_id, &mut end_id);
+                if let Some(endpoints) = edge_endpoint_positions.get_mut(&e) {
+                    endpoints.swap(0, 1);
+                }
+                reversed_edge_orientation.insert(e);
+            }
+        }
+        let eu = t.edge_uses().get(&e);
+        let mut curve = None;
+        if curve_attr != 0 {
+            match carriers.curve(curve_attr) {
+                Some(indexed) => {
+                    let carrier = indexed.carrier();
+                    if emitted_curves.insert(curve_attr) {
+                        emit_curve(ctx, &mut out, carrier)?;
+                        out.approximations.intersection(indexed);
+                        if matches!(indexed, IndexedCurve::Derived(_)) {
+                            let offset = carrier.offset;
+                            annotations.note(
+                                id_curve(curve_attr).as_str(),
+                                &source_stream,
+                                u64_from_index(offset),
+                                Some("surface_intersection"),
+                            );
+                            annotations
+                                .exactness(id_curve(curve_attr).as_str(), Exactness::Derived);
+                        }
+                    }
+                    curve = Some(id_curve(curve_attr));
+                }
+                // Attached once its support surface is emitted, below.
+                None if surface_curve(curve_attr).is_some() => {
+                    if emitted_curves.insert(curve_attr) {
+                        surface_curve_attrs.push(curve_attr);
+                    }
+                    curve = Some(id_curve(curve_attr));
+                }
+                _ => {
+                    if emitted_curves.insert(curve_attr) {
+                        let offset = eu.map_or(0, |record| record.offset);
+                        annotations.note(
+                            id_curve(curve_attr).as_str(),
+                            &source_stream,
+                            u64_from_index(offset),
+                            Some("unknown_curve"),
+                        );
+                        annotations.exactness(id_curve(curve_attr).as_str(), Exactness::Unknown);
+                        admit_brep_entity(ctx)?;
+                        out.curves.push(Curve {
+                            parameter_range: None,
+                            id: id_curve(curve_attr),
+                            source_object: None,
+                            geometry: CurveGeometry::Solved(SolvedCurveGeometry::Unknown {
+                                record: None,
+                            }),
+                        });
+                    }
+                    curve = Some(id_curve(curve_attr));
+                    out.stats.unknown_curve_edges += 1;
+                }
+            }
+        }
+        let off = eu.map_or(0, |r| r.offset);
+        annotations.note(
+            id_edge(e).as_str(),
+            &source_stream,
+            u64_from_index(off),
+            Some("00_10"),
+        );
+        let stored_range = carriers
+            .curve(curve_attr)
+            .is_some_and(|carrier| carrier.carrier().parameter_range.is_some());
+        if (parameter_range.is_some() && !stored_range)
+            || (closed_point.is_some() && !marker_conflict)
+        {
+            annotations
+                .derived(id_edge(e).as_str(), "carrier.param_range")
+                .map_err(cadmpeg_core::CodecError::malformed)?;
+        }
+        admit_brep_entity(ctx)?;
+        out.edges.push(Edge {
+            id: id_edge(e),
+            carrier: cadmpeg_ir::topology::EdgeCarrier::new(
+                curve,
+                parameter_range.map(|(range, _)| range).or(closed_point
+                    .filter(|_| !marker_conflict)
+                    .map(|(_, range)| range)),
+            )
+            .map_err(cadmpeg_core::CodecError::malformed)?,
+            start: start_id,
+            end: end_id,
+            tolerance: match carriers.curve(curve_attr) {
+                Some(IndexedCurve::Derived(chart)) => chart
+                    .support_data
+                    .fit_tolerance_mm
+                    .map(|tolerance| tolerance.max(chart_vertex_gap)),
+                _ => None,
+            }
+            .into_iter()
+            .chain(tolerant_edge_tolerance_mm.get(&e).copied())
+            .reduce(f64::max)
+            .and_then(cadmpeg_ir::scalar::PositiveReal::new),
+        });
+        edge_set.insert(e);
+    }
+
+    // A loop is kept only when its whole ring resolves: every coedge exists and
+    // its edge was emitted. A partial ring is dropped whole, so an emitted
+    // coedge's `next`/`prev` never dangle and every emitted loop closes.
+    let mut kept_loops: HashSet<u32> = HashSet::new();
+    for f in &faces {
+        for (loop_attr, ring) in &f.loops {
+            let ok = !ring.is_empty()
+                && ring.iter().all(|c| {
+                    t.coedges()
+                        .get(c)
+                        .is_some_and(|ce| edge_set.contains(&ce.refs[6]))
+                });
+            if ok {
+                kept_loops.insert(*loop_attr);
+            }
+        }
+    }
+    let mut emitted_coedges = HashSet::new();
+    for f in &faces {
+        for (loop_attr, ring) in &f.loops {
+            if kept_loops.contains(loop_attr) {
+                for coedge in ring.iter().copied() {
+                    emitted_coedges.insert(coedge);
+                }
+            }
+        }
+    }
+
+    // Coedges of kept loops: `next`/`prev` from the ring order, partner from a
+    // mutual twin that is itself emitted.
+    for f in &faces {
+        for (loop_attr, ring) in &f.loops {
+            if !kept_loops.contains(loop_attr) {
+                continue;
+            }
+            for &ce_attr in ring {
+                let ce = &t.coedges()[&ce_attr];
+                let edge_attr = ce.refs[6];
+                let twin = ce.refs[5];
+                let partner = t
+                    .coedges()
+                    .get(&twin)
+                    .filter(|tw| tw.refs[5] == ce_attr)
+                    .filter(|_| emitted_coedges.contains(&twin))
+                    .map(|_| id_coedge(twin));
+                annotations.note(
+                    id_coedge(ce_attr).as_str(),
+                    &source_stream,
+                    u64_from_index(ce.offset),
+                    Some("00_11"),
+                );
+                let mut pcurve_refusal = crate::lane_refusal::LaneRefusals::new();
+                let pcurve_refusal = &mut pcurve_refusal;
+                let pcurves = if let Some((_, _, curve_attr, _)) = edge_ends.get(&edge_attr) {
+                    (|| -> Result<_, cadmpeg_core::CodecError> {
+                        let Some(IndexedCurve::Derived(intersection)) = carriers.curve(*curve_attr)
+                        else {
+                            return Ok(None);
+                        };
+                        let support_data = &intersection.support_data;
+                        let curve_carrier = &intersection.carrier;
+                        let Some(SolvedCurveGeometry::Nurbs(curve)) =
+                            curve_carrier.geometry.solved()
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(surface) = carriers.surface(f.surface_attr) else {
+                            return Ok(None);
+                        };
+                        let surface = &surface.geometry;
+                        let Some(endpoint_positions) = edge_endpoint_positions.get(&edge_attr)
+                        else {
+                            return Ok(None);
+                        };
+                        let mut solver_capped = false;
+                        let derived = intersection_support_pcurve(
+                            ctx,
+                            support_data,
+                            curve,
+                            f.surface_attr,
+                            surface,
+                            *endpoint_positions,
+                            &mut IntersectionPcurveSinks {
+                                refusal: pcurve_refusal,
+                                solver_capped: &mut solver_capped,
+                            },
+                        )?;
+                        if solver_capped {
+                            out.stats
+                                .surface_solver_capped
+                                .push(id_coedge(ce_attr).as_str());
+                        }
+                        let Some((geometry, parameter_range, source)) = derived else {
+                            return Ok(None);
+                        };
+                        let Some(finite_range) =
+                            cadmpeg_ir::units::FiniteVector::new(parameter_range)
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(Ok(fit_tolerance)) = support_data
+                            .fit_tolerance_mm
+                            .map(cadmpeg_ir::geometry::FitTolerance::try_new)
+                        else {
+                            return Ok(None);
+                        };
+                        let id = PcurveId::compose(
+                            &pcurve_namespace(),
+                            cadmpeg_ir::identity_key!("intersection:").then(ce_attr),
+                        );
+                        let offset = curve_carrier.offset;
+                        annotations.note(
+                            id.as_str(),
+                            &source_stream,
+                            u64_from_index(offset),
+                            Some(match source {
+                                IntersectionPcurveSource::StoredCache => "surface_intersection_uv",
+                                IntersectionPcurveSource::AnalyticInverse => {
+                                    "derived_intersection_analytic_uv"
+                                }
+                                IntersectionPcurveSource::NurbsInverse => {
+                                    "derived_intersection_nurbs_uv"
+                                }
+                            }),
+                        );
+                        annotations.exactness(id.as_str(), Exactness::Derived);
+                        admit_brep_entity(ctx)?;
+                        out.pcurves.push(Pcurve {
+                            id: id.clone(),
+                            geometry,
+                            metadata: cadmpeg_ir::geometry::pcurve::PcurveMetadata::general(
+                                None,
+                                Some(finite_range),
+                                Some(fit_tolerance),
+                            ),
+                        });
+                        Ok(Some(
+                            cadmpeg_ir::geometry::DirectedParameterRange::new(parameter_range).map(
+                                |range| {
+                                    vec![cadmpeg_ir::topology::PcurveUse {
+                                        pcurve: id,
+                                        isoparametric: None,
+                                        parameter_range: Some(range),
+                                    }]
+                                },
+                            ),
+                        ))
+                    })()?
+                } else {
+                    None
+                };
+                // The sink is drained before the `?` below: an error on that
+                // route must not drop a refusal the walk above already pushed.
+                for record in pcurve_refusal.take_records() {
+                    let note = crate::loss::spline_lane_refusal(format_args!(
+                        "intersection pcurve for coedge {ce_attr}: {record}"
+                    ));
+                    out.losses.push(note);
+                }
+                let pcurves = pcurves
+                    .transpose()
+                    .map_err(cadmpeg_core::CodecError::malformed)?
+                    .unwrap_or_default();
+                // Preserve the fin's stored surface trim even when its nominal
+                // 3D curve was retained; recomputing UVs would lose exact trims.
+                let pcurves = if let Some(trim) = carriers.surface_curve(ce.refs[7]).filter(|trim|trim.surface == f.surface_attr) {
+                    let id=PcurveId::compose(&pcurve_namespace(),cadmpeg_ir::identity_key!("stored-sp:").then(ce_attr));
+                    let range=cadmpeg_ir::units::FiniteVector::new(trim.parameter_range).ok_or_else(||cadmpeg_core::CodecError::Malformed("nonfinite stored trim".into()))?;
+                    admit_brep_entity(ctx)?;
+                    out.pcurves.push(Pcurve{id:id.clone(),geometry:trim.pcurve.clone(),metadata:cadmpeg_ir::geometry::pcurve::PcurveMetadata::general(None,Some(range),None)});
+                    annotations.note(id.as_str(),&source_stream,u64_from_index(trim.offset),Some("stored_surface_parameter_curve"));
+                    vec![cadmpeg_ir::topology::PcurveUse{pcurve:id,isoparametric:None,parameter_range:Some(cadmpeg_ir::geometry::DirectedParameterRange::new(trim.parameter_range).map_err(cadmpeg_core::CodecError::malformed)?)}]
+                } else {pcurves};
+                let mut sense = ce.sense;
+                if reversed_edge_orientation.contains(&edge_attr) {
+                    sense = match sense {
+                        Sense::Forward => Sense::Reversed,
+                        Sense::Reversed => Sense::Forward,
+                    };
+                }
+                admit_brep_entity(ctx)?;
+                out.coedges.push(Coedge {
+                    id: id_coedge(ce_attr),
+                    owner_loop: id_loop(*loop_attr),
+                    edge: id_edge(edge_attr),
+                    radial_next: partner.unwrap_or_else(|| id_coedge(ce_attr)),
+                    sense,
+                    use_curve: None,
+                    pcurves,
+                });
+            }
+        }
+    }
+
+    // Loops.
+    for f in &faces {
+        for (loop_attr, ring) in &f.loops {
+            if !kept_loops.contains(loop_attr) {
+                continue;
+            }
+            let mut coedges = Vec::new();
+            coedges.extend(ring.iter().map(|a| id_coedge(*a)));
+            let off = t.loops().get(loop_attr).map_or(0, |r| r.offset);
+            annotations.note(
+                id_loop(*loop_attr).as_str(),
+                &source_stream,
+                u64_from_index(off),
+                Some("00_0f"),
+            );
+            let Ok(ring) = cadmpeg_ir::topology::LoopRing::new(coedges, Vec::new()) else {
+                continue;
+            };
+            admit_brep_entity(ctx)?;
+            out.loops.push(Loop {
+                id: id_loop(*loop_attr),
+                face: id_face(f.bridge_attr),
+                boundary: cadmpeg_ir::topology::LoopBoundary::Ring(ring),
+            });
+        }
+        for (loop_attr, vertex_use) in &f.vertex_loops {
+            if !kept_vertices.contains(vertex_use) {
+                continue;
+            }
+            let off = t.loops().get(loop_attr).map_or(0, |r| r.offset);
+            annotations.note(
+                id_loop(*loop_attr).as_str(),
+                &source_stream,
+                u64_from_index(off),
+                Some("00_0f"),
+            );
+            admit_brep_entity(ctx)?;
+            out.loops.push(Loop {
+                id: id_loop(*loop_attr),
+                face: id_face(f.bridge_attr),
+                boundary: cadmpeg_ir::topology::LoopBoundary::Vertex {
+                    vertex: id_vertex(*vertex_use),
+                    pcurves: Vec::new(),
+                },
+            });
+            kept_loops.insert(*loop_attr);
+        }
+    }
+    let loop_set = kept_loops;
+
+    // Surfaces + faces.
+    let bind_bridges = |body_records: &[BodyRecord],
+                        faces: &[WalkedFace]|
+     -> Result<_, cadmpeg_core::CodecError> {
+        let mut bridge_group = HashMap::new();
+        let mut bridge_shell = HashMap::new();
+        for (group, body_record) in body_records.iter().enumerate() {
+            for face in faces {
+                if body_record.refs.contains(&face.bridge_attr) {
+                    bridge_group.insert(face.bridge_attr, group);
+                    if let Some(shell) = body_record
+                        .regions
+                        .iter()
+                        .flat_map(|region| &region.shells)
+                        .find(|shell| shell.refs.contains(&face.bridge_attr))
+                    {
+                        bridge_shell.insert(face.bridge_attr, shell.attr);
+                    }
+                }
+            }
+        }
+        Ok((bridge_group, bridge_shell))
+    };
+    let (bridge_group, bridge_shell) = bind_bridges(&body_records, &faces)?;
+    if !body_records.is_empty() {
+        out.stats.unclaimed_faces += faces
+            .iter()
+            .filter(|face| !bridge_group.contains_key(&face.bridge_attr))
+            .count();
+        faces.retain(|face| bridge_group.contains_key(&face.bridge_attr));
+    }
+    let mut face_edges_by_surface_carrier = HashMap::<u32, Vec<HashSet<u32>>>::new();
+    for face in &faces {
+        let mut edges = HashSet::new();
+        for (_, ring) in &face.loops {
+            for coedge in ring {
+                if let Some(edge) = t.coedges().get(coedge).map(|coedge| coedge.refs[6]) {
+                    if edge != 0 {
+                        edges.insert(edge);
+                    }
+                }
+            }
+        }
+        let groups = face_edges_by_surface_carrier
+            .entry(face.surface_attr)
+            .or_default();
+        groups.push(edges);
+    }
+    let exact_boundary_edges = edge_curve_spans
+        .iter()
+        .filter_map(|(edge, (curve, _))| {
+            let exact = matches!(carriers.curve(*curve), Some(IndexedCurve::Exact(_)))
+                || carriers.curve(*curve).is_none() && surface_curve(*curve).is_some();
+            (exact && edge_set.contains(edge)).then_some(*edge)
+        })
+        .collect::<HashSet<_>>();
+    let unresolved_offset_faces = faces.iter().any(|face| {
+        carriers.offset(face.surface_attr).is_some()
+            && offset_for_face(face, t, carriers, &exact_boundary_edges).is_none()
+    });
+    if unresolved_offset_faces && !carriers.has_unvalidated_offset() {
+        out.losses.push(crate::loss::SldprtLossCode::GeometryOffsetValidityUnresolved.note(
+            "Unchecked offset faces with intersection-chart boundaries retain opaque geometry; the exact boundary guide relation has no neutral carrier.",
+        ));
+    }
+    let mut emitted_face_surface_by_carrier = HashMap::<u32, u32>::new();
+    for face in &faces {
+        let bounded_offset = carriers.offset(face.surface_attr).is_none()
+            || offset_for_face(face, t, carriers, &exact_boundary_edges).is_some();
+        let bounded_sweep = sweep_face_can_alias(ctx, face, t, carriers, &exact_boundary_edges)?;
+        if face_admission(face, &loop_set, t, carriers) == FaceAdmission::Admitted
+            && bounded_offset
+            && bounded_sweep
+        {
+            emitted_face_surface_by_carrier
+                .entry(face.surface_attr)
+                .and_modify(|bridge| *bridge = (*bridge).min(face.bridge_attr))
+                .or_insert(face.bridge_attr);
+        }
+    }
+    for f in &faces {
+        match face_admission(f, &loop_set, t, carriers) {
+            FaceAdmission::Admitted => {}
+            FaceAdmission::VertexLoopUnresolved => {
+                out.stats.withheld_vertex_loop_faces += 1;
+                continue;
+            }
+            FaceAdmission::FinAmbiguous => {
+                out.stats.withheld_ambiguous_fin_faces += 1;
+                continue;
+            }
+            FaceAdmission::NoLoop => {
+                out.stats.withheld_faces += 1;
+                continue;
+            }
+        }
+        let loops: Vec<_> = f
+            .loop_attrs()
+            .filter(|loop_attr| loop_set.contains(loop_attr))
+            .map(id_loop)
+            .collect();
+        // Support surface: a decoded surface carrier, else an opaque carrier.
+        let surf_off = t.bridges().get(&f.bridge_attr).map_or(0, |r| r.offset);
+        let mut surface_orientation_reversed = false;
+        match carriers.surface(f.surface_attr) {
+            Some(c) => {
+                let forward_linked = f.loops.is_empty()
+                    || f.loops
+                        .iter()
+                        .all(|(loop_attr, _)| !f.unlinked_loops.contains(loop_attr));
+                surface_orientation_reversed = c.orientation_reversed(forward_linked);
+                annotations.note(
+                    id_surf(f.bridge_attr).as_str(),
+                    &source_stream,
+                    u64_from_index(c.offset),
+                    Some("compact_surface"),
+                );
+                let geometry = retain_surface_geometry(ctx, &c.geometry)?;
+                if let SurfaceGeometry::Solved(solved) = &geometry {
+                    annotate_surface_frame(
+                        &mut annotations,
+                        id_surf(f.bridge_attr).as_str(),
+                        solved,
+                    )?;
+                }
+                admit_brep_entity(ctx)?;
+                out.surfaces.push(Surface {
+                    id: id_surf(f.bridge_attr),
+                    source_object: None,
+                    geometry,
+                });
+            }
+            _ => {
+                let resolved_offset =
+                    if let Some(offset) = offset_for_face(f, t, carriers, &exact_boundary_edges) {
+                        if support_is_acyclic(ctx, offset.support, carriers, &mut HashSet::new())? {
+                            ensure_surface_support(
+                                &mut BrepSink { ctx, out: &mut out },
+                                offset.support,
+                                carriers,
+                                &emitted_face_surface_by_carrier,
+                                &mut annotations,
+                                &source_stream,
+                                &mut HashSet::new(),
+                            )?
+                            .map(|support| (offset, support))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                let blend_attrs = (|| -> Result<_, cadmpeg_core::CodecError> {
+                    let Some(blend) = carriers.blend(f.surface_attr) else {
+                        return Ok(None);
+                    };
+                    let mut face_edges = HashSet::new();
+                    for (_, ring) in &f.loops {
+                        for coedge in ring {
+                            if let Some(edge) = t.coedges().get(coedge).map(|coedge| coedge.refs[6])
+                            {
+                                if edge != 0 {
+                                    face_edges.insert(edge);
+                                }
+                            }
+                        }
+                    }
+                    let vertices = face_vertex_positions(t, f);
+                    let spine = carriers
+                        .curve(blend.spine)
+                        .map(|spine| &spine.carrier().geometry);
+                    let mut resolved = [None, None];
+                    for (slot, support) in blend.supports.iter().enumerate() {
+                        let attr = match support {
+                            BlendSupportRef::Surface(attr) | BlendSupportRef::Pair(attr) => *attr,
+                        };
+                        resolved[slot] = if let Some(pair) = carriers.blend_support_pair(attr) {
+                            if carriers.curve(pair.intersection).is_none() {
+                                None
+                            } else {
+                                let members = pair.supports.map(|member| carriers.surface(member));
+                                let chosen = match (spine, members) {
+                                    (Some(spine), [Some(first), Some(second)]) => {
+                                        super::blend_fit::pair_member(
+                                            ctx,
+                                            spine,
+                                            [&first.geometry, &second.geometry],
+                                            blend.signed_radius,
+                                            &vertices,
+                                        )?
+                                    }
+                                    _ => None,
+                                };
+                                match chosen {
+                                    Some(member) => Some(pair.supports[member]),
+                                    None => {
+                                        let mut adjacent =
+                                            pair.supports.iter().filter_map(|candidate| {
+                                                face_edges_by_surface_carrier
+                                                    .get(candidate)?
+                                                    .iter()
+                                                    .any(|edges| !face_edges.is_disjoint(edges))
+                                                    .then_some(*candidate)
+                                            });
+                                        match (adjacent.next(), adjacent.next()) {
+                                            (Some(member), None) => Some(member),
+                                            _ => None,
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            Some(attr)
+                        };
+                    }
+                    let [Some(first_attr), Some(second_attr)] = resolved else {
+                        return Ok(None);
+                    };
+                    for attr in [first_attr, second_attr] {
+                        if !support_is_acyclic(ctx, attr, carriers, &mut HashSet::new())? {
+                            return Ok(None);
+                        }
+                    }
+                    Ok(Some((blend, first_attr, second_attr)))
+                })()?;
+                let resolved_blend = if let Some((blend, first_attr, second_attr)) = blend_attrs {
+                    if let Some(first) = ensure_surface_support(
+                        &mut BrepSink { ctx, out: &mut out },
+                        first_attr,
+                        carriers,
+                        &emitted_face_surface_by_carrier,
+                        &mut annotations,
+                        &source_stream,
+                        &mut HashSet::new(),
+                    )? {
+                        ensure_surface_support(
+                            &mut BrepSink { ctx, out: &mut out },
+                            second_attr,
+                            carriers,
+                            &emitted_face_surface_by_carrier,
+                            &mut annotations,
+                            &source_stream,
+                            &mut HashSet::new(),
+                        )?
+                        .map(|second| (blend, first, second, [first_attr, second_attr]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((offset, support)) = resolved_offset {
+                    let construction = ProceduralSurfaceId::compose(
+                        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "offset-construction"),
+                        f.bridge_attr,
+                    );
+                    emit_offset_surface(
+                        &mut BrepSink { ctx, out: &mut out },
+                        &mut annotations,
+                        &source_stream,
+                        id_surf(f.bridge_attr),
+                        construction,
+                        support,
+                        offset,
+                    )?;
+                } else if let Some((blend, first, second, support_attrs)) = resolved_blend {
+                    let spine = if let Some(indexed) = carriers.curve(blend.spine) {
+                        let carrier = indexed.carrier();
+                        if emitted_curves.insert(blend.spine) {
+                            emit_curve(ctx, &mut out, carrier)?;
+                            out.approximations.intersection(indexed);
+                            annotations.note(
+                                id_curve(blend.spine).as_str(),
+                                &source_stream,
+                                u64_from_index(carrier.offset),
+                                Some("blend_spine"),
+                            );
+                        }
+                        Some(id_curve(blend.spine))
+                    } else {
+                        None
+                    };
+                    let procedural_id = ProceduralSurfaceId::compose(
+                        &cadmpeg_ir::identity_namespace!("sldprt", "brep", "blend-construction"),
+                        f.bridge_attr,
+                    );
+                    let (vertices, boundary) = blend_boundary(
+                        ctx,
+                        t,
+                        &f.loops,
+                        carriers,
+                        &edge_curve_spans,
+                        &edge_endpoint_positions,
+                        &closed_edge_starts,
+                    )?;
+                    let support_geometry = |attr: u32| {
+                        blend_support_geometry(
+                            ctx,
+                            carriers,
+                            t,
+                            &faces,
+                            &emitted_face_surface_by_carrier,
+                            attr,
+                        )
+                    };
+                    let solved = match (
+                        carriers.curve(blend.spine),
+                        support_geometry(support_attrs[0])?,
+                        support_geometry(support_attrs[1])?,
+                    ) {
+                        (Some(spine_carrier), Some(first_geometry), Some(second_geometry)) => {
+                            blend_surface::solve(
+                                ctx,
+                                &blend_surface::BlendInputs {
+                                    spine: &spine_carrier.carrier().geometry,
+                                    supports: [first_geometry.as_ref(), second_geometry.as_ref()],
+                                    radius: blend.signed_radius.abs(),
+                                    boundary: &boundary,
+                                    vertices: &vertices,
+                                    tolerance: cadmpeg_ir::units::Tolerances::default()
+                                        .linear
+                                        .get(),
+                                },
+                            )?
+                        }
+                        _ => None,
+                    };
+                    let (cache, off_vertex) = match solved {
+                        Some(solved) if solved.holds => (Some(solved.cache), None),
+                        Some(solved) => (None, Some(solved.cache)),
+                        None => (None, None),
+                    };
+                    // Fallback for blends `blend_surface::solve` leaves without a cache.
+                    let cache = match (cache, carriers.curve(blend.spine)) {
+                        (Some(cache), _) => Some(cache),
+                        (None, Some(spine)) => {
+                            let blend_memo: super::index::BlendMemo<'_, '_> =
+                                std::cell::RefCell::new(HashMap::new());
+                            let mut sides = [None, None];
+                            for (slot, resolved) in support_attrs.into_iter().enumerate() {
+                                let (BlendSupportRef::Surface(reference)
+                                | BlendSupportRef::Pair(reference)) = blend.supports[slot];
+                                sides[slot] = match carriers.support_pair_wedge(
+                                    ctx,
+                                    reference,
+                                    &spine.carrier().geometry,
+                                    &vertices,
+                                )? {
+                                    Some(wedge) => Some(super::blend_fit::Side::Wedge(wedge)),
+                                    None => carriers.blend_side(
+                                        ctx,
+                                        resolved,
+                                        &vertices,
+                                        &blend_memo,
+                                    )?,
+                                };
+                            }
+                            let fitted = match sides {
+                                [Some(first), Some(second)] => super::blend_fit::fit(
+                                    ctx,
+                                    &spine.carrier().geometry,
+                                    [first, second],
+                                    blend.signed_radius,
+                                    &vertices,
+                                )?
+                                .map(|fit| blend_surface::BlendCache {
+                                    surface: fit.surface,
+                                    fit_tolerance: fit.fit_tolerance,
+                                }),
+                                _ => None,
+                            };
+                            // The cache states its largest vertex miss; a miss of
+                            // a sizeable share of the radius is another branch.
+                            match fitted.or(off_vertex) {
+                                Some(mut cache) => match blend_surface::vertex_miss(
+                                    ctx,
+                                    &cache,
+                                    &spine.carrier().geometry,
+                                    &vertices,
+                                )? {
+                                    Some(miss)
+                                        if miss
+                                            <= blend.signed_radius.abs()
+                                                * BLEND_VERTEX_MISS_RADIUS_FRACTION =>
+                                    {
+                                        cache.fit_tolerance = cache.fit_tolerance.max(miss);
+                                        Some(cache)
+                                    }
+                                    _ => None,
+                                },
+                                None => None,
+                            }
+                        }
+                        (None, None) => None,
+                    };
+                    let admitted_payload = BlendRadiusLaw::constant(blend.signed_radius)
+                        .and_then(|radius| {
+                            cadmpeg_ir::geometry::surface_payloads::BlendSurfacePayload::try_new(
+                                [
+                                    Some(BlendSupport {
+                                        surface: first,
+                                        reversed: blend.reversed[0],
+                                    }),
+                                    Some(BlendSupport {
+                                        surface: second,
+                                        reversed: blend.reversed[1],
+                                    }),
+                                ],
+                                spine,
+                                radius,
+                                BlendCrossSection::Circular,
+                                cadmpeg_ir::geometry::CacheContract::from_form(None),
+                            )
+                        })
+                        .map_err(cadmpeg_core::CodecError::malformed)?;
+                    let mut definition = ProceduralSurfaceDefinition::Blend(admitted_payload);
+                    if let Some(cache) = &cache {
+                        out.approximations.blend(cache.fit_tolerance);
+                        let fit_tolerance =
+                            cadmpeg_ir::geometry::FitTolerance::try_new(cache.fit_tolerance)
+                                .map_err(cadmpeg_core::CodecError::malformed)?;
+                        definition
+                            .set_cache_fit_tolerance(Some(fit_tolerance))
+                            .map_err(cadmpeg_core::CodecError::malformed)?;
+                    }
+                    admit_brep_entity(ctx)?;
+                    out.procedural_surfaces.push(ProceduralSurface::new(
+                        procedural_id.clone(),
+                        definition,
+                        None,
+                    ));
+                    let derived_cache = cache.is_some();
+                    let geometry = SurfaceGeometry::Procedural {
+                        construction: procedural_id,
+                        cache: cache.map(|cache| SolvedSurfaceGeometry::Nurbs(cache.surface)),
+                    };
+                    annotations.note(
+                        id_surf(f.bridge_attr).as_str(),
+                        &source_stream,
+                        u64_from_index(blend.offset),
+                        Some("00_38"),
+                    );
+                    if derived_cache {
+                        annotations.field_exactness(
+                            id_surf(f.bridge_attr).as_str(),
+                            "geometry.cache",
+                            Exactness::Derived,
+                        )?;
+                    }
+                    admit_brep_entity(ctx)?;
+                    out.surfaces.push(Surface {
+                        id: id_surf(f.bridge_attr),
+                        source_object: None,
+                        geometry,
+                    });
+                } else if let Some(SweepSurfaceResolution {
+                    geometry,
+                    offset,
+                    tag,
+                    exactness,
+                }) = {
+                    let mut sweep_refusal = crate::lane_refusal::LaneRefusals::new();
+                    let resolved = resolve_sweep_surface(
+                        ctx,
+                        carriers,
+                        t,
+                        f,
+                        &mut sweep_refusal,
+                        &mut out.losses,
+                    )?;
+                    for record in sweep_refusal.take_records() {
+                        let note = crate::loss::spline_lane_refusal(format_args!(
+                            "swept surface for face attr {}: {record}",
+                            f.surface_attr
+                        ));
+                        out.losses.push(note);
+                    }
+                    resolved
+                } {
+                    annotations.note(
+                        id_surf(f.bridge_attr).as_str(),
+                        &source_stream,
+                        u64_from_index(offset),
+                        Some(tag),
+                    );
+                    if let Some(exactness) = exactness {
+                        annotations.exactness(id_surf(f.bridge_attr).as_str(), exactness);
+                    }
+                    admit_brep_entity(ctx)?;
+                    out.surfaces.push(Surface {
+                        id: id_surf(f.bridge_attr),
+                        source_object: None,
+                        geometry: SurfaceGeometry::Solved(geometry),
+                    });
+                } else if !face_has_exact_boundary(f, t, &exact_boundary_edges)
+                    || emit_sweep_support(
+                        &mut BrepSink { ctx, out: &mut out },
+                        f.surface_attr,
+                        id_surf(f.bridge_attr),
+                        carriers,
+                        &mut annotations,
+                        &source_stream,
+                    )?
+                    .is_none()
+                {
+                    out.stats.unknown_surface_faces += 1;
+                    annotations.note(
+                        id_surf(f.bridge_attr).as_str(),
+                        &source_stream,
+                        u64_from_index(surf_off),
+                        Some("unknown_surface"),
+                    );
+                    annotations.exactness(id_surf(f.bridge_attr).as_str(), Exactness::Unknown);
+                    admit_brep_entity(ctx)?;
+                    out.surfaces.push(Surface {
+                        id: id_surf(f.bridge_attr),
+                        source_object: None,
+                        geometry: SurfaceGeometry::Solved(SolvedSurfaceGeometry::Unknown {
+                            record: None,
+                        }),
+                    });
+                }
+            }
+        }
+        annotations.note(
+            id_face(f.bridge_attr).as_str(),
+            &source_stream,
+            u64_from_index(surf_off),
+            Some("00_0e"),
+        );
+        admit_brep_entity(ctx)?;
+        let shell_attr = match bridge_shell.get(&f.bridge_attr).copied() {
+            Some(shell_attr) => shell_attr,
+            None => match bridge_group.get(&f.bridge_attr).copied() {
+                Some(group) => u32::try_from(group).map_err(|_| {
+                    cadmpeg_core::CodecError::malformed("Parasolid bridge group index exceeds u32")
+                })?,
+                None => 0,
+            },
+        };
+        out.faces.push(Face {
+            id: id_face(f.bridge_attr),
+            shell: ShellId::compose(&shell_namespace(), shell_attr),
+            surface: id_surf(f.bridge_attr),
+            sense: surface_sense(f.sense, surface_orientation_reversed),
+            loops: cadmpeg_ir::topology::FaceLoops::unspecified(loops),
+            name: None,
+            color: t
+                .bridges()
+                .get(&f.bridge_attr)
+                .and_then(|bridge| bridge.attributes_head)
+                .and_then(|owner| {
+                    out.face_colors
+                        .iter()
+                        .find(|entry| entry.value.face_attr == owner)
+                })
+                .map(|entry| entry.value.color),
+            tolerance: None,
+        });
+    }
+    for attr in surface_curve_attrs {
+        if let Some(carrier) = surface_curve(attr) {
+            attach_surface_curve(
+                &mut BrepSink { ctx, out: &mut out },
+                &mut annotations,
+                carrier,
+                carriers,
+                &emitted_face_surface_by_carrier,
+                attr,
+                &source_stream,
+            )?;
+        }
+    }
+    let mut emitted_faces = HashMap::new();
+    emitted_faces.extend(out.faces.iter().map(|face| (face.id.as_str(), &face.id)));
+    for appearance in &mut out.face_colors {
+        appearance.value.target = faces
+            .iter()
+            .find(|face| {
+                t.bridges()
+                    .get(&face.bridge_attr)
+                    .and_then(|bridge| bridge.attributes_head)
+                    == Some(appearance.value.face_attr)
+            })
+            .map(|face| id_face(face.bridge_attr))
+            .filter(|face| emitted_faces.contains_key(face.as_str()))
+            .map(cadmpeg_ir::ids::FaceId::into_string);
+    }
+    for (owner, values) in attrib::unique_payloads(entity_facts.face_payloads) {
+        if let Some(face) = emitted_faces.get(id_face(owner).as_str()) {
+            out.native_face_identities.push(attrib::NativeIdentity {
+                target: (*face).clone(),
+                values,
+            });
+        }
+    }
+    for (owner, values) in attrib::unique_payloads(entity_facts.face_keys) {
+        if let (Some(face), [key]) = (
+            emitted_faces.get(id_face(owner).as_str()),
+            values.as_slice(),
+        ) {
+            out.face_keys.push(((*face).clone(), *key));
+        }
+    }
+    let mut bound_faces = HashSet::new();
+    for atom in entity_facts.face_atoms {
+        let Some(identity) = atom.identity else {
+            continue;
+        };
+        let Some(face) = emitted_faces.get(id_face(atom.face_attr).as_str()) else {
+            continue;
+        };
+        if bound_faces.insert(atom.face_attr) {
+            out.face_atoms.push(attrib::FaceAtom {
+                face: (*face).clone(),
+                identity,
+            });
+        }
+    }
+    synthesize_cylinder_seams(ctx, &mut out, &mut annotations, &source_stream)?;
+    synthesize_sphere_seams(ctx, &mut out, &mut annotations, &source_stream)?;
+    phase_full_turn_edge_ranges(&mut out, &mut annotations)?;
+    derive_planar_pcurves(ctx, &mut out, &mut annotations, &source_stream)?;
+    derive_cylindrical_pcurves(ctx, &mut out, &mut annotations, &source_stream)?;
+    derive_revolved_circle_pcurves(ctx, &mut out, &mut annotations, &source_stream)?;
+    derive_spherical_pcurves(ctx, &mut out, &mut annotations, &source_stream)?;
+    derive_nurbs_isoparametric_pcurves(ctx, &mut out, &mut annotations, &source_stream)?;
+    prune_rejected_topology(&mut out);
+    out.stats.tolerant_edges_without_curve = out
+        .edges
+        .iter()
+        .filter(|edge| edge.curve().is_none() && tolerant_edges.contains(&edge.id))
+        .count();
+
+    if out.faces.is_empty() {
+        return Ok(Brep {
+            approximations: out.approximations,
+            losses: out.losses,
+            stats: out.stats,
+            ..Brep::default()
+        });
+    }
+    let synthetic_grouping = body_records.is_empty();
+    out.stats.synthetic_body_grouping = synthetic_grouping;
+
+    for (group, body_record) in body_records
+        .iter()
+        .map(Some)
+        .chain(std::iter::once(None).take(usize::from(synthetic_grouping)))
+        .enumerate()
+    {
+        let body_id = BodyId::compose(
+            &body_namespace(),
+            body_record.map_or(0_u32, |record| record.attr),
+        );
+        let mut annotate_group =
+            |id: &str, source: Option<(usize, &str)>| -> Result<(), cadmpeg_core::CodecError> {
+                let (offset, tag, exactness) = source.map_or(
+                    (0, "synthetic_grouping", Exactness::Derived),
+                    |(offset, tag)| (offset, tag, Exactness::ByteExact),
+                );
+                annotations.note(id, &source_stream, u64_from_index(offset), Some(tag));
+                annotations.exactness(id, exactness);
+                Ok(())
+            };
+        annotate_group(
+            body_id.as_str(),
+            body_record.map(|record| (record.offset, "00_51_body")),
+        )?;
+        let native_regions = body_record.map_or(&[][..], |record| record.regions.as_slice());
+        let mut body_regions = Vec::new();
+        if native_regions.is_empty() {
+            let region_id = RegionId::compose(&region_namespace(), group);
+            let native_shell_id = ShellId::compose(&shell_namespace(), group);
+            annotate_group(region_id.as_str(), None)?;
+            let mut region_shells = Vec::new();
+            for (component, faces) in shell_face_components(&out, native_shell_id.as_str())
+                .into_iter()
+                .enumerate()
+            {
+                let shell_id = if component == 0 {
+                    native_shell_id.clone()
+                } else {
+                    shell_component(&native_shell_id, component)?
+                };
+                annotate_group(shell_id.as_str(), None)?;
+                let mut face_ids = HashSet::new();
+                face_ids.extend(faces.iter().map(cadmpeg_ir::ids::FaceId::as_str));
+                for face in &mut out.faces {
+                    if face_ids.contains(face.id.as_str()) {
+                        face.shell = shell_id.clone();
+                    }
+                }
+                admit_brep_entity(ctx)?;
+                out.shells.push(
+                    match Shell::new(
+                        shell_id.clone(),
+                        region_id.clone(),
+                        faces,
+                        Vec::new(),
+                        Vec::new(),
+                    ) {
+                        Ok(shell) => shell,
+                        Err(_) => {
+                            continue;
+                        }
+                    },
+                );
+                region_shells.push(shell_id);
+            }
+            admit_brep_entity(ctx)?;
+            out.regions.push(Region {
+                id: region_id.clone(),
+                body: body_id.clone(),
+                shells: region_shells,
+            });
+            body_regions.push(region_id);
+        } else {
+            for region in native_regions {
+                let region_id = RegionId::compose(&region_namespace(), region.attr);
+                annotate_group(region_id.as_str(), Some((region.offset, "00_51_region")))?;
+                let mut region_shells = Vec::new();
+                for shell in &region.shells {
+                    let native_shell_id = ShellId::compose(&shell_namespace(), shell.attr);
+                    for (component, faces) in shell_face_components(&out, native_shell_id.as_str())
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let shell_id = if component == 0 {
+                            native_shell_id.clone()
+                        } else {
+                            shell_component(&native_shell_id, component)?
+                        };
+                        annotate_group(
+                            shell_id.as_str(),
+                            (component == 0).then_some((shell.offset, "00_51_shell")),
+                        )?;
+                        let mut face_ids = HashSet::new();
+                        face_ids.extend(faces.iter().map(cadmpeg_ir::ids::FaceId::as_str));
+                        for face in &mut out.faces {
+                            if face_ids.contains(face.id.as_str()) {
+                                face.shell = shell_id.clone();
+                            }
+                        }
+                        admit_brep_entity(ctx)?;
+                        out.shells.push(
+                            match Shell::new(
+                                shell_id.clone(),
+                                region_id.clone(),
+                                faces,
+                                Vec::new(),
+                                Vec::new(),
+                            ) {
+                                Ok(shell) => shell,
+                                Err(_) => {
+                                    continue;
+                                }
+                            },
+                        );
+                        region_shells.push(shell_id);
+                    }
+                }
+                admit_brep_entity(ctx)?;
+                out.regions.push(Region {
+                    id: region_id.clone(),
+                    body: body_id.clone(),
+                    shells: region_shells,
+                });
+                body_regions.push(region_id);
+            }
+        }
+        admit_brep_entity(ctx)?;
+        out.bodies.push(Body {
+            id: body_id,
+            kind: body_record.map_or(BodyKind::Solid, |record| record.kind),
+            regions: body_regions,
+            transform: None,
+            name: None,
+            color: None,
+            visible: None,
+        });
+    }
+
+    let mut body_ids_by_attr = HashMap::<u32, Option<&str>>::new();
+    for body in &out.bodies {
+        let Some(attr) = body
+            .id
+            .as_str()
+            .strip_prefix("sldprt:brep:body#")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match body_ids_by_attr.entry(attr) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(body.id.as_str()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() = None;
+            }
+        }
+    }
+    for (owner, values) in attrib::unique_payloads(entity_facts.body_payloads) {
+        if let Some(Some(id)) = body_ids_by_attr.get(&owner) {
+            let Some(body) = out.bodies.iter().find(|body| body.id.as_str() == *id) else {
+                continue;
+            };
+            let target = body.id.clone();
+            out.native_body_identities
+                .push(attrib::NativeIdentity { target, values });
+        }
+    }
+    for modifier in &mut out.body_modifiers {
+        modifier.target = if let Some(Some(id)) = body_ids_by_attr.get(&modifier.body_attr) {
+            let mut target = String::new();
+            target.push_str(id);
+            Some(target)
+        } else {
+            None
+        };
+    }
+
+    for curve in &out.curves {
+        let Some(attr) = curve
+            .id
+            .as_str()
+            .strip_prefix("sldprt:brep:curve#")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some(indexed) = carriers.curve(attr) {
+            let carrier = indexed.carrier();
+            annotations.note(
+                curve.id.as_str(),
+                &source_stream,
+                u64_from_index(carrier.offset),
+                Some("compact_curve"),
+            );
+            if matches!(
+                curve.geometry,
+                CurveGeometry::Solved(SolvedCurveGeometry::Unknown { .. })
+            ) {
+                annotations.exactness(curve.id.as_str(), Exactness::Unknown);
+            }
+        }
+    }
+    out.bodies.sort_by(|a, b| a.id.cmp(&b.id));
+    out.regions.sort_by(|a, b| a.id.cmp(&b.id));
+    out.shells.sort_by(|a, b| a.id.cmp(&b.id));
+    out.faces.sort_by(|a, b| a.id.cmp(&b.id));
+    out.loops.sort_by(|a, b| a.id.cmp(&b.id));
+    out.coedges.sort_by(|a, b| a.id.cmp(&b.id));
+    out.edges.sort_by(|a, b| a.id.cmp(&b.id));
+    out.vertices.sort_by(|a, b| a.id.cmp(&b.id));
+    out.points.sort_by(|a, b| a.id.cmp(&b.id));
+    out.surfaces.sort_by(|a, b| a.id.cmp(&b.id));
+    out.procedural_surfaces.sort_by(|a, b| a.id.cmp(&b.id));
+    out.curves.sort_by(|a, b| a.id.cmp(&b.id));
+    out.procedural_curves.sort_by(|a, b| a.id.cmp(&b.id));
+    out.pcurves.sort_by(|a, b| a.id.cmp(&b.id));
+    out.annotations = annotations.build();
+    let retained_ids = out
+        .bodies
+        .iter()
+        .map(|entity| entity.id.as_str())
+        .chain(out.regions.iter().map(|entity| entity.id.as_str()))
+        .chain(out.shells.iter().map(|entity| entity.id.as_str()))
+        .chain(out.faces.iter().map(|entity| entity.id.as_str()))
+        .chain(out.loops.iter().map(|entity| entity.id.as_str()))
+        .chain(out.coedges.iter().map(|entity| entity.id.as_str()))
+        .chain(out.edges.iter().map(|entity| entity.id.as_str()))
+        .chain(out.vertices.iter().map(|entity| entity.id.as_str()))
+        .chain(out.points.iter().map(|entity| entity.id.as_str()))
+        .chain(out.surfaces.iter().map(|entity| entity.id.as_str()))
+        .chain(
+            out.procedural_surfaces
+                .iter()
+                .map(|entity| entity.id.as_str()),
+        )
+        .chain(out.curves.iter().map(|entity| entity.id.as_str()))
+        .chain(
+            out.procedural_curves
+                .iter()
+                .map(|entity| entity.id.as_str()),
+        )
+        .chain(out.pcurves.iter().map(|entity| entity.id.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    let mut keep = |id: &str| retained_ids.contains(id);
+    out.annotations.retain_provenance(&mut keep);
+    let mut annotations = AnnotationBuilder::resume(std::mem::take(&mut out.annotations));
+    annotations.retain_exactness(keep);
+    out.annotations = annotations.build();
+    Ok(out)
+}
+
+/// Tolerance in radians for a circle or ellipse edge range that spans a full turn.
+const PERIODIC_FULL_TURN_TOLERANCE: f64 = 1.0e-9;
+
+/// Start each full-turn circle or ellipse edge range at its vertex (spec
+/// §7.2), once the seam passes have placed the derived vertex of a sentinel
+/// closed circle. A moved range is derived.
+fn phase_full_turn_edge_ranges(
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let tau = std::f64::consts::TAU;
+    let vertex_points = out
+        .vertices
+        .iter()
+        .map(|vertex| {
+            let bound = vertex.tolerance.map_or(LINEAR_RESOLUTION_MM, |tolerance| {
+                looser_tolerance(tolerance.get(), LINEAR_RESOLUTION_MM)
+            });
+            (&vertex.id, (&vertex.point, bound))
+        })
+        .collect::<HashMap<_, _>>();
+    let points = out
+        .points
+        .iter()
+        .map(|point| (&point.id, point.position().get()))
+        .collect::<HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, &curve.geometry))
+        .collect::<HashMap<_, _>>();
+    for edge in &mut out.edges {
+        if edge.start != edge.end {
+            continue;
+        }
+        let Some([start, end]) = edge.param_range().map(cadmpeg_ir::units::FiniteVector::get)
+        else {
+            continue;
+        };
+        if ((end - start).abs() - tau).abs() > PERIODIC_FULL_TURN_TOLERANCE {
+            continue;
+        }
+        let Some(curve_id) = edge.curve() else {
+            continue;
+        };
+        let (Some(geometry), Some(&(point, bound))) =
+            (curves.get(curve_id), vertex_points.get(&edge.start))
+        else {
+            continue;
+        };
+        let Some(phase) = points
+            .get(point)
+            .and_then(|point| carrier_angle(geometry, *point, bound))
+        else {
+            continue;
+        };
+        if (phase - start.min(end)).abs() <= PERIODIC_FULL_TURN_TOLERANCE {
+            continue;
+        }
+        if let Ok(carrier) = cadmpeg_ir::topology::EdgeCarrier::new(
+            Some(curve_id.clone()),
+            Some([phase, phase + tau]),
+        ) {
+            edge.carrier = carrier;
+            annotations
+                .derived(edge.id.as_str(), "carrier.param_range")
+                .map_err(cadmpeg_core::CodecError::malformed)?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_rejected_topology(out: &mut Brep) {
+    let kept_loops = out
+        .faces
+        .iter()
+        .flat_map(|face| &face.loops)
+        .map(cadmpeg_ir::ids::LoopId::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    out.loops
+        .retain(|loop_| kept_loops.contains(loop_.id.as_str()));
+
+    let kept_coedges = out
+        .loops
+        .iter()
+        .flat_map(cadmpeg_ir::topology::Loop::coedges)
+        .map(cadmpeg_ir::ids::CoedgeId::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    out.coedges
+        .retain(|coedge| kept_coedges.contains(coedge.id.as_str()));
+    for coedge in &mut out.coedges {
+        if !kept_coedges.contains(coedge.radial_next.as_str()) {
+            coedge.radial_next = coedge.id.clone();
+        }
+    }
+
+    let kept_pcurves = out
+        .coedges
+        .iter()
+        .flat_map(|coedge| &coedge.pcurves)
+        .map(|use_| &use_.pcurve)
+        .map(cadmpeg_ir::ids::PcurveId::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    out.pcurves
+        .retain(|pcurve| kept_pcurves.contains(pcurve.id.as_str()));
+
+    let kept_edges = out
+        .coedges
+        .iter()
+        .map(|coedge| coedge.edge.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    out.edges
+        .retain(|edge| kept_edges.contains(edge.id.as_str()));
+
+    let kept_vertices = out
+        .edges
+        .iter()
+        .flat_map(|edge| [&edge.start, &edge.end])
+        .chain(
+            out.loops
+                .iter()
+                .flat_map(cadmpeg_ir::topology::Loop::vertices),
+        )
+        .map(cadmpeg_ir::ids::VertexId::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    out.vertices
+        .retain(|vertex| kept_vertices.contains(vertex.id.as_str()));
+
+    let kept_points = out
+        .vertices
+        .iter()
+        .map(|vertex| vertex.point.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    out.points
+        .retain(|point| kept_points.contains(point.id.as_str()));
+
+    let kept_curves = out
+        .edges
+        .iter()
+        .filter_map(|edge| edge.curve().map(cadmpeg_ir::ids::CurveId::as_str))
+        .chain(out.procedural_surfaces.iter().filter_map(|surface| {
+            match surface.definition() {
+                ProceduralSurfaceDefinition::Blend(definition) => definition.spine().as_ref(),
+                ProceduralSurfaceDefinition::LinearSweep(definition) => {
+                    Some(definition.directrix())
+                }
+                _ => None,
+            }
+            .map(cadmpeg_ir::ids::CurveId::as_str)
+        }))
+        .collect::<std::collections::HashSet<_>>();
+    out.curves
+        .retain(|curve| kept_curves.contains(curve.id.as_str()));
+    let kept_constructions = out
+        .curves
+        .iter()
+        .filter_map(|curve| {
+            curve
+                .geometry
+                .procedural_construction()
+                .map(ProceduralCurveId::as_str)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    out.procedural_curves
+        .retain(|procedural| kept_constructions.contains(procedural.id.as_str()));
+    let unknown_curves = out
+        .curves
+        .iter()
+        .filter(|curve| {
+            matches!(
+                curve.geometry,
+                CurveGeometry::Solved(SolvedCurveGeometry::Unknown { .. })
+            )
+        })
+        .map(|curve| curve.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    out.stats.unknown_curve_edges = out
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.curve()
+                .is_some_and(|curve_id| unknown_curves.contains(curve_id.as_str()))
+        })
+        .count();
+}
+
+fn annotate_surface_frame(
+    annotations: &mut AnnotationBuilder,
+    id: &str,
+    mut geometry: &SolvedSurfaceGeometry,
+) -> Result<(), cadmpeg_core::CodecError> {
+    loop {
+        match geometry {
+            SolvedSurfaceGeometry::Plane(_) => {
+                annotations.field_exactness(id, "geometry.u_axis", Exactness::Derived)?;
+                break;
+            }
+            SolvedSurfaceGeometry::Cylinder(_)
+            | SolvedSurfaceGeometry::Cone(_)
+            | SolvedSurfaceGeometry::Torus(_) => {
+                annotations.field_exactness(id, "geometry.ref_direction", Exactness::Derived)?;
+                break;
+            }
+            SolvedSurfaceGeometry::Sphere(_) => {
+                annotations.field_exactness(id, "geometry.axis", Exactness::Derived)?;
+                annotations.field_exactness(id, "geometry.ref_direction", Exactness::Derived)?;
+                break;
+            }
+            SolvedSurfaceGeometry::Transformed(placed) => geometry = placed.basis(),
+            SolvedSurfaceGeometry::Nurbs(_)
+            | SolvedSurfaceGeometry::Polygonal(_)
+            | SolvedSurfaceGeometry::Unknown { .. } => break,
+        }
+    }
+    Ok(())
+}
+
+fn derive_planar_pcurves(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let loop_faces = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, &lp.face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let faces = out
+        .faces
+        .iter()
+        .map(|face| (&face.id, face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let surfaces = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, surface))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edges = out
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, curve))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut derived = Vec::new();
+    for coedge in &out.coedges {
+        let Some(face_id) = loop_faces.get(&coedge.owner_loop) else {
+            continue;
+        };
+        let Some(face) = faces.get(face_id) else {
+            continue;
+        };
+        let Some(surface) = surfaces.get(&face.surface) else {
+            continue;
+        };
+        if !matches!(
+            surface.geometry,
+            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(_))
+        ) {
+            continue;
+        }
+        let Some(SolvedSurfaceGeometry::Plane(plane_surface)) = surface.geometry.solved() else {
+            continue;
+        };
+        let origin = plane_surface.origin().get();
+        let normal = *plane_surface.frame().axis().as_raw();
+        let u_reference = *plane_surface.frame().reference().as_raw();
+        let v_reference = cadmpeg_ir::math::Vector3::new(
+            normal.y * u_reference.z - normal.z * u_reference.y,
+            normal.z * u_reference.x - normal.x * u_reference.z,
+            normal.x * u_reference.y - normal.y * u_reference.x,
+        );
+        let Some(edge) = edges.get(&coedge.edge) else {
+            continue;
+        };
+        let Some(curve) = edge.curve().and_then(|id| curves.get(id).copied()) else {
+            continue;
+        };
+        let uv = |point: cadmpeg_ir::math::Point3| {
+            let d = [point.x - origin.x, point.y - origin.y, point.z - origin.z];
+            cadmpeg_ir::math::Point2::new(
+                d[0] * u_reference.x + d[1] * u_reference.y + d[2] * u_reference.z,
+                d[0] * v_reference.x + d[1] * v_reference.y + d[2] * v_reference.z,
+            )
+        };
+        let project_direction = |direction: cadmpeg_ir::math::Vector3| {
+            let projected = cadmpeg_ir::math::Point2::new(
+                direction.x * u_reference.x
+                    + direction.y * u_reference.y
+                    + direction.z * u_reference.z,
+                direction.x * v_reference.x
+                    + direction.y * v_reference.y
+                    + direction.z * v_reference.z,
+            );
+            let norm = (projected.u * projected.u + projected.v * projected.v).sqrt();
+            (norm > EPS_NORMAL_NONZERO)
+                .then(|| cadmpeg_ir::math::Point2::new(projected.u / norm, projected.v / norm))
+        };
+        let plane_distance = |point: cadmpeg_ir::math::Point3| {
+            (point.x - origin.x) * normal.x
+                + (point.y - origin.y) * normal.y
+                + (point.z - origin.z) * normal.z
+        };
+        let geometry = match &curve.geometry {
+            CurveGeometry::Solved(SolvedCurveGeometry::Line(line_curve)) => {
+                let curve_origin = line_curve.origin().get();
+                let direction = *line_curve.direction().as_raw();
+                if plane_distance(curve_origin).abs() > EPS_PLANAR_DISTANCE
+                    || (direction.x * normal.x + direction.y * normal.y + direction.z * normal.z)
+                        .abs()
+                        > EPS_GEOMETRY_RESIDUAL
+                {
+                    continue;
+                }
+                let Some(direction) = project_direction(direction) else {
+                    continue;
+                };
+                PcurveGeometry::Line(
+                    match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                        uv(curve_origin),
+                        direction,
+                    ) {
+                        Ok(payload) => payload,
+                        Err(_) => continue,
+                    },
+                )
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve)) => {
+                let center = circle_curve.center().get();
+                let axis = circle_curve.frame().axis().as_raw();
+                let ref_direction = circle_curve.frame().reference().as_raw();
+                let radius = circle_curve.radius().get();
+                let axis_dot = axis.x * normal.x + axis.y * normal.y + axis.z * normal.z;
+                if axis_dot.abs() < 1.0 - EPS_AXIS_ALIGNMENT
+                    || plane_distance(center).abs() > EPS_PLANAR_DISTANCE
+                {
+                    continue;
+                }
+                let Some(ref_direction) = project_direction(*ref_direction) else {
+                    continue;
+                };
+                PcurveGeometry::Circle(
+                    match cadmpeg_ir::geometry::pcurve::CirclePcurve::try_new(
+                        uv(center),
+                        ref_direction,
+                        if axis_dot < 0.0 {
+                            cadmpeg_ir::math::Point2::new(ref_direction.v, -ref_direction.u)
+                        } else {
+                            cadmpeg_ir::math::Point2::new(-ref_direction.v, ref_direction.u)
+                        },
+                        radius,
+                    ) {
+                        Ok(payload) => payload,
+                        Err(_) => continue,
+                    },
+                )
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Ellipse(ellipse_curve)) => {
+                let center = ellipse_curve.center().get();
+                let axis = ellipse_curve.frame().axis().as_raw();
+                let major_direction = ellipse_curve.frame().reference().as_raw();
+                let major_radius = ellipse_curve.major_radius().get();
+                let minor_radius = ellipse_curve.minor_radius().get();
+                let axis_dot = axis.x * normal.x + axis.y * normal.y + axis.z * normal.z;
+                if axis_dot.abs() < 1.0 - EPS_AXIS_ALIGNMENT
+                    || plane_distance(center).abs() > EPS_PLANAR_DISTANCE
+                {
+                    continue;
+                }
+                let Some(major_direction) = project_direction(*major_direction) else {
+                    continue;
+                };
+                PcurveGeometry::Ellipse(match cadmpeg_ir::geometry::pcurve::EllipsePcurve::try_new(
+                    uv(center),
+                    major_direction,
+                    if axis_dot < 0.0 {
+                        cadmpeg_ir::math::Point2::new(major_direction.v, -major_direction.u)
+                    } else {
+                        cadmpeg_ir::math::Point2::new(-major_direction.v, major_direction.u)
+                    },
+                    major_radius,
+                    minor_radius,
+                ) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                })
+            }
+            _ => continue,
+        };
+        let id = PcurveId::compose(&pcurve_namespace(), coedge.id.key());
+        let pcurve = Pcurve {
+            id: id.clone(),
+            geometry,
+            metadata: cadmpeg_ir::geometry::pcurve::PcurveMetadata::default(),
+        };
+        derived.push((coedge.id.clone(), id, pcurve));
+    }
+    let mut coedge_indices = HashMap::new();
+    for (index, coedge) in out.coedges.iter().enumerate() {
+        let id = coedge.id.clone();
+        coedge_indices.insert(id, index);
+    }
+    for (coedge_id, id, pcurve) in derived {
+        if let Some(index) = coedge_indices.get(&coedge_id) {
+            let uses = vec![cadmpeg_ir::topology::PcurveUse {
+                pcurve: id.clone(),
+                isoparametric: None,
+                parameter_range: None,
+            }];
+            out.coedges[*index].pcurves = uses;
+        }
+        annotations.note(id.as_str(), source_stream, 0, Some("derived_planar_pcurve"));
+        annotations.exactness(id.as_str(), Exactness::Derived);
+        admit_brep_entity(ctx)?;
+        out.pcurves.push(pcurve);
+    }
+    Ok(())
+}
+
+fn derive_cylindrical_pcurves(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let mut refusals = Vec::new();
+    let loop_faces = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, &lp.face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let faces = out
+        .faces
+        .iter()
+        .map(|face| (&face.id, face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let surfaces = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, surface))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edges = out
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, curve))
+        .collect::<std::collections::HashMap<_, _>>();
+    let points = out
+        .points
+        .iter()
+        .map(|point| (&point.id, point))
+        .collect::<std::collections::HashMap<_, _>>();
+    let vertex_points = out
+        .vertices
+        .iter()
+        .filter_map(|vertex| points.get(&vertex.point).map(|point| (&vertex.id, *point)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let position = |vertex_id: &VertexId| {
+        vertex_points
+            .get(vertex_id)
+            .map(|point| point.position().get())
+    };
+    let mut derived = Vec::new();
+    for coedge in &out.coedges {
+        if !coedge.pcurves.is_empty() {
+            continue;
+        }
+        let Some(face_id) = loop_faces.get(&coedge.owner_loop) else {
+            continue;
+        };
+        let Some(face) = faces.get(face_id) else {
+            continue;
+        };
+        let Some(surface) = surfaces.get(&face.surface) else {
+            continue;
+        };
+        let Some(SolvedSurfaceGeometry::Cylinder(cylinder_surface)) = surface.geometry.solved()
+        else {
+            continue;
+        };
+        let origin = cylinder_surface.origin().get();
+        let axis = cylinder_surface.frame().axis().as_raw();
+        let u_reference = cylinder_surface.frame().reference().as_raw();
+        let radius = cylinder_surface.radius().get();
+        let Some(edge) = edges.get(&coedge.edge) else {
+            continue;
+        };
+        let Some(curve) = edge.curve().and_then(|id| curves.get(id).copied()) else {
+            continue;
+        };
+        let cross = cadmpeg_ir::math::Vector3::new(
+            axis.y * u_reference.z - axis.z * u_reference.y,
+            axis.z * u_reference.x - axis.x * u_reference.z,
+            axis.x * u_reference.y - axis.y * u_reference.x,
+        );
+        let dot = |a: [f64; 3], b: cadmpeg_ir::math::Vector3| a[0] * b.x + a[1] * b.y + a[2] * b.z;
+        let mut parameter_range = None;
+        let geometry = match &curve.geometry {
+            CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve))
+                if {
+                    let circle_axis = circle_curve.frame().axis().as_raw();
+                    let circle_radius = circle_curve.radius().get();
+                    (circle_radius.abs() - radius.abs()).abs() < EPS_CIRCLE_RADIUS_MATCH
+                        && (circle_axis.x * axis.x
+                            + circle_axis.y * axis.y
+                            + circle_axis.z * axis.z)
+                            .abs()
+                            > 1.0 - EPS_AXIS_ALIGNMENT
+                } =>
+            {
+                let center = circle_curve.center().get();
+                let circle_axis = circle_curve.frame().axis().as_raw();
+                let circle_reference = circle_curve.frame().reference().as_raw();
+                let d = [
+                    center.x - origin.x,
+                    center.y - origin.y,
+                    center.z - origin.z,
+                ];
+                let axial = dot(d, *axis);
+                let radial = [
+                    d[0] - axial * axis.x,
+                    d[1] - axial * axis.y,
+                    d[2] - axial * axis.z,
+                ];
+                if dot(
+                    radial,
+                    cadmpeg_ir::math::Vector3::new(radial[0], radial[1], radial[2]),
+                )
+                .sqrt()
+                    > EPS_PLANAR_DISTANCE
+                {
+                    continue;
+                }
+                let Some((phase, sense)) =
+                    circle_azimuth_parameter(*axis, *u_reference, *circle_axis, *circle_reference)
+                else {
+                    continue;
+                };
+                PcurveGeometry::Line(
+                    match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                        cadmpeg_ir::math::Point2::new(phase, axial),
+                        cadmpeg_ir::math::Point2::new(sense, 0.0),
+                    ) {
+                        Ok(payload) => payload,
+                        Err(_) => continue,
+                    },
+                )
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Line(line_curve)) => {
+                let curve_origin = line_curve.origin().get();
+                let direction = *line_curve.direction().as_raw();
+                let axial_rate = dot([direction.x, direction.y, direction.z], *axis);
+                let transverse = [
+                    direction.x - axial_rate * axis.x,
+                    direction.y - axial_rate * axis.y,
+                    direction.z - axial_rate * axis.z,
+                ];
+                if dot(
+                    transverse,
+                    cadmpeg_ir::math::Vector3::new(transverse[0], transverse[1], transverse[2]),
+                ) > 2.0 * EPS_AXIS_ALIGNMENT
+                {
+                    continue;
+                }
+                let d = [
+                    curve_origin.x - origin.x,
+                    curve_origin.y - origin.y,
+                    curve_origin.z - origin.z,
+                ];
+                let v = dot(d, *axis);
+                let radial = [d[0] - v * axis.x, d[1] - v * axis.y, d[2] - v * axis.z];
+                let radial_distance = dot(
+                    radial,
+                    cadmpeg_ir::math::Vector3::new(radial[0], radial[1], radial[2]),
+                )
+                .sqrt();
+                let tolerance = EPS_RADIUS_ABSOLUTE.max(radius.abs() * EPS_RADIUS_RELATIVE);
+                if (radial_distance - radius.abs()).abs() > tolerance {
+                    continue;
+                }
+                let u = dot(radial, cross).atan2(dot(radial, *u_reference));
+                PcurveGeometry::Line(
+                    match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                        cadmpeg_ir::math::Point2::new(u, v),
+                        cadmpeg_ir::math::Point2::new(0.0, axial_rate),
+                    ) {
+                        Ok(payload) => payload,
+                        Err(_) => continue,
+                    },
+                )
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Ellipse(ellipse_curve)) => {
+                let center = ellipse_curve.center().get();
+                let ellipse_axis = ellipse_curve.frame().axis().as_raw();
+                let major_direction = ellipse_curve.frame().reference().as_raw();
+                let major_radius = ellipse_curve.major_radius().get();
+                let minor_radius = ellipse_curve.minor_radius().get();
+                let minor_direction = cadmpeg_ir::math::Vector3::new(
+                    ellipse_axis.y * major_direction.z - ellipse_axis.z * major_direction.y,
+                    ellipse_axis.z * major_direction.x - ellipse_axis.x * major_direction.z,
+                    ellipse_axis.x * major_direction.y - ellipse_axis.y * major_direction.x,
+                );
+                let relative = [
+                    center.x - origin.x,
+                    center.y - origin.y,
+                    center.z - origin.z,
+                ];
+                let major = [
+                    major_radius * major_direction.x,
+                    major_radius * major_direction.y,
+                    major_radius * major_direction.z,
+                ];
+                let minor = [
+                    minor_radius * minor_direction.x,
+                    minor_radius * minor_direction.y,
+                    minor_radius * minor_direction.z,
+                ];
+                let radial_center = cadmpeg_ir::math::Point2::new(
+                    dot(relative, *u_reference),
+                    dot(relative, cross),
+                );
+                let radial_cos =
+                    cadmpeg_ir::math::Point2::new(dot(major, *u_reference), dot(major, cross));
+                let radial_sin =
+                    cadmpeg_ir::math::Point2::new(dot(minor, *u_reference), dot(minor, cross));
+                let norm = |value: cadmpeg_ir::math::Point2| value.u.hypot(value.v);
+                let product = |a: cadmpeg_ir::math::Point2, b: cadmpeg_ir::math::Point2| {
+                    a.u * b.u + a.v * b.v
+                };
+                let tolerance = EPS_RADIUS_ABSOLUTE.max(radius.abs() * EPS_RADIUS_RELATIVE);
+                if norm(radial_center) > tolerance
+                    || (norm(radial_cos) - radius.abs()).abs() > tolerance
+                    || (norm(radial_sin) - radius.abs()).abs() > tolerance
+                    || product(radial_cos, radial_sin).abs() > tolerance * radius.abs()
+                {
+                    continue;
+                }
+                PcurveGeometry::PolarHarmonic(
+                    match cadmpeg_ir::geometry::pcurve::PolarHarmonicPcurve::try_new(
+                        radial_center,
+                        radial_cos,
+                        radial_sin,
+                        dot(relative, *axis),
+                        dot(major, *axis),
+                        dot(minor, *axis),
+                    ) {
+                        Ok(payload) => payload,
+                        Err(_) => continue,
+                    },
+                )
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(nurbs)) => {
+                let project = |point: cadmpeg_ir::math::Point3| {
+                    let relative = [point.x - origin.x, point.y - origin.y, point.z - origin.z];
+                    cadmpeg_ir::math::Point2::new(dot(relative, *u_reference), dot(relative, cross))
+                };
+                let mut radial_control_points = Vec::new();
+                let curve_weights = match nurbs.pole_rows() {
+                    cadmpeg_ir::geometry::nurbs::NurbsPoles3::Polynomial { points } => {
+                        radial_control_points
+                            .extend(points.iter().map(|point| project(point.get())));
+                        None
+                    }
+                    cadmpeg_ir::geometry::nurbs::NurbsPoles3::Rational { points } => {
+                        radial_control_points
+                            .extend(points.iter().map(|pole| project(pole.point.get())));
+                        let mut weights = Vec::new();
+                        weights.extend(points.iter().map(|pole| pole.weight.get()));
+                        Some(weights)
+                    }
+                };
+                if !quadratic_nurbs_has_constant_radius(
+                    &radial_control_points,
+                    curve_weights.as_deref(),
+                    nurbs.knots(),
+                    cylinder_surface.radius(),
+                ) {
+                    continue;
+                }
+                parameter_range = if let Some(range) = edge.param_range() {
+                    Some(range.get())
+                } else {
+                    let (Some(start), Some(end)) = (position(&edge.start), position(&edge.end))
+                    else {
+                        continue;
+                    };
+                    match (
+                        nurbs_parameter_at_point(ctx, nurbs, start)?,
+                        nurbs_parameter_at_point(ctx, nurbs, end)?,
+                    ) {
+                        (InverseResolution::Unique(start), InverseResolution::Unique(end)) => {
+                            Some([start.min(end), start.max(end)])
+                        }
+                        (InverseResolution::Ambiguous, _) | (_, InverseResolution::Ambiguous) => {
+                            out.stats.ambiguous_pcurve_parameters += 1;
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                };
+                // One pole row carries its radial and axial halves together,
+                // so the two projections are built into one list.
+                let mut poles = Vec::new();
+                for (index, radial) in radial_control_points.iter().enumerate() {
+                    let Some(point) = nurbs.pole_rows().point_at(index) else {
+                        continue;
+                    };
+                    poles.push(cadmpeg_ir::geometry::pcurve::PolarNurbsPole {
+                        radial: *radial,
+                        axial: dot(
+                            [point.x - origin.x, point.y - origin.y, point.z - origin.z],
+                            *axis,
+                        ),
+                    });
+                }
+                let knots = nurbs.knots().clone();
+                let weights = if let cadmpeg_ir::geometry::nurbs::NurbsPoles3::Rational { points } =
+                    nurbs.pole_rows()
+                {
+                    let mut weights = Vec::new();
+                    weights.extend(points.iter().map(|pole| pole.weight));
+                    Some(weights)
+                } else {
+                    None
+                };
+                let polar = match PolarPcurveNurbs::from_checked_lanes(
+                    nurbs.degree(),
+                    knots,
+                    poles,
+                    weights,
+                    nurbs.periodic(),
+                ) {
+                    Ok(polar) => polar,
+                    Err(error) => {
+                        let note = crate::loss::spline_lane_refusal(format_args!(
+                            "cylindrical pcurve for edge {}: {error}",
+                            edge.id
+                        ));
+                        refusals.push(note);
+                        continue;
+                    }
+                };
+                PcurveGeometry::PolarNurbs { nurbs: polar }
+            }
+            _ => continue,
+        };
+        let id = PcurveId::compose(
+            &pcurve_namespace(),
+            cadmpeg_ir::identity_key!("cylinder:").then(coedge.id.key()),
+        );
+        let parameter_range = match parameter_range.map(cadmpeg_ir::units::FiniteVector::new) {
+            Some(None) => continue,
+            Some(Some(range)) => Some(range),
+            None => None,
+        };
+        derived.push((
+            coedge.id.clone(),
+            id.clone(),
+            Pcurve {
+                id,
+                geometry,
+                metadata: cadmpeg_ir::geometry::pcurve::PcurveMetadata::general(
+                    None,
+                    parameter_range,
+                    None,
+                ),
+            },
+        ));
+    }
+    let mut coedge_indices = HashMap::new();
+    for (index, coedge) in out.coedges.iter().enumerate() {
+        let id = coedge.id.clone();
+        coedge_indices.insert(id, index);
+    }
+    for (coedge_id, id, pcurve) in derived {
+        if let Some(index) = coedge_indices.get(&coedge_id) {
+            let uses = vec![cadmpeg_ir::topology::PcurveUse {
+                pcurve: id.clone(),
+                isoparametric: None,
+                parameter_range: None,
+            }];
+            out.coedges[*index].pcurves = uses;
+        }
+        annotations.note(
+            id.as_str(),
+            source_stream,
+            0,
+            Some("derived_cylindrical_pcurve"),
+        );
+        annotations.exactness(id.as_str(), Exactness::Derived);
+        admit_brep_entity(ctx)?;
+        out.pcurves.push(pcurve);
+    }
+    out.losses.extend(refusals);
+    Ok(())
+}
+
+enum InverseResolution<T> {
+    NoMatch,
+    Unique(T),
+    Ambiguous,
+}
+
+const INVERSE_SAMPLE_COUNT: usize = 32;
+const INVERSE_PARAMETER_TOLERANCE: f64 = 1.0e-10;
+const INVERSE_ABSOLUTE_TOLERANCE_MM: f64 = 1.0e-6;
+const INVERSE_RELATIVE_TOLERANCE: f64 = 8.0 * f64::EPSILON;
+const NURBS_POLE_ROUNDOFF_FACTOR: f64 = 256.0 * f64::EPSILON;
+const NURBS_CACHE_SAMPLES_PER_SPAN: usize = 8;
+const NURBS_ENDPOINT_TOLERANCE_MM: f64 = 1.0e-6;
+
+/// The looser of two acceptance tolerances.
+///
+/// Two independently derived bounds gate the same acceptance, and the
+/// acceptance holds when either of them does, so the looser bound is the gate.
+/// This is not a floor under a value: both arguments are tolerances.
+fn looser_tolerance(left: f64, right: f64) -> f64 {
+    if left >= right {
+        left
+    } else {
+        right
+    }
+}
+
+/// The largest absolute coordinate the point set states, or `None` when it
+/// states none.
+///
+/// This is the model's own coordinate scale, not a bound on it: a
+/// sub-millimetre model states a sub-millimetre scale, and an empty point set
+/// states no scale at all.
+fn coordinate_scale(points: impl IntoIterator<Item = cadmpeg_ir::math::Point3>) -> Option<f64> {
+    points
+        .into_iter()
+        .flat_map(|point| [point.x.abs(), point.y.abs(), point.z.abs()])
+        .filter(|magnitude| magnitude.is_finite())
+        .fold(None, |largest, magnitude| match largest {
+            Some(known) if known >= magnitude => Some(known),
+            _ => Some(magnitude),
+        })
+}
+
+fn inverse_coordinate_tolerance(points: impl IntoIterator<Item = cadmpeg_ir::math::Point3>) -> f64 {
+    // The absolute inverse-projection tolerance against the coordinate-scaled
+    // relative one. A point set that states no coordinate scale states only the
+    // absolute bound.
+    match coordinate_scale(points) {
+        Some(scale) => looser_tolerance(
+            INVERSE_ABSOLUTE_TOLERANCE_MM,
+            scale * INVERSE_RELATIVE_TOLERANCE,
+        ),
+        None => INVERSE_ABSOLUTE_TOLERANCE_MM,
+    }
+}
+
+fn admitted_surface_poles(
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+) -> impl Iterator<Item = FinitePoint3> + '_ {
+    (0..surface.u_count())
+        .flat_map(move |u| (0..surface.v_count()).filter_map(move |v| surface.pole(u, v)))
+}
+
+fn golden_section_minimum<F>(
+    mut left: f64,
+    mut right: f64,
+    objective: &mut F,
+) -> Result<Option<(f64, f64)>, cadmpeg_core::CodecError>
+where
+    F: FnMut(f64) -> Result<Option<f64>, cadmpeg_core::CodecError>,
+{
+    let ratio = (5.0_f64.sqrt() - 1.0) / 2.0;
+    let Some(a) = cadmpeg_ir::math::interpolate(left, right, 1.0 - ratio) else {
+        return Ok(None);
+    };
+    let Some(b) = cadmpeg_ir::math::interpolate(left, right, ratio) else {
+        return Ok(None);
+    };
+    let mut a = a.get();
+    let mut b = b.get();
+    let Some(mut da) = objective(a)? else {
+        return Ok(None);
+    };
+    let Some(mut db) = objective(b)? else {
+        return Ok(None);
+    };
+    for _ in 0..80 {
+        if da <= db {
+            right = b;
+            b = a;
+            db = da;
+            let Some(next) = cadmpeg_ir::math::interpolate(left, right, 1.0 - ratio) else {
+                return Ok(None);
+            };
+            a = next.get();
+            let Some(next) = objective(a)? else {
+                return Ok(None);
+            };
+            da = next;
+        } else {
+            left = a;
+            a = b;
+            da = db;
+            let Some(next) = cadmpeg_ir::math::interpolate(left, right, ratio) else {
+                return Ok(None);
+            };
+            b = next.get();
+            let Some(next) = objective(b)? else {
+                return Ok(None);
+            };
+            db = next;
+        }
+    }
+    let Some(parameter) = cadmpeg_ir::math::interpolate(left, right, 0.5) else {
+        return Ok(None);
+    };
+    let parameter = parameter.get();
+    Ok(objective(parameter)?.map(|distance| (parameter, distance)))
+}
+
+/// Find one representative for every sampled local minimum of an objective on
+/// each nonzero knot span. Endpoints are always retained, so a candidate at a
+/// knot is not lost when adjacent spans share it.
+fn sampled_parameter_minima<F>(
+    knots: &[f64],
+    domain: [f64; 2],
+    mut objective: F,
+) -> Result<Option<Vec<(f64, f64)>>, cadmpeg_core::CodecError>
+where
+    F: FnMut(f64) -> Result<Option<f64>, cadmpeg_core::CodecError>,
+{
+    let mut candidates = Vec::new();
+    for span in knots.windows(2).filter(|span| span[0] < span[1]) {
+        let start = span[0].max(domain[0]);
+        let end = span[1].min(domain[1]);
+        if start >= end {
+            continue;
+        }
+        let mut samples = Vec::new();
+        for index in 0..=INVERSE_SAMPLE_COUNT {
+            let (Some(position), Some(span_count)) =
+                (f64_from_index(index), f64_from_index(INVERSE_SAMPLE_COUNT))
+            else {
+                return Ok(None);
+            };
+            let Some(parameter) = cadmpeg_ir::math::interpolate(start, end, position / span_count)
+            else {
+                return Ok(None);
+            };
+            let parameter = parameter.get();
+            let Some(distance) = objective(parameter)? else {
+                return Ok(None);
+            };
+            samples.push((parameter, distance));
+        }
+        candidates.extend(samples.iter().copied());
+        for index in 1..INVERSE_SAMPLE_COUNT {
+            if samples[index].1 <= samples[index - 1].1 && samples[index].1 <= samples[index + 1].1
+            {
+                let Some(minimum) = golden_section_minimum(
+                    samples[index - 1].0,
+                    samples[index + 1].0,
+                    &mut objective,
+                )?
+                else {
+                    return Ok(None);
+                };
+                candidates.push(minimum);
+            }
+        }
+    }
+    Ok(Some(candidates))
+}
+
+fn unique_inverse_parameter(
+    mut candidates: Vec<(f64, f64)>,
+    tolerance: f64,
+    parameter_domain: [f64; 2],
+) -> InverseResolution<f64> {
+    let tolerance_squared = tolerance * tolerance;
+    candidates.retain(|(parameter, error)| {
+        parameter.is_finite() && error.is_finite() && *error <= tolerance_squared
+    });
+    candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let parameter_tolerance = (INVERSE_PARAMETER_TOLERANCE * parameter_domain[1]
+        - INVERSE_PARAMETER_TOLERANCE * parameter_domain[0])
+        .abs();
+    let mut unique_len = 0;
+    for index in 0..candidates.len() {
+        let candidate = candidates[index];
+        if unique_len > 0
+            && (candidate.0 - candidates[unique_len - 1].0).abs() <= parameter_tolerance
+        {
+            if candidate.1 < candidates[unique_len - 1].1 {
+                candidates[unique_len - 1] = candidate;
+            }
+        } else {
+            candidates[unique_len] = candidate;
+            unique_len += 1;
+        }
+    }
+    candidates.truncate(unique_len);
+    match candidates.as_slice() {
+        [] => InverseResolution::NoMatch,
+        [(parameter, _)] => InverseResolution::Unique(*parameter),
+        _ => InverseResolution::Ambiguous,
+    }
+}
+
+fn nurbs_parameter_at_point(
+    ctx: &DecodeContext<'_>,
+    nurbs: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    target: cadmpeg_ir::math::Point3,
+) -> Result<InverseResolution<f64>, cadmpeg_core::CodecError> {
+    let squared_distance = |parameter: f64| {
+        let Some(point) = super::evaluation::nurbs_curve_point(ctx, nurbs, parameter)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            (point.x - target.x).powi(2)
+                + (point.y - target.y).powi(2)
+                + (point.z - target.z).powi(2),
+        ))
+    };
+    let Some(domain) = nurbs_curve_parameter_domain(nurbs)
+        .map(cadmpeg_ir::topology::IncreasingParameterInterval::endpoints)
+    else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let Some(candidates) = sampled_parameter_minima(nurbs.knots(), domain, squared_distance)?
+    else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let tolerance = match nurbs.pole_rows() {
+        cadmpeg_ir::geometry::nurbs::NurbsPoles3::Polynomial { points } => {
+            inverse_coordinate_tolerance(
+                points
+                    .iter()
+                    .copied()
+                    .map(FinitePoint3::get)
+                    .chain(std::iter::once(target)),
+            )
+        }
+        cadmpeg_ir::geometry::nurbs::NurbsPoles3::Rational { points } => {
+            inverse_coordinate_tolerance(
+                points
+                    .iter()
+                    .map(|pole| pole.point.get())
+                    .chain(std::iter::once(target)),
+            )
+        }
+    };
+    Ok(unique_inverse_parameter(candidates, tolerance, domain))
+}
+
+fn quadratic_nurbs_has_constant_radius(
+    radial_control_points: &[cadmpeg_ir::math::Point2],
+    weights: Option<&[f64]>,
+    knots: &[f64],
+    radius: cadmpeg_ir::scalar::PositiveLength,
+) -> bool {
+    if radial_control_points.len() < 3
+        || radial_control_points.len().is_multiple_of(2)
+        || knots.len() != radial_control_points.len() + 3
+        || weights.is_some_and(|weights| weights.len() != radial_control_points.len())
+    {
+        return false;
+    }
+    let radius = radius.get();
+    let mut runs = 0usize;
+    let mut previous = 0.0;
+    let mut count = 0usize;
+    for knot in knots {
+        if !knot.is_finite() {
+            return false;
+        }
+        if runs == 0 {
+            previous = *knot;
+            count = 1;
+            runs = 1;
+        } else if *knot == previous {
+            count += 1;
+        } else {
+            if *knot <= previous || count != if runs == 1 { 3 } else { 2 } {
+                return false;
+            }
+            previous = *knot;
+            count = 1;
+            runs += 1;
+        }
+    }
+    if runs < 2 || count != 3 || runs - 1 != (radial_control_points.len() - 1) / 2 {
+        return false;
+    }
+    let weight = |index: usize| weights.map_or(1.0, |weights| weights[index]);
+    let choose_2 = [1.0, 2.0, 1.0];
+    let choose_4 = [1.0, 4.0, 6.0, 4.0, 1.0];
+    let tolerance = EPS_RADIUS_ABSOLUTE.max(radius * radius * EPS_RADIUS_RELATIVE);
+    for start in (0..radial_control_points.len() - 1).step_by(2) {
+        let homogeneous = [0, 1, 2].map(|offset| {
+            let weight = weight(start + offset);
+            let point = radial_control_points[start + offset];
+            (point.u * weight, point.v * weight, weight)
+        });
+        for (degree, &denominator) in choose_4.iter().enumerate() {
+            let mut identity = 0.0_f64;
+            for i in 0usize..=2 {
+                let Some(j) = degree.checked_sub(i) else {
+                    continue;
+                };
+                if j > 2 {
+                    continue;
+                }
+                let factor = choose_2[i] * choose_2[j] / denominator;
+                identity += factor
+                    * (homogeneous[i].0 * homogeneous[j].0 + homogeneous[i].1 * homogeneous[j].1
+                        - radius * radius * homogeneous[i].2 * homogeneous[j].2);
+            }
+            if identity.abs() > tolerance {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn circle_azimuth_parameter(
+    surface_axis: cadmpeg_ir::math::Vector3,
+    surface_reference: cadmpeg_ir::math::Vector3,
+    circle_axis: cadmpeg_ir::math::Vector3,
+    circle_reference: cadmpeg_ir::math::Vector3,
+) -> Option<(f64, f64)> {
+    let axis_dot = surface_axis.x * circle_axis.x
+        + surface_axis.y * circle_axis.y
+        + surface_axis.z * circle_axis.z;
+    if axis_dot.abs() < 1.0 - EPS_AXIS_ALIGNMENT {
+        return None;
+    }
+    let surface_tangent = cadmpeg_ir::math::Vector3::new(
+        surface_axis.y * surface_reference.z - surface_axis.z * surface_reference.y,
+        surface_axis.z * surface_reference.x - surface_axis.x * surface_reference.z,
+        surface_axis.x * surface_reference.y - surface_axis.y * surface_reference.x,
+    );
+    let phase = (circle_reference.x * surface_tangent.x
+        + circle_reference.y * surface_tangent.y
+        + circle_reference.z * surface_tangent.z)
+        .atan2(
+            circle_reference.x * surface_reference.x
+                + circle_reference.y * surface_reference.y
+                + circle_reference.z * surface_reference.z,
+        );
+    Some((phase, axis_dot.signum()))
+}
+
+fn derive_revolved_circle_pcurves(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let loop_faces = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, &lp.face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let faces = out
+        .faces
+        .iter()
+        .map(|face| (&face.id, face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let surfaces = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, surface))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edges = out
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, curve))
+        .collect::<std::collections::HashMap<_, _>>();
+    let dot = |a: [f64; 3], b: cadmpeg_ir::math::Vector3| a[0] * b.x + a[1] * b.y + a[2] * b.z;
+    let mut derived = Vec::new();
+    for coedge in &out.coedges {
+        if !coedge.pcurves.is_empty() {
+            continue;
+        }
+        let Some(surface) = loop_faces
+            .get(&coedge.owner_loop)
+            .and_then(|face_id| faces.get(face_id))
+            .and_then(|face| surfaces.get(&face.surface))
+        else {
+            continue;
+        };
+        let Some(CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve))) = edges
+            .get(&coedge.edge)
+            .and_then(|edge| edge.curve())
+            .and_then(|curve_id| curves.get(curve_id))
+            .map(|curve| &curve.geometry)
+        else {
+            continue;
+        };
+        let circle_center = circle_curve.center().get();
+        let circle_axis = circle_curve.frame().axis().as_raw();
+        let circle_reference = circle_curve.frame().reference().as_raw();
+        let circle_radius = circle_curve.radius().get();
+        let (surface_axis, surface_reference, v) = match &surface.geometry {
+            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(cone_surface))
+                if {
+                    let ratio = cone_surface.ratio().get();
+                    (ratio - 1.0).abs() < EPS_NORMAL_NONZERO
+                } =>
+            {
+                let origin = cone_surface.origin().get();
+                let axis = cone_surface.frame().axis().as_raw();
+                let ref_direction = cone_surface.frame().reference().as_raw();
+                let radius = cone_surface.radius().get();
+                let half_angle = cone_surface.half_angle().get();
+                let d = [
+                    circle_center.x - origin.x,
+                    circle_center.y - origin.y,
+                    circle_center.z - origin.z,
+                ];
+                let v = dot(d, *axis);
+                let radial = [d[0] - v * axis.x, d[1] - v * axis.y, d[2] - v * axis.z];
+                let expected_radius = radius + v * half_angle.tan();
+                if dot(
+                    radial,
+                    cadmpeg_ir::math::Vector3::new(radial[0], radial[1], radial[2]),
+                )
+                .sqrt()
+                    > EPS_PLANAR_DISTANCE
+                    || (circle_radius.abs() - expected_radius.abs()).abs() > EPS_CIRCLE_RADIUS_MATCH
+                {
+                    continue;
+                }
+                (*axis, *ref_direction, v)
+            }
+            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(torus_surface)) => {
+                let center = torus_surface.center().get();
+                let axis = torus_surface.frame().axis().as_raw();
+                let ref_direction = torus_surface.frame().reference().as_raw();
+                let major_radius = torus_surface.major_radius().get();
+                let minor_radius = torus_surface.minor_radius().get();
+                let d = [
+                    circle_center.x - center.x,
+                    circle_center.y - center.y,
+                    circle_center.z - center.z,
+                ];
+                let height = dot(d, *axis);
+                let radial = [
+                    d[0] - height * axis.x,
+                    d[1] - height * axis.y,
+                    d[2] - height * axis.z,
+                ];
+                if dot(
+                    radial,
+                    cadmpeg_ir::math::Vector3::new(radial[0], radial[1], radial[2]),
+                )
+                .sqrt()
+                    > EPS_PLANAR_DISTANCE
+                    || ((circle_radius.abs() - major_radius).hypot(height) - minor_radius.abs())
+                        .abs()
+                        > EPS_RADIUS_ABSOLUTE.max(minor_radius.abs() * EPS_RADIUS_RELATIVE)
+                {
+                    continue;
+                }
+                (
+                    *axis,
+                    *ref_direction,
+                    height.atan2(circle_radius.abs() - major_radius),
+                )
+            }
+            _ => continue,
+        };
+        let Some((phase, sense)) = circle_azimuth_parameter(
+            surface_axis,
+            surface_reference,
+            *circle_axis,
+            *circle_reference,
+        ) else {
+            continue;
+        };
+        let id = PcurveId::compose(
+            &pcurve_namespace(),
+            cadmpeg_ir::identity_key!("revolved-circle:").then(coedge.id.key()),
+        );
+        derived.push((
+            coedge.id.clone(),
+            id.clone(),
+            Pcurve {
+                id,
+                geometry: PcurveGeometry::Line(
+                    match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                        cadmpeg_ir::math::Point2::new(phase, v),
+                        cadmpeg_ir::math::Point2::new(sense, 0.0),
+                    ) {
+                        Ok(payload) => payload,
+                        Err(_) => continue,
+                    },
+                ),
+                metadata: cadmpeg_ir::geometry::pcurve::PcurveMetadata::default(),
+            },
+        ));
+    }
+    let mut coedge_indices = HashMap::new();
+    for (index, coedge) in out.coedges.iter().enumerate() {
+        let id = coedge.id.clone();
+        coedge_indices.insert(id, index);
+    }
+    for (coedge_id, id, pcurve) in derived {
+        if let Some(index) = coedge_indices.get(&coedge_id) {
+            let uses = vec![cadmpeg_ir::topology::PcurveUse {
+                pcurve: id.clone(),
+                isoparametric: None,
+                parameter_range: None,
+            }];
+            out.coedges[*index].pcurves = uses;
+        }
+        annotations.note(
+            id.as_str(),
+            source_stream,
+            0,
+            Some("derived_revolved_circle_pcurve"),
+        );
+        annotations.exactness(id.as_str(), Exactness::Derived);
+        admit_brep_entity(ctx)?;
+        out.pcurves.push(pcurve);
+    }
+    Ok(())
+}
+
+/// Answer the sphere latitude of a circle whose plane is normal to the sphere
+/// axis, or refuse a plane the sphere does not carry.
+///
+/// `height` is the signed axial distance from the sphere center to the circle
+/// plane, so a circle on the sphere has `height.abs() <= radius.abs()` and the
+/// latitude is `asin(height / radius)`. The radius match that precedes this
+/// compares the circle radius against `sqrt(radius^2 - height^2)`, which
+/// saturates at zero, so a small circle passes that match at any height beyond
+/// the pole. The height is therefore stated here against the same distance
+/// tolerance, and only the excess that tolerance admits is mapped onto the
+/// pole. A larger height states a circle on another sphere.
+fn sphere_latitude(height: f64, radius: f64) -> Option<f64> {
+    let pole = radius.abs() + EPS_CIRCLE_RADIUS_MATCH;
+    if !(-pole..=pole).contains(&height) {
+        return None;
+    }
+    let sine = height / radius;
+    if sine < -1.0 {
+        return Some(-std::f64::consts::FRAC_PI_2);
+    }
+    if sine > 1.0 {
+        return Some(std::f64::consts::FRAC_PI_2);
+    }
+    Some(sine.asin())
+}
+
+/// One straight span of a circle's image in a sphere's parameter plane.
+struct SphereLineSpan {
+    origin: cadmpeg_ir::math::Point2,
+    direction: cadmpeg_ir::math::Point2,
+    range: Option<[f64; 2]>,
+}
+
+/// The circle parameters inside `[start, end]` where a meridian with latitude
+/// `phase + t` reaches a sphere pole, `margin` clear of the interval's ends.
+fn meridian_poles([start, end]: [f64; 2], phase: f64, margin: f64) -> Vec<f64> {
+    let (pi, half) = (std::f64::consts::PI, std::f64::consts::FRAC_PI_2);
+    let first = ((start + phase - half) / pi).ceil();
+    [0.0, 1.0, 2.0, 3.0]
+        .into_iter()
+        .map(|step| (first + step) * pi + half - phase)
+        .filter(|pole| *pole > start + margin && *pole < end - margin)
+        .collect()
+}
+
+/// The line of a meridian with latitude `phase + t`. It shifts by whole turns
+/// so `middle` is within half a turn of the equator. Beyond a pole, it uses the
+/// opposite meridian, where latitude falls.
+fn meridian_line(
+    longitude: f64,
+    phase: f64,
+    middle: Option<f64>,
+) -> (cadmpeg_ir::math::Point2, cadmpeg_ir::math::Point2) {
+    let pi = std::f64::consts::PI;
+    let phase = middle.map_or(phase, |middle| {
+        let tau = std::f64::consts::TAU;
+        phase - ((phase + middle) / tau).round() * tau
+    });
+    match middle.map(|middle| phase + middle) {
+        Some(latitude) if latitude.abs() > std::f64::consts::FRAC_PI_2 => (
+            cadmpeg_ir::math::Point2::new(
+                longitude - pi.copysign(longitude),
+                pi.copysign(latitude) - phase,
+            ),
+            cadmpeg_ir::math::Point2::new(0.0, -1.0),
+        ),
+        _ => (
+            cadmpeg_ir::math::Point2::new(longitude, phase),
+            cadmpeg_ir::math::Point2::new(0.0, 1.0),
+        ),
+    }
+}
+
+fn derive_spherical_pcurves(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let loop_faces = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, &lp.face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let faces = out
+        .faces
+        .iter()
+        .map(|face| (&face.id, face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let surfaces = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, surface))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edges = out
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, curve))
+        .collect::<std::collections::HashMap<_, _>>();
+    let vertex_points = out
+        .vertices
+        .iter()
+        .filter_map(|vertex| {
+            let point = out.points.iter().find(|point| point.id == vertex.point)?;
+            Some((&vertex.id, point.position().get()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut derived = Vec::new();
+    for coedge in &out.coedges {
+        if !coedge.pcurves.is_empty() {
+            continue;
+        }
+        let Some(face_id) = loop_faces.get(&coedge.owner_loop) else {
+            continue;
+        };
+        let Some(face) = faces.get(face_id) else {
+            continue;
+        };
+        let Some(surface) = surfaces.get(&face.surface) else {
+            continue;
+        };
+        let Some(SolvedSurfaceGeometry::Sphere(sphere_surface)) = surface.geometry.solved() else {
+            continue;
+        };
+        let sphere_center = sphere_surface.center().get();
+        let v_reference = *sphere_surface.frame().axis().as_raw();
+        let u_reference = *sphere_surface.frame().reference().as_raw();
+        let radius = sphere_surface.radius().get();
+        let Some(edge) = edges.get(&coedge.edge) else {
+            continue;
+        };
+        let Some(CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve))) = edge
+            .curve()
+            .and_then(|id| curves.get(id).copied())
+            .map(|curve| &curve.geometry)
+        else {
+            continue;
+        };
+        let center = circle_curve.center().get();
+        let axis = *circle_curve.frame().axis().as_raw();
+        let circle_radius = circle_curve.radius().get();
+        let axis_dot = axis.dot(v_reference);
+        let reference = *circle_curve.frame().reference().as_raw();
+        let tangent = v_reference.cross(u_reference);
+        let offset = center.vector_from(sphere_center);
+        // Allow rounding of the frame projections as well as the existing
+        // absolute carrier fit tolerance; never form squared radii.
+        let fit_tolerance = EPS_CIRCLE_RADIUS_MATCH + 64.0 * f64::EPSILON * radius;
+        let spans: Vec<SphereLineSpan> = if axis_dot.abs() > 1.0 - EPS_AXIS_ALIGNMENT {
+            let height = offset.dot(v_reference);
+            let transverse = cadmpeg_ir::math::Vector3::new(
+                offset.x - height * v_reference.x,
+                offset.y - height * v_reference.y,
+                offset.z - height * v_reference.z,
+            );
+            let Some(latitude) = sphere_latitude(height, radius) else {
+                continue;
+            };
+            let sine = (height / radius).clamp(-1.0, 1.0);
+            let section_radius = radius * ((1.0 - sine.abs()) * (1.0 + sine.abs())).sqrt();
+            if transverse.norm() > fit_tolerance
+                || (section_radius - circle_radius).abs() > fit_tolerance
+            {
+                continue;
+            }
+            let phase = reference.dot(tangent).atan2(reference.dot(u_reference));
+            vec![SphereLineSpan {
+                origin: cadmpeg_ir::math::Point2::new(phase, latitude),
+                direction: cadmpeg_ir::math::Point2::new(axis_dot.signum(), 0.0),
+                range: None,
+            }]
+        } else if axis_dot.abs() < EPS_AXIS_ALIGNMENT
+            && (circle_radius - radius).abs() <= fit_tolerance
+            && offset.norm() <= fit_tolerance
+        {
+            // With equator = sphere_axis × circle_axis, increasing latitude
+            // follows the circle's positive orientation. Its reference fixes
+            // the initial latitude, including a reference at either pole.
+            let Some(equator) = sphere_surface
+                .frame()
+                .axis()
+                .finite_cross(*circle_curve.frame().axis())
+                .unit_nonzero()
+            else {
+                continue;
+            };
+            let longitude = equator.dot(tangent).atan2(equator.dot(u_reference));
+            let phase = reference.dot(v_reference).atan2(reference.dot(equator));
+            let range = edge.param_range().map(cadmpeg_ir::units::FiniteVector::get);
+            let middle = range.map(|[start, end]| start.midpoint(end)).or_else(|| {
+                let circle = CurveGeometry::Solved(SolvedCurveGeometry::Circle(*circle_curve));
+                let angle = |vertex: &VertexId| {
+                    carrier_angle(&circle, *vertex_points.get(vertex)?, f64::INFINITY)
+                };
+                let start = angle(&edge.start)?;
+                let sweep = (angle(&edge.end)? - start).rem_euclid(std::f64::consts::TAU);
+                Some(start + 0.5 * sweep)
+            });
+            let poles = range.map_or_else(Vec::new, |range| {
+                meridian_poles(range, phase, fit_tolerance / radius)
+            });
+            match range {
+                Some(range) if !poles.is_empty() => {
+                    let mut bounds = vec![range[0]];
+                    bounds.extend(poles);
+                    bounds.push(range[1]);
+                    let mut spans: Vec<SphereLineSpan> = bounds
+                        .windows(2)
+                        .map(|pair| {
+                            let (origin, direction) =
+                                meridian_line(longitude, phase, Some(pair[0].midpoint(pair[1])));
+                            let ends = if coedge.sense == Sense::Reversed {
+                                [pair[1], pair[0]]
+                            } else {
+                                [pair[0], pair[1]]
+                            };
+                            SphereLineSpan {
+                                origin,
+                                direction,
+                                range: Some(ends),
+                            }
+                        })
+                        .collect();
+                    if coedge.sense == Sense::Reversed {
+                        spans.reverse();
+                    }
+                    spans
+                }
+                _ => {
+                    let (origin, direction) = meridian_line(longitude, phase, middle);
+                    vec![SphereLineSpan {
+                        origin,
+                        direction,
+                        range: None,
+                    }]
+                }
+            }
+        } else {
+            continue;
+        };
+        let mut pieces = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let Ok(line) =
+                cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(span.origin, span.direction)
+            else {
+                pieces.clear();
+                break;
+            };
+            let geometry = PcurveGeometry::Line(line);
+            // Verify both frame axes and their opposite points before assigning a
+            // derived support relation. Near-aligned frames still need a physical fit.
+            let mut fits = true;
+            for parameter in [
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::PI,
+                -std::f64::consts::FRAC_PI_2,
+            ] {
+                let Some(uv) =
+                    cadmpeg_ir::eval::finite_or_refusal(cadmpeg_ir::eval::decode::outer_refusal(
+                        cadmpeg_ir::eval::decode::pcurve_uv(ctx, &geometry, parameter),
+                    )?)?
+                else {
+                    fits = false;
+                    break;
+                };
+                let Some(lifted) =
+                    super::evaluation::surface_point(ctx, &surface.geometry, uv.u, uv.v)?
+                else {
+                    fits = false;
+                    break;
+                };
+                let Some(curve_point) =
+                    cadmpeg_ir::eval::finite_or_refusal(cadmpeg_ir::eval::decode::outer_refusal(
+                        cadmpeg_ir::eval::decode::curve_point(
+                            ctx,
+                            &CurveGeometry::Solved(SolvedCurveGeometry::Circle(*circle_curve)),
+                            parameter,
+                        ),
+                    )?)?
+                else {
+                    fits = false;
+                    break;
+                };
+                if lifted.distance(curve_point.get()) > fit_tolerance {
+                    fits = false;
+                    break;
+                }
+            }
+            if !fits {
+                pieces.clear();
+                break;
+            }
+            pieces.push((geometry, span.range));
+        }
+        if pieces.is_empty() {
+            continue;
+        }
+        let chained = pieces.len() > 1;
+        for (index, (geometry, range)) in pieces.into_iter().enumerate() {
+            let key = cadmpeg_ir::identity_key!("sphere:").then(coedge.id.key());
+            let id = if chained {
+                PcurveId::compose(
+                    &pcurve_namespace(),
+                    key.then(cadmpeg_ir::identity_key!(":")).then(index),
+                )
+            } else {
+                PcurveId::compose(&pcurve_namespace(), key)
+            };
+            derived.push((
+                coedge.id.clone(),
+                id.clone(),
+                Pcurve {
+                    id,
+                    geometry,
+                    metadata: cadmpeg_ir::geometry::pcurve::PcurveMetadata::default(),
+                },
+                range,
+            ));
+        }
+    }
+    let mut coedge_indices = HashMap::new();
+    for (index, coedge) in out.coedges.iter().enumerate() {
+        let id = coedge.id.clone();
+        coedge_indices.insert(id, index);
+    }
+    for (coedge_id, id, pcurve, range) in derived {
+        if let Some(index) = coedge_indices.get(&coedge_id) {
+            let parameter_range = range
+                .and_then(|range| cadmpeg_ir::geometry::DirectedParameterRange::new(range).ok());
+            out.coedges[*index]
+                .pcurves
+                .push(cadmpeg_ir::topology::PcurveUse {
+                    pcurve: id.clone(),
+                    isoparametric: None,
+                    parameter_range,
+                });
+        }
+        annotations.note(
+            id.as_str(),
+            source_stream,
+            0,
+            Some("derived_spherical_pcurve"),
+        );
+        annotations.exactness(id.as_str(), Exactness::Derived);
+        admit_brep_entity(ctx)?;
+        out.pcurves.push(pcurve);
+    }
+    Ok(())
+}
+
+fn derive_nurbs_isoparametric_pcurves(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let loop_faces = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, &lp.face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let faces = out
+        .faces
+        .iter()
+        .map(|face| (&face.id, face))
+        .collect::<std::collections::HashMap<_, _>>();
+    let surfaces = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, surface))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edges = out
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, curve))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut lane_refusals = crate::lane_refusal::LaneRefusals::new();
+    let vertices = out
+        .vertices
+        .iter()
+        .map(|vertex| (&vertex.id, vertex))
+        .collect::<std::collections::HashMap<_, _>>();
+    let points = out
+        .points
+        .iter()
+        .map(|point| (&point.id, point))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut derived = Vec::new();
+    for coedge in &out.coedges {
+        if !coedge.pcurves.is_empty() {
+            continue;
+        }
+        let Some(face_id) = loop_faces.get(&coedge.owner_loop) else {
+            continue;
+        };
+        let Some(face) = faces.get(face_id) else {
+            continue;
+        };
+        let Some(SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(surface))) =
+            surfaces.get(&face.surface).map(|item| &item.geometry)
+        else {
+            continue;
+        };
+        let Some(edge) = edges.get(&coedge.edge) else {
+            continue;
+        };
+        let Some(curve) = edge
+            .curve()
+            .and_then(|id| curves.get(id).copied())
+            .map(|item| &item.geometry)
+        else {
+            continue;
+        };
+        let endpoints = [&edge.start, &edge.end].map(|vertex_id| {
+            let vertex = vertices.get(&vertex_id)?;
+            Some(points.get(&vertex.point)?.position().get())
+        });
+        let endpoints = match endpoints {
+            [Some(start), Some(end)] => Some([start, end]),
+            _ => None,
+        };
+        let (geometry, parameter_range, fit_tolerance, cache) = match curve {
+            CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(curve)) => {
+                let Some(parameter_range) =
+                    nurbs_edge_parameter_range(ctx, edge, curve, endpoints)?
+                else {
+                    continue;
+                };
+                let resolution =
+                    match derive_nurbs_edge_pcurve(ctx, surface, curve, parameter_range) {
+                        Ok(resolution) => resolution,
+                        Err(NurbsPcurveFailure::Carrier(error)) => {
+                            lane_refusals.note(
+                                format_args!("isoparametric pcurve for edge {}", edge.id.as_str()),
+                                &error,
+                            );
+                            continue;
+                        }
+                        Err(NurbsPcurveFailure::Resource(limit)) => return Err(limit),
+                    };
+                match resolution {
+                    NurbsPcurveResolution::Exact(geometry) => {
+                        (geometry, Some(parameter_range), None, false)
+                    }
+                    NurbsPcurveResolution::Cache {
+                        geometry,
+                        fit_tolerance,
+                    } => (geometry, Some(parameter_range), Some(fit_tolerance), true),
+                    NurbsPcurveResolution::OffSurface => {
+                        out.stats.off_surface_nurbs_pcurves += 1;
+                        continue;
+                    }
+                    NurbsPcurveResolution::Ambiguous => {
+                        out.stats.ambiguous_pcurve_parameters += 1;
+                        continue;
+                    }
+                    NurbsPcurveResolution::NoMatch => continue,
+                }
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Line(line_curve)) => {
+                let origin = line_curve.origin().get();
+                let direction = *line_curve.direction().as_raw();
+                let resolution = resolve_axis_candidates([
+                    ruled_surface_line_pcurve(
+                        ctx,
+                        surface,
+                        SurfaceParameterAxis::U,
+                        origin,
+                        direction,
+                    )?,
+                    ruled_surface_line_pcurve(
+                        ctx,
+                        surface,
+                        SurfaceParameterAxis::V,
+                        origin,
+                        direction,
+                    )?,
+                ]);
+                match resolution {
+                    InverseResolution::Unique(geometry) => (geometry, None, None, false),
+                    InverseResolution::Ambiguous => {
+                        out.stats.ambiguous_pcurve_parameters += 1;
+                        continue;
+                    }
+                    InverseResolution::NoMatch => continue,
+                }
+            }
+            _ => continue,
+        };
+        let id = PcurveId::compose(
+            &pcurve_namespace(),
+            if cache {
+                cadmpeg_ir::identity_key!("nurbs-surface-cache:")
+            } else {
+                cadmpeg_ir::identity_key!("nurbs-isoparametric:")
+            }
+            .then(coedge.id.key()),
+        );
+        let parameter_range = match parameter_range.map(cadmpeg_ir::units::FiniteVector::new) {
+            Some(None) => continue,
+            Some(Some(range)) => Some(range),
+            None => None,
+        };
+        let Ok(fit_tolerance) = fit_tolerance
+            .map(cadmpeg_ir::geometry::FitTolerance::try_new)
+            .transpose()
+        else {
+            continue;
+        };
+        derived.push((
+            coedge.id.clone(),
+            id.clone(),
+            Pcurve {
+                id,
+                geometry,
+                metadata: cadmpeg_ir::geometry::pcurve::PcurveMetadata::general(
+                    None,
+                    parameter_range,
+                    fit_tolerance,
+                ),
+            },
+            cache,
+        ));
+    }
+    let mut coedge_indices = HashMap::new();
+    for (index, coedge) in out.coedges.iter().enumerate() {
+        let id = coedge.id.clone();
+        coedge_indices.insert(id, index);
+    }
+    // The sink is drained before the `?` below: an error on that route must
+    // not drop a refusal the walk above already pushed.
+    for record in lane_refusals.take_records() {
+        let note = crate::loss::spline_lane_refusal(&record);
+        out.losses.push(note);
+    }
+    for (coedge_id, id, pcurve, cache) in derived {
+        if let Some(index) = coedge_indices.get(&coedge_id) {
+            let uses = vec![cadmpeg_ir::topology::PcurveUse {
+                pcurve: id.clone(),
+                isoparametric: None,
+                parameter_range: (pcurve.parameter_range())
+                    .map(|range| cadmpeg_ir::geometry::DirectedParameterRange::new(range.get()))
+                    .transpose()
+                    .map_err(cadmpeg_core::CodecError::malformed)?,
+            }];
+            out.coedges[*index].pcurves = uses;
+        }
+        annotations.note(
+            id.as_str(),
+            source_stream,
+            0,
+            Some(if cache {
+                "derived_nurbs_surface_cache_pcurve"
+            } else {
+                "derived_nurbs_isoparametric_pcurve"
+            }),
+        );
+        annotations.exactness(id.as_str(), Exactness::Derived);
+        if let Some(tolerance) = pcurve.fit_tolerance().filter(|_| cache) {
+            out.approximations.inverse_boundary(tolerance.get());
+        }
+        admit_brep_entity(ctx)?;
+        out.pcurves.push(pcurve);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntersectionPcurveSource {
+    StoredCache,
+    AnalyticInverse,
+    NurbsInverse,
+}
+
+/// Conservative maximum separation between one analytic surface image of a
+/// linear UV segment and the straight chord through its endpoints.
+fn analytic_pcurve_chord_bound(
+    surface: &SurfaceGeometry,
+    start: cadmpeg_ir::math::Point2,
+    end: cadmpeg_ir::math::Point2,
+) -> Option<f64> {
+    let du = (end.u - start.u).abs();
+    let dv = (end.v - start.v).abs();
+    let second_derivative_bound = match surface {
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(_)) => 0.0,
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(cylinder_surface)) => {
+            let radius = cylinder_surface.radius().get();
+            radius.abs() * du * du
+        }
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(cone_surface)) => {
+            let radius = cone_surface.radius().get();
+            let ratio = cone_surface.ratio().get();
+            let half_angle = cone_surface.half_angle().get();
+            let slope = half_angle.tan().abs();
+            let radial_scale = 1.0f64.max(ratio.abs());
+            let max_radius = (radius + start.v * half_angle.tan())
+                .abs()
+                .max((radius + end.v * half_angle.tan()).abs());
+            radial_scale * (max_radius * du * du + 2.0 * slope * du * dv)
+        }
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Sphere(sphere_surface)) => {
+            let radius = sphere_surface.radius().get();
+            radius.abs() * (du + dv).powi(2)
+        }
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(torus_surface)) => {
+            let major_radius = torus_surface.major_radius().get();
+            let minor_radius = torus_surface.minor_radius().get();
+            (major_radius.abs() + minor_radius.abs()) * du * du
+                + 2.0 * minor_radius.abs() * du * dv
+                + minor_radius.abs() * dv * dv
+        }
+        _ => return None,
+    };
+    let bound = second_derivative_bound / 8.0;
+    bound.is_finite().then_some(bound)
+}
+
+struct IntersectionPcurveSinks<'a> {
+    refusal: &'a mut crate::lane_refusal::LaneRefusals,
+    /// Set when a NURBS surface solve stops at its local work cap.
+    solver_capped: &'a mut bool,
+}
+
+fn intersection_support_pcurve(
+    ctx: &DecodeContext<'_>,
+    support_data: &super::intersection::IntersectionSupportData,
+    chart: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    surface_attr: u32,
+    surface: &SurfaceGeometry,
+    edge_endpoints: [cadmpeg_ir::math::Point3; 2],
+    sinks: &mut IntersectionPcurveSinks<'_>,
+) -> Result<Option<(PcurveGeometry, [f64; 2], IntersectionPcurveSource)>, cadmpeg_core::CodecError>
+{
+    macro_rules! some_or_none {
+        ($value:expr) => {
+            match $value {
+                Some(value) => value,
+                None => return Ok(None),
+            }
+        };
+    }
+    (|| -> Result<Option<(PcurveGeometry, [f64; 2], IntersectionPcurveSource)>, cadmpeg_core::CodecError> {
+        let fit_tolerance_mm = some_or_none!(support_data
+            .fit_tolerance_mm
+            .filter(|tolerance| tolerance.is_finite() && *tolerance > 0.0));
+        if chart.degree() != 1
+            || matches!(chart.pole_rows(), cadmpeg_ir::geometry::nurbs::NurbsPoles3::Rational { .. })
+            || chart.periodic()
+        {
+            return Ok(None);
+        }
+        let parameter_range = some_or_none!(nurbs_curve_parameter_domain(chart)).endpoints();
+        let cadmpeg_ir::geometry::nurbs::NurbsPoles3::Polynomial { points: chart_points } = chart.pole_rows() else { return Ok(None) };
+        let support_index = match support_data.supports.map(|support| support == surface_attr) {
+            [true, false] => 0,
+            [false, true] => 1,
+            _ => return Ok(None),
+        };
+        let squared_distance = |left: cadmpeg_ir::math::Point3, right: cadmpeg_ir::math::Point3| {
+            (left.x - right.x).powi(2) + (left.y - right.y).powi(2) + (left.z - right.z).powi(2)
+        };
+        let model_endpoints = [
+            *some_or_none!(chart_points.first()),
+            *some_or_none!(chart_points.last()),
+        ];
+        let direct_error = squared_distance(model_endpoints[0].get(), edge_endpoints[0])
+            + squared_distance(model_endpoints[1].get(), edge_endpoints[1]);
+        let reverse_error = squared_distance(model_endpoints[0].get(), edge_endpoints[1])
+            + squared_distance(model_endpoints[1].get(), edge_endpoints[0]);
+        let targets = if direct_error <= reverse_error {
+            edge_endpoints
+        } else {
+            [edge_endpoints[1], edge_endpoints[0]]
+        };
+        let (mut control_points, source) = if let Some(support_uv) = &support_data.support_uv {
+            let source_points = &support_uv[support_index];
+            let mut control_points = Vec::new();
+            control_points.extend_from_slice(source_points);
+            match surface {
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(_)) => {
+                    for point in &mut control_points {
+                        point.u *= LEN_TO_MM;
+                        point.v *= LEN_TO_MM;
+                    }
+                }
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(_)) => {
+                    for point in &mut control_points {
+                        point.v *= LEN_TO_MM;
+                    }
+                }
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(_)) => {
+                    for point in &mut control_points {
+                        point.v *= LEN_TO_MM;
+                    }
+                }
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Sphere(_)) => {}
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(_)) => {}
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(_)) => {}
+                _ => return Ok(None),
+            }
+            (control_points, IntersectionPcurveSource::StoredCache)
+        } else {
+            match surface {
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(surface)) => {
+                    let mut control_points = Vec::new();
+                    for point in chart_points {
+                        let parameters = match nurbs_surface_parameter_within_tolerance(
+                            ctx,
+                            surface,
+                            point.get(),
+                            control_points.last().copied(),
+                            fit_tolerance_mm,
+                            sinks.solver_capped,
+                        ) {
+                            Ok(Some(parameters)) => parameters,
+                            Ok(None) => return Ok(None),
+                            Err(limit) => return Err(limit),
+                        };
+                        control_points.push(parameters.get());
+                    }
+                    (control_points, IntersectionPcurveSource::NurbsInverse)
+                }
+                _ => {
+                    let mut control_points = Vec::new();
+                    for point in chart_points {
+                        let parameters = some_or_none!(analytic_surface_parameters(surface, point.get()));
+                        control_points.push(cadmpeg_ir::math::Point2::from(parameters));
+                    }
+                    for index in 1..control_points.len() {
+                        let previous = control_points[index - 1];
+                        match surface {
+                            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(_)) => {
+                                control_points[index].u += ((previous.u - control_points[index].u)
+                                    / std::f64::consts::TAU)
+                                    .round()
+                                    * std::f64::consts::TAU;
+                            }
+                            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(_)) => {
+                                control_points[index].u += ((previous.u - control_points[index].u)
+                                    / std::f64::consts::TAU)
+                                    .round()
+                                    * std::f64::consts::TAU;
+                            }
+                            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Sphere(_)) => {
+                                control_points[index].u += ((previous.u - control_points[index].u)
+                                    / std::f64::consts::TAU)
+                                    .round()
+                                    * std::f64::consts::TAU;
+                            }
+                            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(_)) => {
+                                control_points[index].u += ((previous.u - control_points[index].u)
+                                    / std::f64::consts::TAU)
+                                    .round()
+                                    * std::f64::consts::TAU;
+                            }
+                            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(_)) => {}
+                            _ => return Ok(None),
+                        }
+                        if matches!(
+                            surface,
+                            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(_))
+                        ) {
+                            control_points[index].v += ((previous.v - control_points[index].v)
+                                / std::f64::consts::TAU)
+                                .round()
+                                * std::f64::consts::TAU;
+                        }
+                    }
+                    (control_points, IntersectionPcurveSource::AnalyticInverse)
+                }
+            }
+        };
+        if control_points.len() != chart_points.len() {
+            return Ok(None);
+        }
+        if let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(surface)) = surface {
+            let tolerance = inverse_coordinate_tolerance(edge_endpoints);
+            let last = control_points.len() - 1;
+            for (index, target) in [(0, targets[0]), (last, targets[1])] {
+                control_points[index] = match nurbs_surface_parameter_within_tolerance(
+                            ctx,
+                    surface,
+                    target,
+                    Some(control_points[index]),
+                    tolerance,
+                    sinks.solver_capped,
+                ) {
+                    Ok(Some(parameters)) => parameters.get(),
+                    Ok(None) => return Ok(None),
+                    Err(limit) => return Err(limit),
+                };
+            }
+        } else {
+            let adjust_periodic = |parameter: f64, reference: f64| {
+                parameter
+                    + ((reference - parameter) / std::f64::consts::TAU).round()
+                        * std::f64::consts::TAU
+            };
+            let last = control_points.len() - 1;
+            for (index, target) in [(0, targets[0]), (last, targets[1])] {
+                let reference = control_points[index];
+                let mut parameters =
+                    cadmpeg_ir::math::Point2::from(some_or_none!(analytic_surface_parameters(surface, target)));
+                match surface {
+                    SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(_)) => {
+                        parameters.u = adjust_periodic(parameters.u, reference.u);
+                    }
+                    SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(_)) => {
+                        parameters.u = adjust_periodic(parameters.u, reference.u);
+                    }
+                    SurfaceGeometry::Solved(SolvedSurfaceGeometry::Sphere(_)) => {
+                        parameters.u = adjust_periodic(parameters.u, reference.u);
+                    }
+                    SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(_)) => {
+                        parameters.u = adjust_periodic(parameters.u, reference.u);
+                    }
+                    SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(_)) => {}
+                    _ => return Ok(None),
+                }
+                if matches!(
+                    surface,
+                    SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(_))
+                ) {
+                    parameters.v = adjust_periodic(parameters.v, reference.v);
+                }
+                control_points[index] = parameters;
+            }
+        }
+        let tolerance = inverse_coordinate_tolerance(edge_endpoints);
+        for (parameters, target) in [some_or_none!(control_points.first()), some_or_none!(control_points.last())]
+            .into_iter()
+            .zip(targets)
+        {
+            let Some(point) = super::evaluation::surface_point(ctx, surface, parameters.u, parameters.v)? else { return Ok(None); };
+            let point = point.get();
+            if squared_distance(point, target) > tolerance * tolerance {
+                return Ok(None);
+            }
+        }
+        let mut mapped_points = Vec::new();
+        for parameters in &control_points {
+            let Some(point) = super::evaluation::surface_point(ctx, surface, parameters.u, parameters.v)? else { return Ok(None); };
+            let point = point.get();
+            mapped_points.push(point);
+        }
+        let mut control_errors = Vec::new();
+        control_errors.extend(mapped_points.iter().zip(chart_points).map(|(point, target)| {
+            squared_distance(*point, target.get()).sqrt()
+        }));
+        if control_errors
+            .iter()
+            .any(|error| !error.is_finite() || *error > fit_tolerance_mm)
+        {
+            return Ok(None);
+        }
+        for ((parameters, chord), endpoint_errors) in control_points
+            .windows(2)
+            .zip(chart_points.windows(2))
+            .zip(control_errors.windows(2))
+        {
+            let exceeds = match surface {
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(surface)) => {
+                    let error = nurbs_surface_parameter_segment_chord_bound(
+                        ctx,
+                        surface,
+                        [parameters[0], parameters[1]],
+                        [chord[0].get(), chord[1].get()],
+                        sinks.solver_capped,
+                    )?;
+                    error.is_none_or(|error| error > fit_tolerance_mm)
+                }
+                _ => analytic_pcurve_chord_bound(surface, parameters[0], parameters[1]).is_none_or(
+                    |curvature_error| {
+                        curvature_error + endpoint_errors[0].max(endpoint_errors[1])
+                            > fit_tolerance_mm
+                    },
+                ),
+            };
+            if exceeds {
+                return Ok(None);
+            }
+        }
+        let knots_source = chart.knots().as_slice();
+        let mut knots = Vec::new();
+        knots.extend_from_slice(knots_source);
+        let nurbs =
+            match PcurveNurbs::from_lanes(1, knots, control_points, None, false) {
+                Ok(nurbs) => nurbs,
+                Err(error) => {
+                    sinks.refusal.note(
+                        format_args!(
+                            "sldprt intersection support pcurve for surface attr {surface_attr}"
+                        ),
+                        &error,
+                    );
+                    return Ok(None);
+                }
+            };
+        Ok(Some((
+            PcurveGeometry::Nurbs { nurbs },
+            parameter_range,
+            source,
+        )))
+    })()
+}
+
+fn resolve_axis_candidates<T, const N: usize>(
+    candidates: [InverseResolution<T>; N],
+) -> InverseResolution<T> {
+    let mut unique = None;
+    for candidate in candidates {
+        match candidate {
+            InverseResolution::NoMatch => {}
+            InverseResolution::Ambiguous => return InverseResolution::Ambiguous,
+            InverseResolution::Unique(value) if unique.is_none() => unique = Some(value),
+            InverseResolution::Unique(_) => return InverseResolution::Ambiguous,
+        }
+    }
+    unique.map_or(InverseResolution::NoMatch, InverseResolution::Unique)
+}
+
+#[derive(Debug)]
+enum NurbsPcurveFailure {
+    Carrier(cadmpeg_ir::geometry::nurbs::NurbsError),
+    Resource(cadmpeg_core::CodecError),
+}
+
+impl From<cadmpeg_ir::geometry::nurbs::NurbsError> for NurbsPcurveFailure {
+    fn from(error: cadmpeg_ir::geometry::nurbs::NurbsError) -> Self {
+        Self::Carrier(error)
+    }
+}
+
+impl From<cadmpeg_core::decode::ResourceLimit> for NurbsPcurveFailure {
+    fn from(limit: cadmpeg_core::decode::ResourceLimit) -> Self {
+        Self::Resource(limit.into())
+    }
+}
+
+impl From<cadmpeg_core::CodecError> for NurbsPcurveFailure {
+    fn from(error: cadmpeg_core::CodecError) -> Self {
+        Self::Resource(error)
+    }
+}
+
+fn nurbs_boundary_pcurve(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    fixed_axis: SurfaceParameterAxis,
+) -> Result<InverseResolution<PcurveGeometry>, cadmpeg_core::CodecError> {
+    let (fixed_degree, fixed_count, fixed_knots) = match fixed_axis {
+        SurfaceParameterAxis::U => (
+            index_from_u32(surface.u_degree()),
+            surface.u_count(),
+            surface.u_knots(),
+        ),
+        SurfaceParameterAxis::V => (
+            index_from_u32(surface.v_degree()),
+            surface.v_count(),
+            surface.v_knots(),
+        ),
+    };
+    let (varying_degree, varying_knots) = match fixed_axis {
+        SurfaceParameterAxis::U => (index_from_u32(surface.v_degree()), surface.v_knots()),
+        SurfaceParameterAxis::V => (index_from_u32(surface.u_degree()), surface.u_knots()),
+    };
+    let (Some(&fixed_min), Some(&fixed_max), Some(&varying_min)) = (
+        fixed_knots.get(fixed_degree),
+        fixed_knots.get(fixed_count),
+        varying_knots.get(varying_degree),
+    ) else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    if !fixed_min.is_finite()
+        || !fixed_max.is_finite()
+        || fixed_min >= fixed_max
+        || !varying_min.is_finite()
+    {
+        return Ok(InverseResolution::NoMatch);
+    }
+    let tolerance = inverse_coordinate_tolerance(
+        admitted_surface_poles(surface)
+            .chain((0..curve.pole_count()).filter_map(|index| curve.pole_rows().point_at(index)))
+            .map(FinitePoint3::get),
+    );
+    let same_curve = |candidate: &cadmpeg_ir::geometry::nurbs::NurbsCurve| {
+        candidate.degree() == curve.degree()
+            && candidate.knots() == curve.knots()
+            && candidate.periodic() == curve.periodic()
+            && candidate.pole_count() == curve.pole_count()
+            && (0..curve.pole_count()).all(|index| {
+                let (Some(candidate), Some(actual)) = (
+                    candidate.pole_rows().point_at(index),
+                    curve.pole_rows().point_at(index),
+                ) else {
+                    return false;
+                };
+                (candidate.x - actual.x).powi(2)
+                    + (candidate.y - actual.y).powi(2)
+                    + (candidate.z - actual.z).powi(2)
+                    <= tolerance * tolerance
+            })
+            && (0..curve.pole_count()).all(|index| {
+                match (
+                    candidate.pole_rows().weight_at(index),
+                    curve.pole_rows().weight_at(index),
+                ) {
+                    (None, None) => true,
+                    (Some(candidate), Some(actual)) => {
+                        (candidate - actual).abs() <= EPS_NURBS_WEIGHT
+                    }
+                    _ => false,
+                }
+            })
+    };
+    let mut fixed = None;
+    for parameter in [fixed_min, fixed_max]
+        .into_iter()
+        .filter(|parameter| parameter.is_finite())
+    {
+        if nurbs_surface_isocurve(ctx, surface, fixed_axis, parameter)?
+            .is_some_and(|candidate| same_curve(&candidate))
+        {
+            if fixed.is_some() {
+                return Ok(InverseResolution::Ambiguous);
+            }
+            fixed = Some(parameter);
+        }
+    }
+    let Some(fixed) = fixed else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    Ok(InverseResolution::Unique(match fixed_axis {
+        SurfaceParameterAxis::U => PcurveGeometry::Line(
+            match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                cadmpeg_ir::math::Point2::new(fixed, varying_min),
+                cadmpeg_ir::math::Point2::new(0.0, 1.0),
+            ) {
+                Ok(payload) => payload,
+                Err(_) => return Ok(InverseResolution::NoMatch),
+            },
+        ),
+        SurfaceParameterAxis::V => PcurveGeometry::Line(
+            match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                cadmpeg_ir::math::Point2::new(varying_min, fixed),
+                cadmpeg_ir::math::Point2::new(1.0, 0.0),
+            ) {
+                Ok(payload) => payload,
+                Err(_) => return Ok(InverseResolution::NoMatch),
+            },
+        ),
+    }))
+}
+
+fn nurbs_strict_isocurve_pcurve(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+) -> Result<InverseResolution<PcurveGeometry>, cadmpeg_core::CodecError> {
+    let axis_candidate = |fixed_axis| -> Result<
+        InverseResolution<PcurveGeometry>,
+        cadmpeg_core::CodecError,
+    > {
+        let (uc, vc) = (surface.u_count(), surface.v_count());
+        let (fixed_degree, fixed_count, fixed_knots, fixed_periodic) = match fixed_axis {
+            SurfaceParameterAxis::U => (
+                surface.u_degree(),
+                uc,
+                surface.u_knots(),
+                surface.u_periodic(),
+            ),
+            SurfaceParameterAxis::V => (
+                surface.v_degree(),
+                vc,
+                surface.v_knots(),
+                surface.v_periodic(),
+            ),
+        };
+        let (varying_degree, varying_count, varying_knots, varying_periodic) = match fixed_axis {
+            SurfaceParameterAxis::U => (
+                surface.v_degree(),
+                vc,
+                surface.v_knots(),
+                surface.v_periodic(),
+            ),
+            SurfaceParameterAxis::V => (
+                surface.u_degree(),
+                uc,
+                surface.u_knots(),
+                surface.u_periodic(),
+            ),
+        };
+        if curve.degree() != varying_degree
+            || curve.knots() != varying_knots
+            || curve.periodic() != varying_periodic
+            || curve.pole_count() != varying_count
+        {
+            return Ok(InverseResolution::NoMatch);
+        }
+        let (Some(&fixed_min), Some(&fixed_max)) = (fixed_knots.get(1), fixed_knots.get(2)) else {
+            return nurbs_boundary_pcurve(ctx, surface, curve, fixed_axis);
+        };
+        if fixed_degree != 1
+            || fixed_count != 2
+            || fixed_periodic
+            || fixed_knots.as_slice() != [fixed_min, fixed_min, fixed_max, fixed_max]
+            || fixed_min >= fixed_max
+        {
+            return nurbs_boundary_pcurve(ctx, surface, curve, fixed_axis);
+        }
+        let pole_indices = |varying: usize| match fixed_axis {
+            SurfaceParameterAxis::U => (varying, vc + varying),
+            SurfaceParameterAxis::V => (varying * vc, varying * vc + 1),
+        };
+        let weight_mismatch = (0..varying_count).any(|varying| {
+            let (a, b) = pole_indices(varying);
+            match (
+                surface.weight(a / vc, a % vc),
+                surface.weight(b / vc, b % vc),
+                curve.pole_rows().weight_at(varying),
+            ) {
+                (None, None, None) => false,
+                (Some(a), Some(b), Some(actual)) => {
+                    (a.get() - b.get()).abs() > EPS_NURBS_WEIGHT
+                        || (a.get() - actual).abs() > EPS_NURBS_WEIGHT
+                }
+                _ => true,
+            }
+        });
+        if weight_mismatch {
+            return Ok(InverseResolution::NoMatch);
+        }
+        let pole_at = |index: usize| surface.pole(index / vc, index % vc);
+        let mut delta_squared = 0.0;
+        let mut relative_dot_delta = 0.0;
+        for varying in 0..varying_count {
+            let (a_index, b_index) = pole_indices(varying);
+            let (Some(a), Some(b), Some(point)) = (
+                pole_at(a_index),
+                pole_at(b_index),
+                curve.pole_rows().point_at(varying),
+            ) else {
+                return Ok(InverseResolution::NoMatch);
+            };
+            let delta = [b.x - a.x, b.y - a.y, b.z - a.z];
+            let relative = [point.x - a.x, point.y - a.y, point.z - a.z];
+            delta_squared += delta.iter().map(|value| value * value).sum::<f64>();
+            relative_dot_delta += relative
+                .iter()
+                .zip(delta)
+                .map(|(relative, delta)| relative * delta)
+                .sum::<f64>();
+        }
+        let tolerance = inverse_coordinate_tolerance(
+            admitted_surface_poles(surface)
+                .chain(
+                    (0..curve.pole_count()).filter_map(|index| curve.pole_rows().point_at(index)),
+                )
+                .map(FinitePoint3::get),
+        );
+        if delta_squared <= f64::EPSILON {
+            let all_equal = (0..varying_count).all(|varying| {
+                let (Some(a), Some(point)) = (
+                    pole_at(pole_indices(varying).0),
+                    curve.pole_rows().point_at(varying),
+                ) else {
+                    return false;
+                };
+                (point.x - a.x).powi(2) + (point.y - a.y).powi(2) + (point.z - a.z).powi(2)
+                    <= tolerance * tolerance
+            });
+            return Ok(if all_equal {
+                InverseResolution::Ambiguous
+            } else {
+                InverseResolution::NoMatch
+            });
+        }
+        let factor = relative_dot_delta / delta_squared;
+        let residual_squared = (0..varying_count)
+            .filter_map(|varying| {
+                let (a_index, b_index) = pole_indices(varying);
+                let a = pole_at(a_index)?;
+                let b = pole_at(b_index)?;
+                let point = curve.pole_rows().point_at(varying)?;
+                Some(
+                    (point.x - (a.x + factor * (b.x - a.x))).powi(2)
+                        + (point.y - (a.y + factor * (b.y - a.y))).powi(2)
+                        + (point.z - (a.z + factor * (b.z - a.z))).powi(2),
+                )
+            })
+            .fold(0.0_f64, f64::max);
+        let parameter_tolerance = INVERSE_PARAMETER_TOLERANCE;
+        if !factor.is_finite()
+            || factor < -parameter_tolerance
+            || factor > 1.0 + parameter_tolerance
+            || residual_squared > tolerance * tolerance
+        {
+            return Ok(InverseResolution::NoMatch);
+        }
+        let fixed = fixed_min + factor.clamp(0.0, 1.0) * (fixed_max - fixed_min);
+        let Some(varying_degree) = usize::try_from(varying_degree).ok() else {
+            return Ok(InverseResolution::NoMatch);
+        };
+        let (Some(&varying_min), Some(&varying_max)) = (
+            varying_knots.get(varying_degree),
+            varying_knots.get(varying_count),
+        ) else {
+            return Ok(InverseResolution::NoMatch);
+        };
+        if !varying_min.is_finite() || !varying_max.is_finite() || varying_min >= varying_max {
+            return Ok(InverseResolution::NoMatch);
+        }
+        Ok(InverseResolution::Unique(match fixed_axis {
+            SurfaceParameterAxis::U => PcurveGeometry::Line(
+                match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                    cadmpeg_ir::math::Point2::new(fixed, varying_min),
+                    cadmpeg_ir::math::Point2::new(0.0, 1.0),
+                ) {
+                    Ok(payload) => payload,
+                    Err(_) => return Ok(InverseResolution::NoMatch),
+                },
+            ),
+            SurfaceParameterAxis::V => PcurveGeometry::Line(
+                match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                    cadmpeg_ir::math::Point2::new(varying_min, fixed),
+                    cadmpeg_ir::math::Point2::new(1.0, 0.0),
+                ) {
+                    Ok(payload) => payload,
+                    Err(_) => return Ok(InverseResolution::NoMatch),
+                },
+            ),
+        }))
+    };
+    Ok(resolve_axis_candidates([
+        axis_candidate(SurfaceParameterAxis::U)?,
+        axis_candidate(SurfaceParameterAxis::V)?,
+    ]))
+}
+
+fn nurbs_active_domain(knots: &[f64], degree: u32, count: usize) -> Option<[f64; 2]> {
+    let degree = usize::try_from(degree).ok()?;
+    if count <= degree || knots.len() != count.checked_add(degree)?.checked_add(1)? {
+        return None;
+    }
+    let domain = [*knots.get(degree)?, *knots.get(count)?];
+    (domain[0] < domain[1]).then_some(domain)
+}
+
+fn nurbs_roundoff_equal(left: f64, right: f64, scale: f64) -> bool {
+    left.is_finite()
+        && right.is_finite()
+        && (left - right).abs()
+            <= NURBS_POLE_ROUNDOFF_FACTOR
+                * 1.0_f64.max(scale.abs()).max(left.abs()).max(right.abs())
+}
+
+fn nurbs_representation_matches(
+    expected: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    actual: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+) -> bool {
+    if expected.degree() != actual.degree()
+        || expected.periodic() != actual.periodic()
+        || expected.knots().len() != actual.knots().len()
+        || expected.pole_count() != actual.pole_count()
+    {
+        return false;
+    }
+    let mut scale = 1.0_f64;
+    for index in 0..expected.pole_count() {
+        let (Some(expected_point), Some(actual_point)) = (
+            expected.pole_rows().point_at(index),
+            actual.pole_rows().point_at(index),
+        ) else {
+            return false;
+        };
+        for value in [
+            expected_point.x,
+            expected_point.y,
+            expected_point.z,
+            actual_point.x,
+            actual_point.y,
+            actual_point.z,
+        ] {
+            scale = scale.max(value.abs());
+        }
+        if let Some(weight) = expected.pole_rows().weight_at(index) {
+            scale = scale.max(weight.abs());
+        }
+        if let Some(weight) = actual.pole_rows().weight_at(index) {
+            scale = scale.max(weight.abs());
+        }
+    }
+    expected
+        .knots()
+        .iter()
+        .zip(actual.knots().iter())
+        .all(|(left, right)| nurbs_roundoff_equal(*left, *right, scale))
+        && (0..expected.pole_count()).all(|index| {
+            let (Some(left), Some(right)) = (
+                expected.pole_rows().point_at(index),
+                actual.pole_rows().point_at(index),
+            ) else {
+                return false;
+            };
+            nurbs_roundoff_equal(left.x, right.x, scale)
+                && nurbs_roundoff_equal(left.y, right.y, scale)
+                && nurbs_roundoff_equal(left.z, right.z, scale)
+                && match (
+                    expected.pole_rows().weight_at(index),
+                    actual.pole_rows().weight_at(index),
+                ) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => nurbs_roundoff_equal(left, right, scale),
+                    _ => false,
+                }
+        })
+}
+
+fn nurbs_homogeneous_controls(
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+) -> Option<Vec<[f64; 4]>> {
+    let mut controls = Vec::new();
+    for index in 0..curve.pole_count() {
+        let point = curve.pole_rows().point_at(index)?;
+        let weight = curve.pole_rows().weight_at(index).unwrap_or(1.0);
+        if weight <= 0.0 {
+            return None;
+        }
+        controls.push([point.x * weight, point.y * weight, point.z * weight, weight]);
+    }
+    Some(controls)
+}
+
+struct HomogeneousCurveLanes {
+    knots: Vec<f64>,
+    controls: Vec<[f64; 4]>,
+}
+
+fn insert_nurbs_homogeneous_knot(
+    degree: usize,
+    knots: &[f64],
+    controls: &[[f64; 4]],
+    value: f64,
+) -> Option<HomogeneousCurveLanes> {
+    let expected_knots = controls
+        .len()
+        .checked_add(degree)
+        .and_then(|count| count.checked_add(1))?;
+    if degree == 0
+        || controls.is_empty()
+        || knots.len() != expected_knots
+        || !value.is_finite()
+        || knots.iter().any(|knot| !knot.is_finite())
+        || !knots.is_sorted()
+    {
+        return None;
+    }
+    let n = controls.len() - 1;
+    let (Some(&start), Some(&end)) = (knots.get(degree), knots.get(n + 1)) else {
+        return None;
+    };
+    let domain = [start, end];
+    if value < domain[0] || value > domain[1] {
+        return None;
+    }
+    let span = if value == domain[1] {
+        n
+    } else {
+        (degree..=n).find(|index| knots[*index] <= value && value < knots[*index + 1])?
+    };
+    let multiplicity = knots.iter().filter(|knot| **knot == value).count();
+    if multiplicity > degree {
+        return None;
+    }
+    let mut inserted_knots = Vec::new();
+    inserted_knots.extend_from_slice(&knots[..=span]);
+    inserted_knots.push(value);
+    inserted_knots.extend_from_slice(&knots[span + 1..]);
+
+    let control_count = controls.len().checked_add(1)?;
+    let mut inserted_controls = Vec::new();
+    inserted_controls.resize(control_count, [0.0; 4]);
+    let prefix_end = span - degree + 1;
+    inserted_controls[..prefix_end].copy_from_slice(&controls[..prefix_end]);
+    // The knot span never precedes the multiplicity of the inserted value: a
+    // refused subtraction states that, where a saturating one would alias an
+    // impossible span with span 0 and copy the wrong control run.
+    let middle_end = span.checked_sub(multiplicity)?;
+    let suffix_start = middle_end;
+    inserted_controls[(suffix_start + 1)..].copy_from_slice(&controls[suffix_start..]);
+    let middle_start = prefix_end;
+    if middle_start <= middle_end {
+        for index in middle_start..=middle_end {
+            let denominator = knots[index + degree] - knots[index];
+            if !denominator.is_finite() || denominator <= 0.0 {
+                return None;
+            }
+            let alpha = (value - knots[index]) / denominator;
+            inserted_controls[index] = std::array::from_fn(|axis| {
+                alpha * controls[index][axis] + (1.0 - alpha) * controls[index - 1][axis]
+            });
+        }
+    }
+    Some(HomogeneousCurveLanes {
+        knots: inserted_knots,
+        controls: inserted_controls,
+    })
+}
+
+/// The knots, control points and weights of one clamped NURBS segment, before
+/// the carrier mints them.
+type ClampedCurveLanes = (Vec<f64>, Vec<cadmpeg_ir::math::Point3>, Option<Vec<f64>>);
+
+/// The clamped segment lanes of `curve` over `domain`. `None` when the curve
+/// does not clamp to the domain at all; the lanes themselves are minted by the
+/// caller.
+fn clamp_nurbs_curve_to_domain_lanes(
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    domain: [f64; 2],
+) -> Option<ClampedCurveLanes> {
+    if curve.periodic()
+        || !domain[0].is_finite()
+        || !domain[1].is_finite()
+        || domain[0] >= domain[1]
+    {
+        return None;
+    }
+    let Ok(degree) = usize::try_from(curve.degree()) else {
+        return None;
+    };
+    let original_domain = nurbs_curve_parameter_domain(curve)?;
+    let original_domain = original_domain.endpoints();
+    if domain[0] < original_domain[0] || domain[1] > original_domain[1] {
+        return None;
+    }
+    let mut knots = Vec::new();
+    knots.extend_from_slice(curve.knots());
+    let mut controls = nurbs_homogeneous_controls(curve)?;
+    let full_multiplicity = degree.checked_add(1)?;
+    for value in domain {
+        let multiplicity = knots.iter().filter(|knot| **knot == value).count();
+        if multiplicity > full_multiplicity {
+            return None;
+        }
+        for _ in multiplicity..full_multiplicity {
+            let inserted = insert_nurbs_homogeneous_knot(degree, &knots, &controls, value)?;
+            knots = inserted.knots;
+            controls = inserted.controls;
+        }
+    }
+    let (Some(start), Some(end), Some(end_last)) = (
+        knots.iter().position(|knot| *knot == domain[0]),
+        knots.iter().position(|knot| *knot == domain[1]),
+        knots.iter().rposition(|knot| *knot == domain[1]),
+    ) else {
+        return None;
+    };
+    if end <= start || end_last < end || end - start == 0 {
+        return None;
+    }
+    let (Some(control_slice), Some(knot_slice)) =
+        (controls.get(start..end), knots.get(start..=end_last))
+    else {
+        return None;
+    };
+    let expected_knots = control_slice
+        .len()
+        .checked_add(degree)
+        .and_then(|count| count.checked_add(1))?;
+    if knot_slice.len() != expected_knots {
+        return None;
+    }
+    let mut segment_knots = Vec::new();
+    segment_knots.extend_from_slice(knot_slice);
+    let rational = matches!(
+        curve.pole_rows(),
+        cadmpeg_ir::geometry::nurbs::NurbsPoles3::Rational { .. }
+    );
+    let mut control_points = Vec::new();
+    let mut weights = rational.then(Vec::new);
+    for &[x, y, z, weight] in control_slice {
+        if !weight.is_finite() || weight <= 0.0 {
+            return None;
+        }
+        control_points.push(cadmpeg_ir::math::Point3::new(
+            x / weight,
+            y / weight,
+            z / weight,
+        ));
+        if let Some(weights) = &mut weights {
+            weights.push(weight);
+        }
+    }
+    Some((segment_knots, control_points, weights))
+}
+
+pub(crate) fn clamp_nurbs_curve_to_domain(
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    domain: [f64; 2],
+) -> Result<Option<cadmpeg_ir::geometry::nurbs::NurbsCurve>, cadmpeg_ir::geometry::nurbs::NurbsError>
+{
+    let Some((segment_knots, control_points, weights)) =
+        clamp_nurbs_curve_to_domain_lanes(curve, domain)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(cadmpeg_ir::geometry::nurbs::NurbsCurve::from_lanes(
+        curve.degree(),
+        segment_knots,
+        control_points,
+        weights,
+        false,
+    )?))
+}
+
+fn extended_nurbs_isocurve_axis_candidate(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    fixed_axis: SurfaceParameterAxis,
+) -> Result<InverseResolution<PcurveGeometry>, NurbsPcurveFailure> {
+    let (fixed_degree, fixed_count, fixed_knots, fixed_periodic) = match fixed_axis {
+        SurfaceParameterAxis::U => (
+            surface.u_degree(),
+            surface.u_count(),
+            surface.u_knots(),
+            surface.u_periodic(),
+        ),
+        SurfaceParameterAxis::V => (
+            surface.v_degree(),
+            surface.v_count(),
+            surface.v_knots(),
+            surface.v_periodic(),
+        ),
+    };
+    let (varying_degree, varying_count, varying_knots, varying_periodic) = match fixed_axis {
+        SurfaceParameterAxis::U => (
+            surface.v_degree(),
+            surface.v_count(),
+            surface.v_knots(),
+            surface.v_periodic(),
+        ),
+        SurfaceParameterAxis::V => (
+            surface.u_degree(),
+            surface.u_count(),
+            surface.u_knots(),
+            surface.u_periodic(),
+        ),
+    };
+    if fixed_periodic || varying_periodic || curve.periodic() || curve.degree() != varying_degree {
+        return Ok(InverseResolution::NoMatch);
+    }
+    let Some(fixed_domain) = nurbs_active_domain(fixed_knots, fixed_degree, fixed_count) else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let Some(varying_domain) = nurbs_active_domain(varying_knots, varying_degree, varying_count)
+    else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let Some(curve_domain) = nurbs_curve_parameter_domain(curve)
+        .map(cadmpeg_ir::topology::IncreasingParameterInterval::endpoints)
+    else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    if curve_domain[0] > varying_domain[0] || curve_domain[1] < varying_domain[1] {
+        return Ok(InverseResolution::NoMatch);
+    }
+
+    let mut fixed_values = vec![fixed_domain[0], fixed_domain[1]];
+    let overlap = [
+        curve_domain[0].max(varying_domain[0]),
+        curve_domain[1].min(varying_domain[1]),
+    ];
+    if overlap[0] < overlap[1] {
+        let parameter = overlap[0].midpoint(overlap[1]);
+        let point = super::evaluation::nurbs_curve_point(ctx, curve, parameter)?;
+        if let Some(point) = point {
+            let tolerance = inverse_coordinate_tolerance(
+                admitted_surface_poles(surface)
+                    .map(FinitePoint3::get)
+                    .chain(std::iter::once(point.get())),
+            );
+            if let Some(parameters) = super::evaluation::nurbs_surface_parameter_near_point(
+                ctx,
+                surface,
+                point.get(),
+                None,
+            )? {
+                let mapped = super::evaluation::nurbs_surface_point(
+                    ctx,
+                    surface,
+                    parameters.u,
+                    parameters.v,
+                )?;
+                if mapped
+                    .is_some_and(|mapped| Point3::distance(point.get(), mapped.get()) <= tolerance)
+                {
+                    fixed_values.push(match fixed_axis {
+                        SurfaceParameterAxis::U => parameters.u,
+                        SurfaceParameterAxis::V => parameters.v,
+                    });
+                }
+            }
+        }
+    }
+    let parameter_tolerance = (INVERSE_PARAMETER_TOLERANCE * fixed_domain[1]
+        - INVERSE_PARAMETER_TOLERANCE * fixed_domain[0])
+        .abs();
+    let mut unique_fixed_values = Vec::new();
+    for value in fixed_values {
+        if value.is_finite()
+            && value >= fixed_domain[0] - parameter_tolerance
+            && value <= fixed_domain[1] + parameter_tolerance
+            && !unique_fixed_values
+                .iter()
+                .any(|known: &f64| (value - *known).abs() <= parameter_tolerance)
+        {
+            unique_fixed_values.push(value.clamp(fixed_domain[0], fixed_domain[1]));
+        }
+    }
+    // The clamp does not vary with the candidate value, and the first candidate
+    // already reaches it, so it is minted once here.
+    let clamped = if unique_fixed_values.is_empty() {
+        None
+    } else {
+        clamp_nurbs_curve_to_domain(curve, varying_domain)?
+    };
+    let Some(clamped) = clamped else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let mut matched = None;
+    for fixed in unique_fixed_values {
+        if nurbs_surface_isocurve(ctx, surface, fixed_axis, fixed)?
+            .is_some_and(|expected| nurbs_representation_matches(&expected, &clamped))
+        {
+            if matched.is_some() {
+                return Ok(InverseResolution::Ambiguous);
+            }
+            matched = Some(fixed);
+        }
+    }
+    let Some(fixed) = matched else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    Ok(InverseResolution::Unique(match fixed_axis {
+        SurfaceParameterAxis::U => PcurveGeometry::Line(
+            match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                cadmpeg_ir::math::Point2::new(fixed, varying_domain[0]),
+                cadmpeg_ir::math::Point2::new(0.0, 1.0),
+            ) {
+                Ok(payload) => payload,
+                Err(_) => return Ok(InverseResolution::NoMatch),
+            },
+        ),
+        SurfaceParameterAxis::V => PcurveGeometry::Line(
+            match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                cadmpeg_ir::math::Point2::new(varying_domain[0], fixed),
+                cadmpeg_ir::math::Point2::new(1.0, 0.0),
+            ) {
+                Ok(payload) => payload,
+                Err(_) => return Ok(InverseResolution::NoMatch),
+            },
+        ),
+    }))
+}
+
+fn extended_nurbs_isocurve_pcurve(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+) -> Result<InverseResolution<PcurveGeometry>, NurbsPcurveFailure> {
+    Ok(resolve_axis_candidates([
+        extended_nurbs_isocurve_axis_candidate(ctx, surface, curve, SurfaceParameterAxis::U)?,
+        extended_nurbs_isocurve_axis_candidate(ctx, surface, curve, SurfaceParameterAxis::V)?,
+    ]))
+}
+
+fn nurbs_isocurve_pcurve(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+) -> Result<InverseResolution<PcurveGeometry>, NurbsPcurveFailure> {
+    match nurbs_strict_isocurve_pcurve(ctx, surface, curve)? {
+        InverseResolution::NoMatch => extended_nurbs_isocurve_pcurve(ctx, surface, curve),
+        other => Ok(other),
+    }
+}
+
+enum NurbsPcurveResolution {
+    Exact(PcurveGeometry),
+    Cache {
+        geometry: PcurveGeometry,
+        fit_tolerance: f64,
+    },
+    OffSurface,
+    NoMatch,
+    Ambiguous,
+}
+
+fn nurbs_curve_sample_parameters(
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    range: [f64; 2],
+) -> Option<Vec<f64>> {
+    let domain = nurbs_curve_parameter_domain(curve)?.endpoints();
+    if !range[0].is_finite()
+        || !range[1].is_finite()
+        || range[0] >= range[1]
+        || range[0] < domain[0]
+        || range[1] > domain[1]
+    {
+        return None;
+    }
+    let mut parameters = vec![range[0], range[1]];
+    for span in curve.knots().windows(2) {
+        let start = span[0].max(range[0]);
+        let end = span[1].min(range[1]);
+        if !span[0].is_finite() || !span[1].is_finite() || start >= end {
+            continue;
+        }
+        for index in 0..=NURBS_CACHE_SAMPLES_PER_SPAN {
+            let (Some(position), Some(span_count)) = (
+                f64_from_index(index),
+                f64_from_index(NURBS_CACHE_SAMPLES_PER_SPAN),
+            ) else {
+                return None;
+            };
+            let fraction = position / span_count;
+            let parameter = cadmpeg_ir::math::interpolate(start, end, fraction)?;
+            parameters.push(parameter.get());
+        }
+    }
+    parameters.sort_by(f64::total_cmp);
+    // Every distinct sample participates in the fit bound, including tiny spans.
+    parameters.dedup();
+    (!parameters.is_empty()).then_some(parameters)
+}
+
+fn nurbs_edge_endpoint_parameters(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    range: [f64; 2],
+) -> Result<Option<[cadmpeg_ir::math::Point2; 2]>, cadmpeg_core::CodecError> {
+    let Some(first) = super::evaluation::nurbs_curve_point(ctx, curve, range[0])? else {
+        return Ok(None);
+    };
+    let Some(last) = super::evaluation::nurbs_curve_point(ctx, curve, range[1])? else {
+        return Ok(None);
+    };
+    // The inverse-projection tolerance of this surface's coordinates against
+    // the NURBS endpoint tolerance.
+    let tolerance = looser_tolerance(
+        inverse_coordinate_tolerance(
+            admitted_surface_poles(surface)
+                .chain([first, last])
+                .map(FinitePoint3::get),
+        ),
+        NURBS_ENDPOINT_TOLERANCE_MM,
+    );
+    let project = |point| -> Result<Option<cadmpeg_ir::math::Point2>, cadmpeg_core::CodecError> {
+        let Some(parameters) =
+            super::evaluation::nurbs_surface_parameter_near_point(ctx, surface, point, None)?
+        else {
+            return Ok(None);
+        };
+        let Some(mapped) =
+            super::evaluation::nurbs_surface_point(ctx, surface, parameters.u, parameters.v)?
+        else {
+            return Ok(None);
+        };
+        Ok((Point3::distance(point, mapped.get()) <= tolerance).then_some(parameters.get()))
+    };
+    let Some(start) = project(first.get())? else {
+        return Ok(None);
+    };
+    let Some(end) = project(last.get())? else {
+        return Ok(None);
+    };
+    Ok(Some([start, end]))
+}
+
+fn nurbs_curve_surface_deviation(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    range: [f64; 2],
+) -> Result<Option<f64>, NurbsPcurveFailure> {
+    let Some(parameters) = nurbs_curve_sample_parameters(curve, range) else {
+        return Ok(None);
+    };
+    let mut seed = None;
+    let mut maximum = 0.0_f64;
+    for parameter in parameters {
+        let Some(point) = super::evaluation::nurbs_curve_point(ctx, curve, parameter)? else {
+            return Ok(None);
+        };
+        let projected = match seed {
+            Some(seed) => super::evaluation::nurbs_surface_parameter_near_point(
+                ctx,
+                surface,
+                point.get(),
+                Some(seed),
+            )?,
+            None => None,
+        };
+        let parameters = match projected {
+            Some(parameters) => Some(parameters),
+            None => super::evaluation::nurbs_surface_parameter_near_point(
+                ctx,
+                surface,
+                point.get(),
+                None,
+            )?,
+        };
+        let Some(parameters) = parameters else {
+            return Ok(None);
+        };
+        let parameters = parameters.get();
+        let Some(surface_point) =
+            super::evaluation::nurbs_surface_point(ctx, surface, parameters.u, parameters.v)?
+        else {
+            return Ok(None);
+        };
+        seed = Some(parameters);
+        maximum = maximum.max(Point3::distance(point.get(), surface_point.get()));
+    }
+    Ok(maximum.is_finite().then_some(maximum))
+}
+
+/// `parameter` moved by whole periods to the value nearest `seed`, on a
+/// periodic axis.
+fn parameter_nearest_seed(
+    parameter: f64,
+    seed: f64,
+    knots: &[f64],
+    degree: u32,
+    count: usize,
+    periodic: bool,
+) -> f64 {
+    let bounds = usize::try_from(degree)
+        .ok()
+        .and_then(|degree| knots.get(degree))
+        .zip(knots.get(count));
+    match bounds {
+        Some((start, end)) if periodic && start < end => {
+            let period = end - start;
+            parameter + ((seed - parameter) / period).round() * period
+        }
+        _ => parameter,
+    }
+}
+
+/// The surface parameters of one pole of a degree-one curve, on the branch of
+/// the preceding pole.
+///
+/// A seeded inverse stops at a parameter bound, so a pole past a periodic seam
+/// stays at the seam. The unseeded inverse reaches that pole, and the period
+/// nearest the seed continues the branch across the seam.
+fn nurbs_pole_parameters(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    point: cadmpeg_ir::math::Point3,
+    seed: Option<cadmpeg_ir::math::Point2>,
+) -> Result<Option<cadmpeg_ir::math::Point2>, cadmpeg_core::CodecError> {
+    let unseeded = |ctx| {
+        super::evaluation::nurbs_surface_parameter_near_point(ctx, surface, point, None)
+            .map(|parameters| parameters.map(cadmpeg_ir::units::FinitePoint2::get))
+    };
+    let Some(seed) = seed else {
+        return unseeded(ctx);
+    };
+    let miss = |parameters: cadmpeg_ir::math::Point2| {
+        super::evaluation::nurbs_surface_point(ctx, surface, parameters.u, parameters.v)
+            .map(|mapped| mapped.map(|mapped| Point3::distance(point, mapped.get())))
+    };
+    let tolerance = looser_tolerance(
+        inverse_coordinate_tolerance(
+            admitted_surface_poles(surface)
+                .map(FinitePoint3::get)
+                .chain([point]),
+        ),
+        NURBS_ENDPOINT_TOLERANCE_MM,
+    );
+    let seeded =
+        super::evaluation::nurbs_surface_parameter_near_point(ctx, surface, point, Some(seed))?
+            .map(cadmpeg_ir::units::FinitePoint2::get);
+    let seeded_miss = match seeded {
+        Some(parameters) => miss(parameters)?,
+        None => None,
+    };
+    if seeded_miss.is_some_and(|miss| miss <= tolerance) {
+        return Ok(seeded);
+    }
+    let Some(found) = unseeded(ctx)? else {
+        return Ok(seeded);
+    };
+    match (seeded_miss, miss(found)?) {
+        (Some(seeded_miss), Some(found_miss)) if seeded_miss <= found_miss => return Ok(seeded),
+        (Some(_), None) => return Ok(seeded),
+        _ => {}
+    }
+    Ok(Some(cadmpeg_ir::math::Point2::new(
+        parameter_nearest_seed(
+            found.u,
+            seed.u,
+            surface.u_knots(),
+            surface.u_degree(),
+            surface.u_count(),
+            surface.u_periodic(),
+        ),
+        parameter_nearest_seed(
+            found.v,
+            seed.v,
+            surface.v_knots(),
+            surface.v_degree(),
+            surface.v_count(),
+            surface.v_periodic(),
+        ),
+    )))
+}
+
+/// The degree-one pcurve lanes a cached projection states, and the fit
+/// tolerance they reach. `None` when the curve is not a degree-one cache
+/// candidate or a projection does not land on the surface.
+fn nurbs_degree_one_cache_lanes(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    range: [f64; 2],
+) -> Result<Option<(Vec<cadmpeg_ir::math::Point2>, f64)>, NurbsPcurveFailure> {
+    if curve.degree() != 1 || curve.pole_rows().weight_at(0).is_some() || curve.periodic() {
+        return Ok(None);
+    }
+    let mut control_points = Vec::new();
+    let mut seed = None;
+    for index in 0..curve.pole_count() {
+        let Some(point) = curve.pole_rows().point_at(index) else {
+            return Ok(None);
+        };
+        let Some(parameters) = nurbs_pole_parameters(ctx, surface, point.get(), seed)? else {
+            return Ok(None);
+        };
+        seed = Some(parameters);
+        control_points.push(parameters);
+    }
+    let Some(parameters) = nurbs_curve_sample_parameters(curve, range) else {
+        return Ok(None);
+    };
+    let mut fit_tolerance = 0.0_f64;
+    for parameter in parameters {
+        let Some(model_point) = super::evaluation::nurbs_curve_point(ctx, curve, parameter)? else {
+            return Ok(None);
+        };
+        let Some(uv) = cadmpeg_ir::eval::finite_or_refusal(nurbs_pcurve_uv(
+            ctx,
+            1,
+            curve.knots(),
+            &control_points,
+            None,
+            parameter,
+        ))?
+        else {
+            return Ok(None);
+        };
+        let Some(mapped_point) = super::evaluation::nurbs_surface_point(ctx, surface, uv.u, uv.v)?
+        else {
+            return Ok(None);
+        };
+        fit_tolerance = fit_tolerance.max(Point3::distance(model_point.get(), mapped_point.get()));
+    }
+    if !fit_tolerance.is_finite() {
+        return Ok(None);
+    }
+    Ok(Some((control_points, fit_tolerance)))
+}
+
+fn nurbs_degree_one_cache_pcurve(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    range: [f64; 2],
+) -> Result<Option<(PcurveGeometry, f64)>, NurbsPcurveFailure> {
+    let Some((control_points, fit_tolerance)) =
+        nurbs_degree_one_cache_lanes(ctx, surface, curve, range)?
+    else {
+        return Ok(None);
+    };
+    let mut knots = Vec::new();
+    knots.extend_from_slice(curve.knots());
+    let nurbs = PcurveNurbs::from_lanes(1, knots, control_points, None, false)?;
+    Ok(Some((PcurveGeometry::Nurbs { nurbs }, fit_tolerance)))
+}
+
+fn nurbs_edge_parameter_range(
+    ctx: &DecodeContext<'_>,
+    edge: &Edge,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    endpoints: Option<[cadmpeg_ir::math::Point3; 2]>,
+) -> Result<Option<[f64; 2]>, cadmpeg_core::CodecError> {
+    let Some(domain) = nurbs_curve_parameter_domain(curve) else {
+        return Ok(None);
+    };
+    let domain = domain.endpoints();
+    let range = if let Some(range) = edge.param_range() {
+        range.get()
+    } else {
+        let Some([start, end]) = endpoints else {
+            return Ok(None);
+        };
+        match (
+            nurbs_parameter_at_point(ctx, curve, start)?,
+            nurbs_parameter_at_point(ctx, curve, end)?,
+        ) {
+            (InverseResolution::Unique(start), InverseResolution::Unique(end)) => [start, end],
+            _ => return Ok(None),
+        }
+    };
+    if !range[0].is_finite()
+        || !range[1].is_finite()
+        || range[0] == range[1]
+        || range
+            .iter()
+            .any(|parameter| *parameter < domain[0] || *parameter > domain[1])
+    {
+        return Ok(None);
+    }
+    Ok(Some([range[0].min(range[1]), range[0].max(range[1])]))
+}
+
+fn derive_nurbs_edge_pcurve(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    curve: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+    range: [f64; 2],
+) -> Result<NurbsPcurveResolution, NurbsPcurveFailure> {
+    if nurbs_edge_endpoint_parameters(ctx, surface, curve, range)?.is_none() {
+        return Ok(NurbsPcurveResolution::OffSurface);
+    }
+    if nurbs_curve_surface_deviation(ctx, surface, curve, range)?.is_none() {
+        return Ok(NurbsPcurveResolution::NoMatch);
+    }
+    Ok(match nurbs_isocurve_pcurve(ctx, surface, curve)? {
+        InverseResolution::Unique(geometry) => NurbsPcurveResolution::Exact(geometry),
+        InverseResolution::Ambiguous => NurbsPcurveResolution::Ambiguous,
+        InverseResolution::NoMatch => {
+            match nurbs_degree_one_cache_pcurve(ctx, surface, curve, range)? {
+                Some((geometry, fit_tolerance)) => NurbsPcurveResolution::Cache {
+                    geometry,
+                    fit_tolerance,
+                },
+                None => NurbsPcurveResolution::NoMatch,
+            }
+        }
+    })
+}
+
+fn ruled_surface_line_pcurve(
+    ctx: &DecodeContext<'_>,
+    surface: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    fixed_axis: SurfaceParameterAxis,
+    line_origin: cadmpeg_ir::math::Point3,
+    line_direction: cadmpeg_ir::math::Vector3,
+) -> Result<InverseResolution<PcurveGeometry>, cadmpeg_core::CodecError> {
+    let (uc, vc) = (surface.u_count(), surface.v_count());
+    let (varying_degree, varying_count, varying_knots, varying_periodic) = match fixed_axis {
+        SurfaceParameterAxis::U => (
+            surface.v_degree(),
+            vc,
+            surface.v_knots(),
+            surface.v_periodic(),
+        ),
+        SurfaceParameterAxis::V => (
+            surface.u_degree(),
+            uc,
+            surface.u_knots(),
+            surface.u_periodic(),
+        ),
+    };
+    let (fixed_degree, fixed_count, fixed_knots) = match fixed_axis {
+        SurfaceParameterAxis::U => (surface.u_degree(), uc, surface.u_knots()),
+        SurfaceParameterAxis::V => (surface.v_degree(), vc, surface.v_knots()),
+    };
+    let (Some(&varying_min), Some(&varying_max)) = (varying_knots.get(1), varying_knots.get(2))
+    else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    if varying_degree != 1
+        || varying_count != 2
+        || varying_periodic
+        || varying_knots.as_slice() != [varying_min, varying_min, varying_max, varying_max]
+        || varying_min >= varying_max
+    {
+        return Ok(InverseResolution::NoMatch);
+    }
+    if matches!(
+        surface.pole_grid(),
+        cadmpeg_ir::geometry::nurbs::NurbsPoleGrid::Rational { .. }
+    ) && (0..fixed_count).any(|fixed| {
+        let ((a_u, a_v), (b_u, b_v)) = match fixed_axis {
+            SurfaceParameterAxis::U => ((fixed, 0), (fixed, 1)),
+            SurfaceParameterAxis::V => ((0, fixed), (1, fixed)),
+        };
+        match (surface.weight(a_u, a_v), surface.weight(b_u, b_v)) {
+            (Some(a), Some(b)) => (a.get() - b.get()).abs() > EPS_NURBS_WEIGHT,
+            _ => true,
+        }
+    }) {
+        return Ok(InverseResolution::NoMatch);
+    }
+    let Some(fixed_degree) = usize::try_from(fixed_degree).ok() else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let (Some(&fixed_min), Some(&fixed_max)) =
+        (fixed_knots.get(fixed_degree), fixed_knots.get(fixed_count))
+    else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    if !fixed_min.is_finite() || !fixed_max.is_finite() || fixed_min >= fixed_max {
+        return Ok(InverseResolution::NoMatch);
+    }
+    let evaluate_ruling =
+        |fixed: f64| -> Result<Option<(FinitePoint3, FinitePoint3)>, cadmpeg_core::CodecError> {
+            let parameters = |varying| match fixed_axis {
+                SurfaceParameterAxis::U => (fixed, varying),
+                SurfaceParameterAxis::V => (varying, fixed),
+            };
+            let (u0, v0) = parameters(varying_min);
+            let (u1, v1) = parameters(varying_max);
+            let Some(first) = super::evaluation::nurbs_surface_point(ctx, surface, u0, v0)? else {
+                return Ok(None);
+            };
+            let Some(second) = super::evaluation::nurbs_surface_point(ctx, surface, u1, v1)? else {
+                return Ok(None);
+            };
+            Ok(Some((first, second)))
+        };
+    let direction_squared = line_direction.x * line_direction.x
+        + line_direction.y * line_direction.y
+        + line_direction.z * line_direction.z;
+    if direction_squared <= f64::EPSILON {
+        return Ok(InverseResolution::NoMatch);
+    }
+    let perpendicular_squared = |point: cadmpeg_ir::math::Point3| {
+        let relative = [
+            point.x - line_origin.x,
+            point.y - line_origin.y,
+            point.z - line_origin.z,
+        ];
+        let along = (relative[0] * line_direction.x
+            + relative[1] * line_direction.y
+            + relative[2] * line_direction.z)
+            / direction_squared;
+        (relative[0] - along * line_direction.x).powi(2)
+            + (relative[1] - along * line_direction.y).powi(2)
+            + (relative[2] - along * line_direction.z).powi(2)
+    };
+    let objective = |parameter: f64| {
+        let Some((a, b)) = evaluate_ruling(parameter)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            perpendicular_squared(a.get()).max(perpendicular_squared(b.get())),
+        ))
+    };
+    let Some(candidates) =
+        sampled_parameter_minima(fixed_knots, [fixed_min, fixed_max], objective)?
+    else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let resolution = unique_inverse_parameter(
+        candidates,
+        inverse_coordinate_tolerance(
+            admitted_surface_poles(surface)
+                .map(FinitePoint3::get)
+                .chain(std::iter::once(line_origin)),
+        ),
+        [fixed_min, fixed_max],
+    );
+    let fixed = match resolution {
+        InverseResolution::Unique(fixed) => fixed,
+        InverseResolution::NoMatch => return Ok(InverseResolution::NoMatch),
+        InverseResolution::Ambiguous => return Ok(InverseResolution::Ambiguous),
+    };
+    let Some((a, b)) = evaluate_ruling(fixed)? else {
+        return Ok(InverseResolution::NoMatch);
+    };
+    let delta = [b.x - a.x, b.y - a.y, b.z - a.z];
+    let delta_squared = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+    if delta_squared <= f64::EPSILON {
+        return Ok(InverseResolution::NoMatch);
+    }
+    let project = |value: [f64; 3]| {
+        (value[0] * delta[0] + value[1] * delta[1] + value[2] * delta[2]) / delta_squared
+    };
+    let offset = project([
+        line_origin.x - a.x,
+        line_origin.y - a.y,
+        line_origin.z - a.z,
+    ]);
+    let rate = project([line_direction.x, line_direction.y, line_direction.z]);
+    if rate == 0.0 {
+        return Ok(InverseResolution::NoMatch);
+    }
+    let domain = varying_max - varying_min;
+    Ok(InverseResolution::Unique(match fixed_axis {
+        SurfaceParameterAxis::U => PcurveGeometry::Line(
+            match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                cadmpeg_ir::math::Point2::new(fixed, varying_min + offset * domain),
+                cadmpeg_ir::math::Point2::new(0.0, rate * domain),
+            ) {
+                Ok(payload) => payload,
+                Err(_) => return Ok(InverseResolution::NoMatch),
+            },
+        ),
+        SurfaceParameterAxis::V => PcurveGeometry::Line(
+            match cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+                cadmpeg_ir::math::Point2::new(varying_min + offset * domain, fixed),
+                cadmpeg_ir::math::Point2::new(rate * domain, 0.0),
+            ) {
+                Ok(payload) => payload,
+                Err(_) => return Ok(InverseResolution::NoMatch),
+            },
+        ),
+    }))
+}
+
+fn synthesize_cylinder_seams(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let surfaces = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, surface))
+        .collect::<std::collections::HashMap<_, _>>();
+    let loops = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, lp))
+        .collect::<std::collections::HashMap<_, _>>();
+    let coedges = out
+        .coedges
+        .iter()
+        .map(|coedge| (&coedge.id, coedge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edges = out
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, curve))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut candidates = Vec::new();
+    for face in &out.faces {
+        let Some(surface) = surfaces.get(&face.surface) else {
+            continue;
+        };
+        let Some(SolvedSurfaceGeometry::Cylinder(cylinder_surface)) = surface.geometry.solved()
+        else {
+            continue;
+        };
+        let ref_direction = *cylinder_surface.frame().reference().as_raw();
+        if face.loops.len() != 2 {
+            continue;
+        }
+        let mut members = face.loops.iter();
+        let (Some(a), Some(b)) = (
+            members.next().and_then(|id| loops.get(id)),
+            members.next().and_then(|id| loops.get(id)),
+        ) else {
+            continue;
+        };
+        if a.coedges().len() != 1 || b.coedges().len() != 1 {
+            continue;
+        }
+        let Some(ca) = coedges.get(&a.coedges()[0]) else {
+            continue;
+        };
+        let Some(cb) = coedges.get(&b.coedges()[0]) else {
+            continue;
+        };
+        let Some(ea) = edges.get(&ca.edge) else {
+            continue;
+        };
+        let Some(eb) = edges.get(&cb.edge) else {
+            continue;
+        };
+        let seam_point = |edge: &Edge| {
+            if edge.start != edge.end {
+                return None;
+            }
+            let curve = curves.get(edge.curve()?)?;
+            let Some(SolvedCurveGeometry::Circle(circle_curve)) = curve.geometry.solved() else {
+                return None;
+            };
+            let center = circle_curve.center().get();
+            let radius = circle_curve.radius().get();
+            Some(cadmpeg_ir::math::Point3::new(
+                center.x - ref_direction.x * radius,
+                center.y - ref_direction.y * radius,
+                center.z - ref_direction.z * radius,
+            ))
+        };
+        if let (Some(pa), Some(pb)) = (seam_point(ea), seam_point(eb)) {
+            candidates.push((
+                face.id.clone(),
+                a.id.clone(),
+                b.id.clone(),
+                ca.id.clone(),
+                cb.id.clone(),
+                ea.start.clone(),
+                eb.start.clone(),
+                pa,
+                pb,
+            ));
+        }
+    }
+
+    let mut removed = HashSet::new();
+    let mut coedge_indices = HashMap::new();
+    for (index, coedge) in out.coedges.iter().enumerate() {
+        let id = coedge.id.clone();
+        coedge_indices.insert(id, index);
+    }
+    for (face_id, loop_a, loop_b, circle_a, circle_b, vertex_a, vertex_b, pa, pb) in candidates {
+        for (vertex_id, position) in [(&vertex_a, pa), (&vertex_b, pb)] {
+            let Some(point_id) = out
+                .vertices
+                .iter()
+                .find(|vertex| vertex.id == *vertex_id)
+                .map(|vertex| &vertex.point)
+            else {
+                continue;
+            };
+            if let Some(point) = out.points.iter_mut().find(|point| point.id == *point_id) {
+                point.set_position(
+                    cadmpeg_ir::features::FinitePoint3::new(position).ok_or_else(|| {
+                        cadmpeg_core::CodecError::Malformed(Point::NON_FINITE_POSITION.into())
+                    })?,
+                );
+            }
+        }
+        let direction = cadmpeg_ir::math::Vector3::new(pb.x - pa.x, pb.y - pa.y, pb.z - pa.z);
+        let norm = direction.norm();
+        if norm == 0.0 {
+            continue;
+        }
+        let direction = cadmpeg_ir::math::Vector3::new(
+            direction.x / norm,
+            direction.y / norm,
+            direction.z / norm,
+        );
+        let suffix = cadmpeg_ir::identity_key!("seam:").then(face_id.key());
+        let curve_id = CurveId::compose(
+            &cadmpeg_ir::identity_namespace!("sldprt", "brep", "curve"),
+            suffix.clone(),
+        );
+        let edge_id = EdgeId::compose(
+            &cadmpeg_ir::identity_namespace!("sldprt", "brep", "edge"),
+            suffix.clone(),
+        );
+        let coedge_namespace = cadmpeg_ir::identity_namespace!("sldprt", "brep", "coedge");
+        let seam_a = CoedgeId::compose(&coedge_namespace, suffix.clone().colon(0_u32));
+        let seam_b = CoedgeId::compose(&coedge_namespace, suffix.colon(1_u32));
+        for id in [
+            curve_id.as_str(),
+            edge_id.as_str(),
+            seam_a.as_str(),
+            seam_b.as_str(),
+        ] {
+            annotations.note(id, source_stream, 0, Some("derived_periodic_seam"));
+            annotations.exactness(id, Exactness::Derived);
+        }
+        admit_brep_entity(ctx)?;
+        out.curves.push(Curve {
+            parameter_range: None,
+            id: curve_id.clone(),
+            source_object: None,
+            geometry: CurveGeometry::Solved(SolvedCurveGeometry::Line(
+                match cadmpeg_ir::geometry::analytic::LineCurve::try_new(pa, direction) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                },
+            )),
+        });
+        admit_brep_entity(ctx)?;
+        out.edges.push(Edge {
+            id: edge_id.clone(),
+            carrier: cadmpeg_ir::topology::EdgeCarrier::new(Some(curve_id), Some([0.0, norm]))
+                .map_err(cadmpeg_core::CodecError::malformed)?,
+            start: vertex_a,
+            end: vertex_b,
+            tolerance: None,
+        });
+        coedge_indices.insert(seam_a.clone(), out.coedges.len());
+        admit_brep_entity(ctx)?;
+        out.coedges.push(Coedge {
+            id: seam_a.clone(),
+            owner_loop: loop_a.clone(),
+            edge: edge_id.clone(),
+            radial_next: seam_b.clone(),
+            sense: Sense::Forward,
+            use_curve: None,
+            pcurves: Vec::new(),
+        });
+        coedge_indices.insert(seam_b.clone(), out.coedges.len());
+        admit_brep_entity(ctx)?;
+        out.coedges.push(Coedge {
+            id: seam_b.clone(),
+            owner_loop: loop_a.clone(),
+            edge: edge_id,
+            radial_next: seam_a.clone(),
+            sense: Sense::Reversed,
+            use_curve: None,
+            pcurves: Vec::new(),
+        });
+        let ring_ids = [circle_a.clone(), seam_a, circle_b.clone(), seam_b];
+        let mut ring_members = Vec::new();
+        for id in &ring_ids {
+            ring_members.push(id.clone());
+        }
+        let ring =
+            cadmpeg_ir::topology::LoopRing::new(ring_members, Vec::new()).map_err(|error| {
+                cadmpeg_core::CodecError::malformed(format_args!(
+                    "generated periodic seam ring is invalid: {error}"
+                ))
+            })?;
+        for id in &ring_ids {
+            if let Some(coedge_index) = coedge_indices.get(id) {
+                out.coedges[*coedge_index].owner_loop = loop_a.clone();
+            }
+        }
+        if let Some(lp) = out.loops.iter_mut().find(|lp| lp.id == loop_a) {
+            lp.boundary = cadmpeg_ir::topology::LoopBoundary::Ring(ring);
+        }
+        if let Some(face) = out.faces.iter_mut().find(|face| face.id == face_id) {
+            face.loops = cadmpeg_ir::topology::FaceLoops::unspecified(ctx.alloc_filled(
+                1,
+                loop_a,
+                "bind Parasolid cylinder seam loop",
+            )?);
+        }
+        out.merged_source_loops.insert(loop_b.clone());
+        removed.insert(loop_b);
+    }
+    out.loops.retain(|lp| !removed.contains(&lp.id));
+    Ok(())
+}
+
+fn synthesize_sphere_seams(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    annotations: &mut AnnotationBuilder,
+    source_stream: &cadmpeg_ir::annotations::StreamHandle,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let surface_geometry = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, &surface.geometry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let loop_coedges = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, lp.coedges()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let coedge_edges = out
+        .coedges
+        .iter()
+        .map(|coedge| (&coedge.id, &coedge.edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edge_indices = out
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| (&edge.id, index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curve_geometry = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, &curve.geometry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let vertex_points = out
+        .vertices
+        .iter()
+        .filter_map(|vertex| {
+            out.points
+                .iter()
+                .find(|point| point.id == vertex.point)
+                .map(|point| (&vertex.id, point.position().get()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut existing = Vec::new();
+    for face in &out.faces {
+        let Some(SurfaceGeometry::Solved(SolvedSurfaceGeometry::Sphere(sphere_surface))) =
+            surface_geometry.get(&face.surface).copied()
+        else {
+            continue;
+        };
+        let center = sphere_surface.center().get();
+        let axis = sphere_surface.frame().axis().as_raw();
+        let radius = sphere_surface.radius().get();
+        let mut face_loops = face.loops.iter();
+        let (Some(loop_id), None) = (face_loops.next(), face_loops.next()) else {
+            continue;
+        };
+        let Some(coedge_ids) = loop_coedges.get(loop_id).copied() else {
+            continue;
+        };
+        if coedge_ids.len() != 4 {
+            continue;
+        }
+        let mut seam_edges = Vec::new();
+        for coedge in coedge_ids {
+            if let Some(index) = coedge_edges
+                .get(coedge)
+                .and_then(|edge| edge_indices.get(*edge))
+            {
+                if out.edges[*index].curve().is_none() {
+                    seam_edges.push(*index);
+                }
+            }
+        }
+        let circle_count = coedge_ids
+            .iter()
+            .filter_map(|coedge| coedge_edges.get(coedge).copied())
+            .filter_map(|edge| edge_indices.get(edge).copied())
+            .filter(|index| {
+                out.edges[*index]
+                    .curve()
+                    .and_then(|curve| curve_geometry.get(curve))
+                    .is_some_and(|geometry| {
+                        matches!(
+                            geometry,
+                            CurveGeometry::Solved(SolvedCurveGeometry::Circle(_))
+                        )
+                    })
+            })
+            .count();
+        if let [edge_index] = seam_edges.as_slice() {
+            if circle_count != 3 {
+                continue;
+            }
+            let north = cadmpeg_ir::math::Point3::new(
+                center.x + radius * axis.x,
+                center.y + radius * axis.y,
+                center.z + radius * axis.z,
+            );
+            // The analytic sphere axis fixes the seam pole. An existing
+            // endpoint is a topology carrier, not a pole selector; choosing
+            // the nearer pole lets a stale or reversed endpoint change the
+            // sphere parameterization.
+            let point = north;
+            existing.push((*edge_index, point));
+        }
+    }
+    for (edge_index, point) in existing {
+        let Ok(degenerate) = cadmpeg_ir::geometry::analytic::DegenerateCurve::try_new(point) else {
+            continue;
+        };
+
+        let seam_vertices = [&out.edges[edge_index].start, &out.edges[edge_index].end];
+        for vertex_id in seam_vertices {
+            let Some(point_id) = out
+                .vertices
+                .iter()
+                .find(|vertex| &vertex.id == vertex_id)
+                .map(|vertex| &vertex.point)
+            else {
+                continue;
+            };
+            if let Some(vertex_point) = out.points.iter_mut().find(|item| item.id == *point_id) {
+                vertex_point.set_position(degenerate.point());
+            }
+        }
+        let curve_id = CurveId::compose(
+            &cadmpeg_ir::identity_namespace!("sldprt", "brep", "curve"),
+            cadmpeg_ir::identity_key!("sphere-seam:").then(out.edges[edge_index].id.key()),
+        );
+        annotations.note(
+            curve_id.as_str(),
+            source_stream,
+            0,
+            Some("derived_sphere_seam"),
+        );
+        annotations.exactness(curve_id.as_str(), Exactness::Derived);
+        admit_brep_entity(ctx)?;
+        out.curves.push(Curve {
+            parameter_range: None,
+            id: curve_id.clone(),
+            source_object: None,
+            geometry: CurveGeometry::Solved(SolvedCurveGeometry::Degenerate(degenerate)),
+        });
+        out.edges[edge_index]
+            .set_curve(Some(curve_id))
+            .map_err(cadmpeg_core::CodecError::malformed)?;
+    }
+
+    let surfaces = out
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, surface))
+        .collect::<std::collections::HashMap<_, _>>();
+    let loops = out
+        .loops
+        .iter()
+        .map(|lp| (&lp.id, lp))
+        .collect::<std::collections::HashMap<_, _>>();
+    let coedges = out
+        .coedges
+        .iter()
+        .map(|coedge| (&coedge.id, coedge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edges = out
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let curves = out
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, curve))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut candidates = Vec::new();
+    for (face_index, face) in out.faces.iter().enumerate() {
+        let Some(surface) = surfaces.get(&face.surface) else {
+            continue;
+        };
+        let Some(SolvedSurfaceGeometry::Sphere(sphere_surface)) = surface.geometry.solved() else {
+            continue;
+        };
+        let center = sphere_surface.center().get();
+        let radius = sphere_surface.radius().get();
+        if face.loops.len() != 1 {
+            continue;
+        }
+        let Some(lp) = face.loops.iter().next().and_then(|id| loops.get(id)) else {
+            continue;
+        };
+        if lp.coedges().len() != 3 {
+            continue;
+        }
+        let all_circles = lp.coedges().iter().all(|id| {
+            coedges
+                .get(id)
+                .and_then(|coedge| edges.get(&coedge.edge))
+                .and_then(|edge| edge.curve())
+                .is_some_and(|curve_id| {
+                    curves.get(curve_id).is_some_and(|curve| {
+                        matches!(
+                            curve.geometry,
+                            CurveGeometry::Solved(SolvedCurveGeometry::Circle(_))
+                        )
+                    })
+                })
+        });
+        let Some(SolvedSurfaceGeometry::Sphere(sphere_surface)) = surface.geometry.solved() else {
+            continue;
+        };
+        let axis = *sphere_surface.frame().axis().as_raw();
+        if all_circles {
+            let seam_point = cadmpeg_ir::math::Point3::new(
+                center.x + radius * axis.x,
+                center.y + radius * axis.y,
+                center.z + radius * axis.z,
+            );
+            let pole_candidates = lp
+                .coedges()
+                .iter()
+                .filter_map(|id| coedges.get(id))
+                .filter_map(|coedge| edges.get(&coedge.edge))
+                .flat_map(|edge| [&edge.start, &edge.end])
+                .filter(|vertex| {
+                    vertex_points.get(vertex).is_some_and(|point| {
+                        let dx = point.x - seam_point.x;
+                        let dy = point.y - seam_point.y;
+                        let dz = point.z - seam_point.z;
+                        dx * dx + dy * dy + dz * dz <= EPS_POINT_DISTANCE
+                    })
+                });
+            let mut pole_vertices = Vec::new();
+            for vertex in pole_candidates {
+                pole_vertices.push(vertex);
+            }
+            pole_vertices.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            pole_vertices.dedup();
+            let mut ring = Vec::new();
+            for id in lp.coedges() {
+                ring.push(id.clone());
+            }
+            candidates.push((
+                face_index,
+                face.id.clone(),
+                lp.id.clone(),
+                ring,
+                seam_point,
+                pole_vertices.first().copied().cloned(),
+            ));
+        }
+    }
+    let mut coedge_indices = HashMap::new();
+    for (index, coedge) in out.coedges.iter().enumerate() {
+        let id = coedge.id.clone();
+        coedge_indices.insert(id, index);
+    }
+    for (face_index, _face, loop_id, mut ring, seam_point, pole_vertex) in candidates {
+        let Ok(degenerate) = cadmpeg_ir::geometry::analytic::DegenerateCurve::try_new(seam_point)
+        else {
+            continue;
+        };
+        let Ok(pcurve) = cadmpeg_ir::geometry::pcurve::LinePcurve::try_new(
+            cadmpeg_ir::math::Point2::new(0.0, std::f64::consts::FRAC_PI_2),
+            cadmpeg_ir::math::Point2::new(1.0, 0.0),
+        ) else {
+            continue;
+        };
+
+        let seam_face_key = cadmpeg_ir::identity_key!("sphere-seam-face:").then(face_index);
+        let curve_id = CurveId::compose(
+            &cadmpeg_ir::identity_namespace!("sldprt", "brep", "curve"),
+            seam_face_key.clone(),
+        );
+        let edge_id = EdgeId::compose(
+            &cadmpeg_ir::identity_namespace!("sldprt", "brep", "edge"),
+            seam_face_key.clone(),
+        );
+        let coedge_id = CoedgeId::compose(
+            &cadmpeg_ir::identity_namespace!("sldprt", "brep", "coedge"),
+            seam_face_key.clone(),
+        );
+        let pcurve_id = PcurveId::compose(&pcurve_namespace(), seam_face_key.clone());
+        let pole_vertex = match pole_vertex {
+            Some(vertex) => vertex,
+            None => {
+                let point_id = PointId::compose(
+                    &cadmpeg_ir::identity_namespace!("sldprt", "brep", "point"),
+                    seam_face_key.clone(),
+                );
+                let vertex_id = VertexId::compose(
+                    &cadmpeg_ir::identity_namespace!("sldprt", "brep", "vertex"),
+                    seam_face_key.clone(),
+                );
+                for id in [point_id.as_str(), vertex_id.as_str()] {
+                    annotations.note(id, source_stream, 0, Some("derived_sphere_seam"));
+                    annotations.exactness(id, Exactness::Derived);
+                }
+                admit_brep_entity(ctx)?;
+                out.points
+                    .push(Point::new(point_id.clone(), degenerate.point(), None));
+                admit_brep_entity(ctx)?;
+                out.vertices.push(Vertex {
+                    id: vertex_id.clone(),
+                    point: point_id,
+                    tolerance: None,
+                });
+                vertex_id
+            }
+        };
+        // The seam follows the coedge that ends at the pole.
+        let after_pole = ring
+            .iter()
+            .position(|id| {
+                coedge_indices
+                    .get(id)
+                    .and_then(|&index| out.coedges.get(index))
+                    .and_then(|coedge| {
+                        let edge = out.edges.iter().find(|edge| edge.id == coedge.edge)?;
+                        Some(match coedge.sense {
+                            Sense::Forward => edge.end == pole_vertex,
+                            Sense::Reversed => edge.start == pole_vertex,
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .map_or(ring.len(), |index| index + 1);
+        for id in [
+            curve_id.as_str(),
+            edge_id.as_str(),
+            coedge_id.as_str(),
+            pcurve_id.as_str(),
+        ] {
+            annotations.note(id, source_stream, 0, Some("derived_sphere_seam"));
+            annotations.exactness(id, Exactness::Derived);
+        }
+        admit_brep_entity(ctx)?;
+        out.curves.push(Curve {
+            parameter_range: None,
+            id: curve_id.clone(),
+            source_object: None,
+            geometry: CurveGeometry::Solved(SolvedCurveGeometry::Degenerate(degenerate)),
+        });
+        admit_brep_entity(ctx)?;
+        out.edges.push(Edge {
+            id: edge_id.clone(),
+            carrier: cadmpeg_ir::topology::EdgeCarrier::unbounded(Some(curve_id)),
+            start: pole_vertex.clone(),
+            end: pole_vertex,
+            tolerance: None,
+        });
+        let Some(full_turn) = cadmpeg_ir::units::FiniteVector::new([0.0, std::f64::consts::TAU])
+        else {
+            continue;
+        };
+        admit_brep_entity(ctx)?;
+        out.pcurves.push(Pcurve {
+            id: pcurve_id.clone(),
+            geometry: PcurveGeometry::Line(pcurve),
+            metadata: cadmpeg_ir::geometry::pcurve::PcurveMetadata::general(
+                None,
+                Some(full_turn),
+                None,
+            ),
+        });
+        ring.insert(after_pole, coedge_id.clone());
+        coedge_indices.insert(coedge_id.clone(), out.coedges.len());
+        let pcurve_uses = vec![cadmpeg_ir::topology::PcurveUse {
+            pcurve: pcurve_id,
+            isoparametric: None,
+            parameter_range: Some(
+                cadmpeg_ir::geometry::DirectedParameterRange::new([0.0, std::f64::consts::TAU])
+                    .map_err(cadmpeg_core::CodecError::malformed)?,
+            ),
+        }];
+        admit_brep_entity(ctx)?;
+        out.coedges.push(Coedge {
+            id: coedge_id.clone(),
+            owner_loop: loop_id.clone(),
+            edge: edge_id,
+            radial_next: coedge_id.clone(),
+            sense: Sense::Forward,
+            use_curve: None,
+            pcurves: pcurve_uses,
+        });
+        let ring = cadmpeg_ir::topology::LoopRing::new(ring, Vec::new()).map_err(|error| {
+            cadmpeg_core::CodecError::malformed(format_args!(
+                "generated sphere seam ring is invalid: {error}"
+            ))
+        })?;
+        if let Some(lp) = out.loops.iter_mut().find(|lp| lp.id == loop_id) {
+            lp.boundary = cadmpeg_ir::topology::LoopBoundary::Ring(ring);
+        }
+    }
+    Ok(())
+}
+
+fn emit_curve(
+    ctx: &DecodeContext<'_>,
+    out: &mut Brep,
+    carrier: &CurveCarrier,
+) -> Result<(), cadmpeg_core::CodecError> {
+    admit_brep_entity(ctx)?;
+    out.curves.push(Curve {
+        parameter_range: None,
+        id: id_curve(carrier.attr),
+        source_object: None,
+        geometry: carrier.geometry.clone(),
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn incomplete_brep_marker_decodes_empty() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let policy = cadmpeg_core::decode::DecodePolicy::service();
+        let body = [0x00, 0x1e, 0x00];
+        let (ctx, _) =
+            cadmpeg_core::decode::DecodeContext::from_root_bytes(&body, &arena, &policy).unwrap();
+        let carriers = super::super::index::scan_carriers(&ctx, &body).unwrap();
+        assert!(carriers.curve_attrs().is_empty());
+        let tables = super::topology::scan(&body);
+        assert!(tables.points().is_empty());
+        assert!(tables.loops().is_empty());
+        ctx.finish_session().unwrap();
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) =
+            cadmpeg_core::decode::DecodeContext::from_root_bytes(&body, &arena, &policy).unwrap();
+        let decoded = super::decode_body(
+            &ctx,
+            &body,
+            &cadmpeg_ir::stream_name!("incomplete-marker"),
+            false,
+        )
+        .unwrap();
+        assert!(decoded.points.is_empty());
+        assert!(decoded.loops.is_empty());
+        ctx.finish_session().unwrap();
+    }
+
+    #[test]
+    fn numerical_followup_inverse_ambiguity_is_independent_of_parameter_units() {
+        for domain in [1e-200, 1e-12, 1.0, 1e200] {
+            assert!(matches!(
+                super::unique_inverse_parameter(
+                    vec![(0.25 * domain, 0.), (0.75 * domain, 0.)],
+                    0.001,
+                    [0., domain]
+                ),
+                super::InverseResolution::Ambiguous
+            ));
+            assert!(matches!(
+                super::unique_inverse_parameter(
+                    vec![(0.25 * domain, 0.), (0.25 * domain, 0.)],
+                    0.001,
+                    [0., domain]
+                ),
+                super::InverseResolution::Unique(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn sweep_precharge_bounds_the_retained_surface() {
+        use super::sweep::{
+            spun_nurbs, swept_nurbs, SPUN_RING_KNOTS, SPUN_RING_POLES, SWEPT_RULING_KNOTS,
+            SWEPT_RULING_POLES,
+        };
+        use cadmpeg_ir::math::{Point3, Vector3};
+        use cadmpeg_ir::units::SumSquaresUnitVector3;
+
+        let profile = cadmpeg_ir::geometry::nurbs::NurbsCurve::from_lanes(
+            2,
+            vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            vec![
+                Point3::new(2.0, 0.0, 0.0),
+                Point3::new(3.0, 0.0, 1.0),
+                Point3::new(2.0, 0.0, 2.0),
+                Point3::new(4.0, 0.0, 3.0),
+            ],
+            Some(vec![1.0, 0.5, 1.0, 1.0]),
+            false,
+        )
+        .unwrap();
+        let knots = profile.knots().as_slice().len();
+        let axis = SumSquaresUnitVector3::new(Vector3::new(0.0, 0.0, 1.0)).unwrap();
+        let mut refusal = crate::lane_refusal::LaneRefusals::new();
+        let spun = spun_nurbs(
+            &profile,
+            Point3::new(0.0, 0.0, 0.0),
+            axis,
+            &"spin",
+            &mut refusal,
+        )
+        .unwrap();
+        let swept = swept_nurbs(&profile, axis, 0.0, 1.0, false, &"sweep", &mut refusal).unwrap();
+        assert_eq!(
+            super::nurbs_surface_bytes(
+                profile.pole_count(),
+                SPUN_RING_POLES,
+                knots + SPUN_RING_KNOTS
+            ),
+            super::solved_surface_bytes(&SolvedSurfaceGeometry::Nurbs(spun))
+        );
+        assert_eq!(
+            super::nurbs_surface_bytes(
+                profile.pole_count(),
+                SWEPT_RULING_POLES,
+                knots + SWEPT_RULING_KNOTS
+            ),
+            super::solved_surface_bytes(&SolvedSurfaceGeometry::Nurbs(swept))
+        );
+        assert_eq!(super::nurbs_surface_bytes(usize::MAX, 2, 0), None);
+    }
+
+    use super::sphere_latitude;
+    use super::unique_face_colors;
+    use crate::brep::entity;
+    use crate::brep::topology::{Bridge, Coedge, EdgeReferences, EdgeUse, Loop, Tables};
+    use cadmpeg_ir::geometry::{SolvedCurveGeometry, SolvedSurfaceGeometry};
+    use cadmpeg_ir::topology::Color;
+    use cadmpeg_ir::topology::Sense;
+
+    fn with_test_context<T>(f: impl FnOnce(&cadmpeg_core::decode::DecodeContext<'_>) -> T) -> T {
+        use cadmpeg_core::decode::{DecodeArena, DecodeContext, DecodePolicy};
+
+        let arena = DecodeArena::new();
+        let (ctx, _) = DecodeContext::from_root_bytes(&[], &arena, &DecodePolicy::service())
+            .expect("test context");
+        f(&ctx)
+    }
+
+    fn intersection_support_pcurve(
+        support_data: &crate::brep::intersection::IntersectionSupportData,
+        chart: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+        surface_attr: u32,
+        surface: &cadmpeg_ir::geometry::SurfaceGeometry,
+        edge_endpoints: [cadmpeg_ir::math::Point3; 2],
+        refusal: &mut crate::lane_refusal::LaneRefusals,
+    ) -> Result<
+        Option<(
+            super::PcurveGeometry,
+            [f64; 2],
+            super::IntersectionPcurveSource,
+        )>,
+        cadmpeg_core::CodecError,
+    > {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .expect("empty test root fits service policy");
+        super::intersection_support_pcurve(
+            &ctx,
+            support_data,
+            chart,
+            surface_attr,
+            surface,
+            edge_endpoints,
+            &mut super::IntersectionPcurveSinks {
+                refusal,
+                solver_capped: &mut false,
+            },
+        )
+    }
+
+    fn test_nurbs_curve(
+        degree: u32,
+        knots: Vec<f64>,
+        control_points: Vec<cadmpeg_ir::math::Point3>,
+        weights: Option<Vec<f64>>,
+    ) -> cadmpeg_ir::geometry::nurbs::NurbsCurve {
+        cadmpeg_ir::geometry::nurbs::NurbsCurve::from_lanes(
+            degree,
+            knots,
+            control_points,
+            weights,
+            false,
+        )
+        .expect("valid test NURBS curve")
+    }
+
+    // The fixture helper states each independent NURBS grid parameter explicitly.
+    #[allow(clippy::too_many_arguments)]
+    fn test_nurbs_surface(
+        u_degree: u32,
+        v_degree: u32,
+        u_knots: Vec<f64>,
+        v_knots: Vec<f64>,
+        _u_count: u32,
+        v_count: u32,
+        control_points: &[cadmpeg_ir::math::Point3],
+        weights: Option<Vec<f64>>,
+    ) -> cadmpeg_ir::geometry::nurbs::NurbsSurface {
+        cadmpeg_ir::geometry::nurbs::NurbsSurface::from_lanes(
+            cadmpeg_ir::geometry::nurbs::NurbsSurfaceAxis::new(u_degree, u_knots, false),
+            cadmpeg_ir::geometry::nurbs::NurbsSurfaceAxis::new(v_degree, v_knots, false),
+            cadmpeg_ir::geometry::nurbs::NurbsSurfaceLanes::new(
+                control_points
+                    .chunks(cadmpeg_core::decode::index_from_u32(v_count))
+                    .map(<[_]>::to_vec)
+                    .collect(),
+                weights.map(|values| {
+                    values
+                        .chunks(cadmpeg_core::decode::index_from_u32(v_count))
+                        .map(<[_]>::to_vec)
+                        .collect()
+                }),
+            ),
+            false,
+        )
+        .expect("valid test NURBS surface")
+    }
+
+    #[test]
+    fn sphere_latitude_refuses_a_circle_plane_beyond_the_pole() {
+        use std::f64::consts::FRAC_PI_2;
+        // Planes the sphere carries: the equator and the pole.
+        assert_eq!(sphere_latitude(0.0, 2.0), Some(0.0));
+        assert_eq!(sphere_latitude(2.0, 2.0), Some(FRAC_PI_2));
+        // The rounding the radius match admits reaches the pole and no further.
+        assert_eq!(sphere_latitude(2.0 + 1.0e-9, 2.0), Some(FRAC_PI_2));
+        // A plane beyond that band states a circle on another sphere. The
+        // radius match alone admits it, because a circle radius near zero
+        // matches the saturated `sqrt(radius^2 - height^2)`.
+        assert_eq!(sphere_latitude(2.1, 2.0), None);
+        // A signed radius keeps the signed ratio.
+        assert_eq!(sphere_latitude(2.0, -2.0), Some(-FRAC_PI_2));
+    }
+
+    #[test]
+    fn line_edge_parameters_convert_from_metres_to_millimetres() {
+        let carrier = crate::brep::CurveCarrier {
+            marker_reversed: None,
+            attr: 1,
+            offset: 0,
+            end: 0,
+            geometry: cadmpeg_ir::geometry::CurveGeometry::Solved(SolvedCurveGeometry::Line(
+                cadmpeg_ir::geometry::analytic::LineCurve::try_new(
+                    cadmpeg_ir::math::Point3::new(0.0, 17.5, 0.0),
+                    cadmpeg_ir::math::Vector3::new(0.0, -1.0, 0.0),
+                )
+                .unwrap(),
+            )),
+            parameter_range: Some(
+                cadmpeg_ir::units::FiniteVector::new([-0.014, 0.0165])
+                    .expect("finite fixture range"),
+            ),
+        };
+
+        let endpoints = [
+            cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+            cadmpeg_ir::math::Point3::new(0.0, 31.5, 0.0),
+        ];
+        assert_eq!(
+            super::edge_parameter_range(
+                &cadmpeg_test_support::service_decode_context(),
+                &carrier,
+                Some(endpoints),
+                [None; 2],
+                false,
+                true,
+            )
+            .unwrap(),
+            Some(([-14.0, 16.5], true))
+        );
+    }
+
+    #[test]
+    fn circle_edge_ranges_start_within_one_turn() {
+        // An arc stored as ending at the seam from below: [-1.47, 0].
+        let carrier = crate::brep::CurveCarrier {
+            marker_reversed: None,
+            attr: 1,
+            offset: 0,
+            end: 0,
+            geometry: cadmpeg_ir::geometry::CurveGeometry::Solved(SolvedCurveGeometry::Circle(
+                cadmpeg_ir::geometry::analytic::CircleCurve::try_new(
+                    cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                    cadmpeg_ir::math::Vector3::new(-1.0, 0.0, 0.0),
+                    cadmpeg_ir::math::Vector3::new(0.0, 0.0, 1.0),
+                    3.175,
+                )
+                .unwrap(),
+            )),
+            parameter_range: Some(
+                cadmpeg_ir::units::FiniteVector::new([-1.471_127_674_303_733_8, 0.0])
+                    .expect("finite fixture range"),
+            ),
+        };
+        let endpoints = [
+            cadmpeg_ir::math::Point3::new(0.0, -3.159_243_078_916_716, 0.315_924_307_891_68),
+            cadmpeg_ir::math::Point3::new(0.0, 0.0, 3.175),
+        ];
+        let (range, reversed) = super::edge_parameter_range(
+            &cadmpeg_test_support::service_decode_context(),
+            &carrier,
+            Some(endpoints),
+            [None; 2],
+            false,
+            true,
+        )
+        .unwrap()
+        .expect("the arc's ends are its vertices");
+        let tau = std::f64::consts::TAU;
+        assert!(!reversed);
+        assert!((range[0] - (tau - 1.471_127_674_303_733_8)).abs() < 1e-12);
+        assert!((range[1] - tau).abs() < 1e-12);
+
+        assert_eq!(super::periodic_phase([0.5, 1.0]), [0.5, 1.0]);
+        let [start, end] = super::periodic_phase([7.0, 8.0]);
+        assert!((start - (7.0 - tau)).abs() < 1e-12 && (end - (8.0 - tau)).abs() < 1e-12);
+        // A start a hair below zero lands on zero, never on `τ`.
+        assert_eq!(super::periodic_phase([-1e-17, 1.0])[0], 0.0);
+    }
+
+    fn bridge_record(attr: u32, refs: [u32; 5]) -> Bridge {
+        Bridge {
+            attr,
+            sequence: 0,
+            refs,
+            sense: Sense::Forward,
+            attributes_head: None,
+            offset: 0,
+        }
+    }
+
+    fn loop_record(attr: u32, refs: [u32; 4]) -> Loop {
+        Loop {
+            attr,
+            refs,
+            offset: 0,
+        }
+    }
+
+    fn coedge_record(attr: u32, refs: [u32; 9]) -> Coedge {
+        Coedge {
+            attr,
+            refs,
+            sense: Sense::Forward,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn face_walk_rejects_a_loop_owned_by_another_bridge() {
+        let mut bridge = bridge_record(10, [0, 0, 20, 0, 30]);
+        bridge.attributes_head = Some(700);
+        let mut other = bridge_record(11, [0, 0, 20, 0, 30]);
+        other.attributes_head = Some(700);
+        let mut tables = Tables::default();
+        tables.insert_bridge(other);
+        tables.insert_loop(loop_record(20, [0, 40, 11, 0]));
+        tables.insert_coedge(coedge_record(40, [0, 0, 0, 40, 0, 0, 0, 0, 0]));
+
+        let face = super::walk_face(&bridge, &tables);
+
+        assert!(face.loops.is_empty());
+    }
+
+    #[test]
+    fn face_walk_rejects_a_ring_owned_by_another_loop() {
+        let bridge = bridge_record(10, [0, 0, 20, 0, 30]);
+        let mut tables = Tables::default();
+        tables.insert_loop(loop_record(20, [0, 40, 10, 0]));
+        tables.insert_coedge(coedge_record(40, [0, 21, 0, 40, 0, 0, 0, 0, 0]));
+
+        let face = super::walk_face(&bridge, &tables);
+
+        assert!(face.loops.is_empty());
+    }
+
+    fn face_color(
+        face_attr: u32,
+        color_attr: u32,
+        face_seq: u32,
+        rgb: [f32; 3],
+    ) -> entity::FaceColor {
+        entity::FaceColor {
+            face_attr,
+            color_attr,
+            face_seq,
+            stream_order: 0,
+            color: Color::new(rgb[0], rgb[1], rgb[2], 1.0).expect("valid color"),
+            offset: usize::try_from(face_attr).unwrap(),
+            target: None,
+        }
+    }
+
+    fn face_color_version(
+        face_attr: u32,
+        seq: u32,
+        stream_order: usize,
+    ) -> entity::FaceColorVersion {
+        entity::FaceColorVersion {
+            face_attr,
+            seq,
+            stream_order,
+        }
+    }
+
+    #[test]
+    fn current_uncolored_face_version_removes_an_older_color() {
+        let colors = vec![face_color(700, 900, 1, [0.25, 0.5, 0.75])];
+
+        let (resolved, unresolved) = unique_face_colors(
+            colors,
+            vec![face_color_version(700, 1, 0), face_color_version(700, 2, 0)],
+        );
+
+        assert!(resolved.is_empty());
+        assert_eq!(unresolved, 0);
+    }
+
+    #[test]
+    fn later_stream_replaces_an_equal_sequence_face_color() {
+        let old = face_color(700, 900, 2, [0.25, 0.5, 0.75]);
+        let mut current = face_color(700, 901, 2, [0.75, 0.5, 0.25]);
+        current.stream_order = 1;
+
+        let (resolved, unresolved) = unique_face_colors(
+            vec![old, current],
+            vec![face_color_version(700, 2, 0), face_color_version(700, 2, 1)],
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].color_attr, 901);
+        assert_eq!(unresolved, 0);
+    }
+
+    #[test]
+    fn conflicting_current_face_colors_remain_unresolved() {
+        let colors = vec![
+            face_color(700, 900, 2, [0.25, 0.5, 0.75]),
+            face_color(700, 901, 2, [0.75, 0.5, 0.25]),
+        ];
+
+        let (resolved, unresolved) = unique_face_colors(
+            colors,
+            vec![face_color_version(700, 2, 0), face_color_version(700, 2, 0)],
+        );
+
+        assert!(resolved.is_empty());
+        assert_eq!(unresolved, 1);
+    }
+
+    #[test]
+    fn conflicting_reuse_of_one_color_identity_remains_unresolved() {
+        let colors = vec![
+            face_color(700, 900, 2, [0.25, 0.5, 0.75]),
+            face_color(701, 900, 2, [0.75, 0.5, 0.25]),
+        ];
+
+        let (resolved, unresolved) = unique_face_colors(
+            colors,
+            vec![face_color_version(700, 2, 0), face_color_version(701, 2, 0)],
+        );
+
+        assert!(resolved.is_empty());
+        assert_eq!(unresolved, 2);
+    }
+
+    #[test]
+    fn intersection_uv_converts_length_parameters_and_exact_endpoints() {
+        let surface =
+            cadmpeg_ir::geometry::SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(
+                cadmpeg_ir::geometry::analytic::CylinderSurface::try_new(
+                    cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                    cadmpeg_ir::math::Vector3::new(0.0, 0.0, 1.0),
+                    cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+                    2.0,
+                )
+                .unwrap(),
+            ));
+        let endpoints = [
+            cadmpeg_ir::eval::decode::surface_point(
+                cadmpeg_ir::eval::admission::EvaluationAdmission::Standard,
+                &surface,
+                0.0,
+                3.0,
+            )
+            .expect("cylinder start")
+            .get(),
+            cadmpeg_ir::eval::decode::surface_point(
+                cadmpeg_ir::eval::admission::EvaluationAdmission::Standard,
+                &surface,
+                0.5,
+                2.0,
+            )
+            .expect("cylinder end")
+            .get(),
+        ];
+        let chart = test_nurbs_curve(1, vec![0.0, 0.0, 1.0, 1.0], endpoints.to_vec(), None);
+        let support_data = super::super::intersection::IntersectionSupportData {
+            supports: [10, 11],
+            fit_tolerance_mm: Some(0.2),
+            support_uv: Some([
+                vec![
+                    cadmpeg_ir::math::Point2::new(0.0, 0.0029),
+                    cadmpeg_ir::math::Point2::new(0.5, 0.0018),
+                ],
+                vec![
+                    cadmpeg_ir::math::Point2::new(0.0, 0.0),
+                    cadmpeg_ir::math::Point2::new(1.0, 0.0),
+                ],
+            ]),
+        };
+        let (geometry, range, source) = intersection_support_pcurve(
+            &support_data,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new(),
+        )
+        .expect("build the intersection support pcurve")
+        .expect("support parameterization");
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Nurbs { nurbs } = geometry else {
+            panic!("expected solved UV NURBS");
+        };
+        assert_eq!(
+            nurbs.control_points()[0],
+            cadmpeg_ir::math::Point2::new(0.0, 3.0)
+        );
+        assert_eq!(
+            nurbs.control_points()[1],
+            cadmpeg_ir::math::Point2::new(0.5, 2.0)
+        );
+        assert_eq!(range, [0.0, 1.0]);
+        assert_eq!(source, super::IntersectionPcurveSource::StoredCache);
+
+        let ambiguous = super::super::intersection::IntersectionSupportData {
+            supports: [10, 10],
+            ..support_data.clone()
+        };
+        assert!(intersection_support_pcurve(
+            &ambiguous,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new()
+        )
+        .expect("build the intersection support pcurve")
+        .is_none());
+
+        let malformed = super::super::intersection::IntersectionSupportData {
+            support_uv: Some([Vec::new(), Vec::new()]),
+            ..support_data
+        };
+        assert!(intersection_support_pcurve(
+            &malformed,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new()
+        )
+        .expect("build the intersection support pcurve")
+        .is_none());
+    }
+
+    #[test]
+    fn intersection_support_pcurve_accepts_two_stored_uv_controls() {
+        let surface =
+            cadmpeg_ir::geometry::SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(
+                cadmpeg_ir::geometry::analytic::CylinderSurface::try_new(
+                    cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                    cadmpeg_ir::math::Vector3::new(0.0, 0.0, 1.0),
+                    cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+                    2.0,
+                )
+                .expect("valid cylinder"),
+            ));
+        let endpoints = [
+            cadmpeg_ir::eval::decode::surface_point(
+                cadmpeg_ir::eval::admission::EvaluationAdmission::Standard,
+                &surface,
+                0.0,
+                3.0,
+            )
+            .expect("start")
+            .get(),
+            cadmpeg_ir::eval::decode::surface_point(
+                cadmpeg_ir::eval::admission::EvaluationAdmission::Standard,
+                &surface,
+                0.5,
+                2.0,
+            )
+            .expect("end")
+            .get(),
+        ];
+        let chart = test_nurbs_curve(1, vec![0.0, 0.0, 1.0, 1.0], endpoints.to_vec(), None);
+        let support_data = super::super::intersection::IntersectionSupportData {
+            supports: [10, 11],
+            fit_tolerance_mm: Some(0.2),
+            support_uv: Some([
+                vec![
+                    cadmpeg_ir::math::Point2::new(0.0, 0.0029),
+                    cadmpeg_ir::math::Point2::new(0.5, 0.0018),
+                ],
+                vec![
+                    cadmpeg_ir::math::Point2::new(0.0, 0.0),
+                    cadmpeg_ir::math::Point2::new(1.0, 0.0),
+                ],
+            ]),
+        };
+        assert!(intersection_support_pcurve(
+            &support_data,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new(),
+        )
+        .expect("build the intersection support pcurve")
+        .is_some());
+    }
+
+    #[test]
+    fn analytic_intersection_chart_derives_continuous_uv_without_cache() {
+        let surface =
+            cadmpeg_ir::geometry::SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(
+                cadmpeg_ir::geometry::analytic::CylinderSurface::try_new(
+                    cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                    cadmpeg_ir::math::Vector3::new(0.0, 0.0, 1.0),
+                    cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+                    2.0,
+                )
+                .unwrap(),
+            ));
+        let model_points = [(3.0, 1.0), (3.2, 2.0), (3.4, 3.0)]
+            .map(|(u, v)| {
+                cadmpeg_ir::eval::decode::surface_point(
+                    cadmpeg_ir::eval::admission::EvaluationAdmission::Standard,
+                    &surface,
+                    u,
+                    v,
+                )
+                .expect("cylinder point")
+                .get()
+            })
+            .to_vec();
+        let endpoints = [model_points[0], model_points[2]];
+        let chart = test_nurbs_curve(1, vec![0.0, 0.0, 0.5, 1.0, 1.0], model_points, None);
+        let support_data = super::super::intersection::IntersectionSupportData {
+            supports: [10, 11],
+            fit_tolerance_mm: Some(0.011),
+            support_uv: None,
+        };
+
+        let (geometry, _, source) = intersection_support_pcurve(
+            &support_data,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new(),
+        )
+        .expect("build the intersection support pcurve")
+        .expect("analytic support inversion");
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Nurbs { nurbs } = geometry else {
+            panic!("expected solved UV NURBS");
+        };
+        for (point, expected) in
+            nurbs
+                .control_points()
+                .iter()
+                .zip([(3.0, 1.0), (3.2, 2.0), (3.4, 3.0)])
+        {
+            assert!((point.u - expected.0).abs() < 1.0e-12);
+            assert!((point.v - expected.1).abs() < 1.0e-12);
+        }
+        assert_eq!(source, super::IntersectionPcurveSource::AnalyticInverse);
+
+        let under_toleranced = super::super::intersection::IntersectionSupportData {
+            fit_tolerance_mm: Some(0.009),
+            ..support_data
+        };
+        assert!(intersection_support_pcurve(
+            &under_toleranced,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new()
+        )
+        .expect("build the intersection support pcurve")
+        .is_none());
+    }
+
+    #[test]
+    fn analytic_torus_chart_unwraps_both_periodic_parameters() {
+        let surface = cadmpeg_ir::geometry::SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(
+            cadmpeg_ir::geometry::analytic::TorusSurface::try_new(
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Vector3::new(0.0, 0.0, 1.0),
+                cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+                5.0,
+                1.0,
+            )
+            .unwrap(),
+        ));
+        let expected = [(3.0, 3.0), (3.2, 3.2), (3.4, 3.4)];
+        let model_points = expected
+            .map(|(u, v)| {
+                cadmpeg_ir::eval::decode::surface_point(
+                    cadmpeg_ir::eval::admission::EvaluationAdmission::Standard,
+                    &surface,
+                    u,
+                    v,
+                )
+                .expect("torus point")
+                .get()
+            })
+            .to_vec();
+        let endpoints = [model_points[0], model_points[2]];
+        let chart = test_nurbs_curve(1, vec![0.0, 0.0, 0.5, 1.0, 1.0], model_points, None);
+        let support_data = super::super::intersection::IntersectionSupportData {
+            supports: [10, 11],
+            fit_tolerance_mm: Some(0.08),
+            support_uv: None,
+        };
+
+        let (geometry, _, _) = intersection_support_pcurve(
+            &support_data,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new(),
+        )
+        .expect("build the intersection support pcurve")
+        .expect("torus support inversion");
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Nurbs { nurbs } = geometry else {
+            panic!("expected solved UV NURBS");
+        };
+        for (point, expected) in nurbs.control_points().iter().zip(expected) {
+            assert!((point.u - expected.0).abs() < 1.0e-12);
+            assert!((point.v - expected.1).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn nurbs_intersection_chart_inverts_with_continuation_seeds() {
+        let nurbs = test_nurbs_surface(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+            ],
+            None,
+        );
+        let surface = cadmpeg_ir::geometry::SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(
+            nurbs.clone(),
+        ));
+        let expected = [(0.2, 0.1), (0.5, 0.4), (0.8, 0.7)];
+        let model_points = expected
+            .map(|(u, v)| {
+                cadmpeg_ir::eval::decode::nurbs_surface_point(
+                    cadmpeg_ir::eval::admission::EvaluationAdmission::Standard,
+                    &nurbs,
+                    u,
+                    v,
+                )
+                .expect("surface point")
+                .get()
+            })
+            .to_vec();
+        let endpoints = [model_points[0], model_points[2]];
+        let chart = test_nurbs_curve(1, vec![0.0, 0.0, 0.5, 1.0, 1.0], model_points, None);
+        let support_data = super::super::intersection::IntersectionSupportData {
+            supports: [10, 11],
+            fit_tolerance_mm: Some(1.0e-9),
+            support_uv: None,
+        };
+
+        let (geometry, _, source) = intersection_support_pcurve(
+            &support_data,
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new(),
+        )
+        .expect("build the intersection support pcurve")
+        .expect("NURBS support inversion");
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Nurbs { nurbs } = geometry else {
+            panic!("expected solved UV NURBS");
+        };
+        for (point, expected) in nurbs.control_points().iter().zip(expected) {
+            assert!((point.u - expected.0).abs() < 1.0e-10);
+            assert!((point.v - expected.1).abs() < 1.0e-10);
+        }
+        assert_eq!(source, super::IntersectionPcurveSource::NurbsInverse);
+    }
+
+    #[test]
+    fn nurbs_intersection_chart_requires_a_complete_chord_certificate() {
+        let nurbs = test_nurbs_surface(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 1.0),
+            ],
+            None,
+        );
+        let surface =
+            cadmpeg_ir::geometry::SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(nurbs));
+        let endpoints = [
+            cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+            cadmpeg_ir::math::Point3::new(1.0, 1.0, 1.0),
+        ];
+        let chart = test_nurbs_curve(1, vec![0.0, 0.0, 1.0, 1.0], endpoints.to_vec(), None);
+        let support_data = |fit_tolerance_mm| super::super::intersection::IntersectionSupportData {
+            supports: [10, 11],
+            fit_tolerance_mm: Some(fit_tolerance_mm),
+            support_uv: None,
+        };
+
+        assert!(intersection_support_pcurve(
+            &support_data(0.3),
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new(),
+        )
+        .expect("build the intersection support pcurve")
+        .is_none());
+        assert!(intersection_support_pcurve(
+            &support_data(0.34),
+            &chart,
+            10,
+            &surface,
+            endpoints,
+            &mut crate::lane_refusal::LaneRefusals::new(),
+        )
+        .expect("build the intersection support pcurve")
+        .is_some());
+    }
+
+    #[test]
+    fn canonical_edge_direction_uses_explicit_or_unique_forward_coedge() {
+        use std::collections::HashMap;
+
+        let record = |attr, refs, sense| Coedge {
+            attr,
+            refs,
+            sense,
+            offset: 0,
+        };
+        let edge = |attr, references| EdgeUse {
+            attr,
+            references,
+            sequence: 0,
+            tolerance_m: None,
+            offset: 0,
+        };
+        let mut coedges = HashMap::from([
+            (
+                10,
+                record(10, [0, 0, 0, 0, 101, 0, 7, 0, 0], Sense::Reversed),
+            ),
+            (
+                11,
+                record(11, [0, 0, 0, 0, 102, 10, 7, 0, 0], Sense::Forward),
+            ),
+        ]);
+        let prefixed_edge = edge(7, EdgeReferences::Compact { curve: 300 });
+
+        assert_eq!(
+            super::canonical_coedge_attr(7, Some(&prefixed_edge), &coedges),
+            Some(11)
+        );
+
+        let bare_edge = edge(7, EdgeReferences::Bare([11, 0, 0, 300, 0, 0]));
+        assert_eq!(
+            super::canonical_coedge_attr(7, Some(&bare_edge), &coedges),
+            Some(11)
+        );
+
+        let sentinel_edge = edge(7, EdgeReferences::Bare([1, 0, 0, 300, 0, 0]));
+        assert_eq!(
+            super::canonical_coedge_attr(7, Some(&sentinel_edge), &coedges),
+            Some(11)
+        );
+
+        let reversed_edge = edge(7, EdgeReferences::Bare([10, 0, 0, 300, 0, 0]));
+        assert_eq!(
+            super::canonical_coedge_attr(7, Some(&reversed_edge), &coedges),
+            None
+        );
+
+        coedges.insert(
+            12,
+            record(12, [0, 0, 0, 0, 103, 0, 7, 0, 0], Sense::Forward),
+        );
+        assert_eq!(
+            super::canonical_coedge_attr(7, Some(&prefixed_edge), &coedges),
+            None
+        );
+    }
+
+    /// The FIN slot proof: `refs[2]` is the forward link and `refs[4]` the
+    /// coedge's end. Every FIN carries both links. The plane faces +z and the
+    /// bridge is forward, so the ring runs counter-clockwise and each edge
+    /// ends at its own vertex-use. A slot swap reverses the ring or shifts
+    /// every edge by one.
+    fn doubly_linked_triangle_body() -> Vec<u8> {
+        let mut body = crate::test_support::parasolid::triangle_body();
+        for (attr, forward, backward, end) in [
+            (30u16, 31u16, 32u16, 51u16),
+            (31, 32, 30, 52),
+            (32, 30, 31, 50),
+        ] {
+            let id = attr.to_be_bytes();
+            let at = body
+                .windows(4)
+                .position(|window| {
+                    window[0] == 0x00
+                        && window[1] == 0x11
+                        && window[2] == id[0]
+                        && window[3] == id[1]
+                })
+                .expect("synthetic triangle FIN");
+            body[at + 8..at + 10].copy_from_slice(&forward.to_be_bytes());
+            body[at + 10..at + 12].copy_from_slice(&backward.to_be_bytes());
+            body[at + 12..at + 14].copy_from_slice(&end.to_be_bytes());
+        }
+        body
+    }
+
+    #[test]
+    fn forward_fin_chain_walks_the_face_on_left_ring() {
+        let body = doubly_linked_triangle_body();
+        with_test_context(|ctx| {
+            let decoded = super::decode_body(
+                ctx,
+                &body,
+                &cadmpeg_ir::stream_name!("forward-fin-proof"),
+                false,
+            )
+            .expect("XT-linked triangle decodes");
+            assert_eq!(decoded.faces.len(), 1);
+            assert_eq!(decoded.loops.len(), 1);
+            let ring: Vec<_> = decoded.loops[0]
+                .coedges()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            assert_eq!(ring.len(), 3);
+            assert!(ring[0].ends_with("#30"));
+            assert!(ring[1].ends_with("#31"));
+            assert!(ring[2].ends_with("#32"));
+            let position = |vertex_id: &cadmpeg_ir::ids::VertexId| {
+                let vertex = decoded
+                    .vertices
+                    .iter()
+                    .find(|vertex| vertex.id == *vertex_id)
+                    .expect("ring vertex");
+                let point = decoded
+                    .points
+                    .iter()
+                    .find(|point| point.id == vertex.point)
+                    .expect("ring point");
+                let position = point.position().get();
+                [position.x, position.y]
+            };
+            let mut area = 0.0;
+            for edge in &decoded.edges {
+                let [x0, y0] = position(&edge.start);
+                let [x1, y1] = position(&edge.end);
+                area += x0 * y1 - x1 * y0;
+            }
+            assert!(area > 0.0, "forward ring runs counter-clockwise");
+            let edge = decoded
+                .edges
+                .iter()
+                .find(|edge| edge.id.as_str().ends_with("#40"))
+                .expect("first triangle edge");
+            assert!(edge.start.as_str().ends_with("#50"));
+            assert!(edge.end.as_str().ends_with("#51"));
+        });
+    }
+
+    /// A FIN without a forward link: `refs[3]` is the next FIN and `refs[4]`
+    /// the coedge's start.
+    #[test]
+    fn a_ring_without_forward_links_is_listed_in_traversal_order() {
+        let body = crate::test_support::parasolid::triangle_body();
+        with_test_context(|ctx| {
+            let decoded = super::decode_body(
+                ctx,
+                &body,
+                &cadmpeg_ir::stream_name!("backward-fin-ring"),
+                false,
+            )
+            .expect("singly linked triangle decodes");
+            let ring: Vec<_> = decoded.loops[0]
+                .coedges()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            assert_eq!(ring.len(), 3);
+            assert!(ring[0].ends_with("#30"));
+            assert!(ring[1].ends_with("#31"));
+            assert!(ring[2].ends_with("#32"));
+            let edge = decoded
+                .edges
+                .iter()
+                .find(|edge| edge.id.as_str().ends_with("#40"))
+                .expect("first triangle edge");
+            assert!(edge.start.as_str().ends_with("#50"));
+            assert!(edge.end.as_str().ends_with("#51"));
+        });
+    }
+
+    /// One FIN carries a reciprocal `refs[2]` and the others carry none, so
+    /// the loop is not forward linked.
+    #[test]
+    fn a_ring_with_some_forward_links_is_listed_in_traversal_order() {
+        let mut body = crate::test_support::parasolid::triangle_body();
+        let at = body
+            .windows(4)
+            .position(|window| window == [0x00, 0x11, 0x00, 30])
+            .expect("synthetic triangle FIN");
+        body[at + 8..at + 10].copy_from_slice(&32u16.to_be_bytes());
+        with_test_context(|ctx| {
+            let decoded = super::decode_body(
+                ctx,
+                &body,
+                &cadmpeg_ir::stream_name!("partial-fin-ring"),
+                false,
+            )
+            .expect("partly linked triangle decodes");
+            let ring: Vec<_> = decoded.loops[0]
+                .coedges()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            assert_eq!(ring.len(), 3);
+            assert!(ring[0].ends_with("#30"));
+            assert!(ring[1].ends_with("#31"));
+            assert!(ring[2].ends_with("#32"));
+            let edge = decoded
+                .edges
+                .iter()
+                .find(|edge| edge.id.as_str().ends_with("#40"))
+                .expect("first triangle edge");
+            assert!(edge.start.as_str().ends_with("#50"));
+            assert!(edge.end.as_str().ends_with("#51"));
+        });
+    }
+
+    /// FIN 30 names FIN 31 as its forward link, and FIN 31 does not name it
+    /// back, so the only loop of the face is withheld.
+    #[test]
+    fn a_face_without_a_decoded_loop_is_withheld_with_its_surface() {
+        let mut body = crate::test_support::parasolid::triangle_body();
+        let at = body
+            .windows(4)
+            .position(|window| window == [0x00, 0x11, 0x00, 30])
+            .expect("synthetic triangle FIN");
+        body[at + 8..at + 10].copy_from_slice(&31u16.to_be_bytes());
+        with_test_context(|ctx| {
+            let decoded = super::decode_body(
+                ctx,
+                &body,
+                &cadmpeg_ir::stream_name!("withheld-face"),
+                false,
+            )
+            .expect("triangle decodes");
+            assert!(decoded.loops.is_empty());
+            assert!(decoded.faces.is_empty());
+            assert!(decoded.surfaces.is_empty());
+            assert_eq!(decoded.stats.withheld_fin_links, 1);
+            assert_eq!(decoded.stats.withheld_faces, 1);
+        });
+    }
+
+    #[test]
+    fn boundary_coedge_uses_ring_endpoint_but_reciprocal_twin_must_agree() {
+        use std::collections::HashMap;
+
+        let record = |attr, refs| Coedge {
+            attr,
+            refs,
+            sense: Sense::Forward,
+            offset: 0,
+        };
+        let incidence = |fin, ring_vuse, forward_linked| super::EdgeIncidence {
+            fin,
+            own_vuse: if fin == 10 { 101 } else { 102 },
+            ring_vuse,
+            forward_linked,
+        };
+        let boundary = HashMap::from([(10, record(10, [0, 0, 0, 0, 101, 10, 7, 0, 0]))]);
+        assert_eq!(
+            super::edge_ring_vuse(incidence(10, 102, true), &[], &boundary),
+            Some(102)
+        );
+
+        let reciprocal = HashMap::from([
+            (10, record(10, [0, 0, 0, 0, 101, 11, 7, 0, 0])),
+            (11, record(11, [0, 0, 0, 0, 102, 10, 7, 0, 0])),
+        ]);
+        assert_eq!(
+            super::edge_ring_vuse(incidence(10, 102, true), &[], &reciprocal),
+            Some(102)
+        );
+        assert_eq!(
+            super::edge_ring_vuse(incidence(10, 103, true), &[], &reciprocal),
+            None
+        );
+    }
+
+    #[test]
+    fn a_twin_in_a_loop_of_the_other_kind_names_the_canonical_end() {
+        use std::collections::HashMap;
+
+        // Edge 7 runs from vertex-use 102 to 101. FIN 10 is in a forward-linked
+        // loop, so its `refs[4]` is the end. FIN 11 is in a loop that is not
+        // forward linked, so its `refs[4]` is its own start, the edge's end.
+        let record = |attr, refs| Coedge {
+            attr,
+            refs,
+            sense: Sense::Forward,
+            offset: 0,
+        };
+        let coedges = HashMap::from([
+            (10, record(10, [0, 0, 0, 0, 101, 11, 7, 0, 0])),
+            (11, record(11, [0, 0, 0, 0, 101, 10, 7, 0, 0])),
+        ]);
+        let canonical = super::EdgeIncidence {
+            fin: 10,
+            own_vuse: 101,
+            ring_vuse: 102,
+            forward_linked: true,
+        };
+        let twin = super::EdgeIncidence {
+            fin: 11,
+            own_vuse: 101,
+            ring_vuse: 102,
+            forward_linked: false,
+        };
+        assert_eq!(
+            super::edge_ring_vuse(canonical, &[canonical, twin], &coedges),
+            Some(102)
+        );
+        assert_eq!(
+            super::edge_ring_vuse(canonical, &[canonical], &coedges),
+            None
+        );
+    }
+
+    #[test]
+    fn normalized_surface_parameter_reversal_toggles_face_sense() {
+        use cadmpeg_ir::topology::Sense;
+
+        assert_eq!(super::surface_sense(Sense::Forward, false), Sense::Forward);
+        assert_eq!(
+            super::surface_sense(Sense::Reversed, false),
+            Sense::Reversed
+        );
+        assert_eq!(super::surface_sense(Sense::Forward, true), Sense::Reversed);
+        assert_eq!(super::surface_sense(Sense::Reversed, true), Sense::Forward);
+    }
+
+    #[test]
+    fn geometry_free_stream_does_not_report_synthetic_body_grouping() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .unwrap();
+        let decoded = super::decode_body(&ctx, &[], &cadmpeg_ir::stream_name!("empty"), false)
+            .expect("valid exactness fields");
+
+        assert!(decoded.faces.is_empty());
+        assert!(!decoded.stats.synthetic_body_grouping);
+    }
+
+    #[test]
+    fn native_brep_carrier_decodes_triangle_body() {
+        use cadmpeg_core::decode::{DecodeArena, DecodeContext, DecodePolicy};
+
+        let body = crate::test_support::parasolid::triangle_body();
+        let arena = DecodeArena::new();
+        let (ctx, _) =
+            DecodeContext::from_root_bytes(&body, &arena, &DecodePolicy::service()).expect("root");
+        super::decode_body(
+            &ctx,
+            &body,
+            &cadmpeg_ir::stream_name!("candidate-admission"),
+            false,
+        )
+        .expect("decode body");
+    }
+
+    #[test]
+    fn typed_body_records_preserve_stored_sheet_kind_and_links() {
+        use crate::brep::typed::{BodyNode, FaceNode, Facts, RegionNode, ShellNode};
+        use cadmpeg_ir::topology::BodyKind;
+        use std::collections::HashSet;
+
+        let facts = Facts {
+            bodies: vec![BodyNode {
+                attr: 3,
+                node_id: 7,
+                topology_refs: [7, 8, 9, 10, 1, 12, 11],
+                ownership_refs: Vec::new(),
+                kind: BodyKind::Sheet,
+                offset: 1,
+                end: 2,
+            }],
+            shells: vec![ShellNode {
+                attr: 7,
+                node_id: 814,
+                refs: [1, 3, 1, 38, 1, 1, 39, 1],
+                offset: 3,
+                end: 4,
+            }],
+            regions: vec![
+                RegionNode {
+                    attr: 11,
+                    node_id: 244,
+                    refs: [1, 3, 39, 1, 44],
+                    kind: super::RegionKind::Void,
+                    offset: 5,
+                    end: 6,
+                },
+                RegionNode {
+                    attr: 39,
+                    node_id: 815,
+                    refs: [1, 3, 1, 11, 7],
+                    kind: super::RegionKind::Solid,
+                    offset: 7,
+                    end: 8,
+                },
+            ],
+            faces: vec![FaceNode {
+                attr: 100,
+                node_id: 900,
+                refs: [1, 1, 49, 7, 8],
+                sense: Sense::Forward,
+                offset: 9,
+                end: 10,
+            }],
+        };
+        let mut tables = Tables::default();
+        tables.insert_bridge(Bridge {
+            attr: 100,
+            sequence: 0,
+            refs: [1, 1, 49, 7, 8],
+            sense: Sense::Forward,
+            attributes_head: None,
+            offset: 11,
+        });
+
+        let records = super::typed_body_records(&facts, &tables).expect("typed body records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, BodyKind::Sheet);
+        assert_eq!(records[0].regions.len(), 1);
+        assert!(records[0].refs.contains(&100));
+        assert_eq!(records[0].regions[0].shells[0].refs, vec![100]);
+        assert_eq!(
+            facts
+                .hierarchies(&HashSet::from([100]))
+                .expect("typed hierarchy")[0]
+                .body
+                .kind,
+            BodyKind::Sheet
+        );
+    }
+
+    #[test]
+    fn attribute_chain_heads_do_not_merge_distinct_face_identities() {
+        let mut body = crate::test_support::parasolid::owned_triangle(0, 700, 0.0);
+        let mut other = crate::test_support::parasolid::owned_triangle(200, 701, 2.0);
+        let face = other
+            .windows(2)
+            .position(|bytes| bytes == [0x00, 0x0e])
+            .expect("FACE");
+        other[face + 8..face + 10].copy_from_slice(&700u16.to_be_bytes());
+        body.extend(other);
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &body,
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .unwrap();
+        let decoded = super::decode_body(
+            &ctx,
+            &body,
+            &cadmpeg_ir::stream_name!("shared-metadata-head"),
+            false,
+        )
+        .expect("valid exactness fields");
+
+        assert_eq!(decoded.faces.len(), 2);
+        assert_ne!(decoded.faces[0].id, decoded.faces[1].id);
+    }
+
+    #[test]
+    fn topology_pruning_retains_a_procedural_blend_spine() {
+        use cadmpeg_ir::geometry::{
+            BlendCrossSection, BlendRadiusLaw, Curve, CurveGeometry, ProceduralSurface,
+            ProceduralSurfaceDefinition, SolvedCurveGeometry,
+        };
+        use cadmpeg_ir::ids::{CurveId, ProceduralSurfaceId};
+
+        let spine = CurveId::mint("test:model:entity#spine").expect("identity grammar");
+        let mut brep = super::Brep {
+            curves: vec![Curve {
+                parameter_range: None,
+                id: spine.clone(),
+                geometry: CurveGeometry::Solved(SolvedCurveGeometry::Line(
+                    cadmpeg_ir::geometry::analytic::LineCurve::try_new(
+                        cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                        cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+                    )
+                    .unwrap(),
+                )),
+                source_object: None,
+            }],
+            procedural_surfaces: vec![ProceduralSurface::new(
+                ProceduralSurfaceId::mint("test:model:entity#blend").expect("identity grammar"),
+                ProceduralSurfaceDefinition::Blend(
+                    cadmpeg_ir::geometry::surface_payloads::BlendSurfacePayload::try_new(
+                        [None, None],
+                        Some(spine.clone()),
+                        BlendRadiusLaw::constant(0.5).unwrap(),
+                        BlendCrossSection::Circular,
+                        cadmpeg_ir::geometry::CacheContract::from_form(None),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )],
+            ..Default::default()
+        };
+
+        super::prune_rejected_topology(&mut brep);
+        assert_eq!(brep.curves.first().map(|curve| &curve.id), Some(&spine));
+    }
+
+    #[test]
+    fn homogeneous_quadratic_identity_proves_constant_radius() {
+        let radius = 2.0;
+        let checked_radius =
+            cadmpeg_ir::scalar::PositiveLength::new(radius).expect("positive radius");
+        let controls = [
+            cadmpeg_ir::math::Point2::new(radius, 0.0),
+            cadmpeg_ir::math::Point2::new(radius, radius),
+            cadmpeg_ir::math::Point2::new(0.0, radius),
+        ];
+        let weights = [1.0, std::f64::consts::FRAC_1_SQRT_2, 1.0];
+        let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        assert!(super::quadratic_nurbs_has_constant_radius(
+            &controls,
+            Some(&weights),
+            &knots,
+            checked_radius,
+        ));
+
+        let mut invalid = controls;
+        invalid[1].u += 0.01;
+        assert!(!super::quadratic_nurbs_has_constant_radius(
+            &invalid,
+            Some(&weights),
+            &knots,
+            checked_radius,
+        ));
+    }
+
+    #[test]
+    fn interior_ruled_surface_line_has_affine_isoparametric_inverse() {
+        let surface = test_nurbs_surface(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(2.0, 1.0, 0.0),
+            ],
+            None,
+        );
+        let geometry = match with_test_context(|ctx| {
+            super::ruled_surface_line_pcurve(
+                ctx,
+                &surface,
+                cadmpeg_ir::geometry::nurbs::SurfaceParameterAxis::V,
+                cadmpeg_ir::math::Point3::new(0.0, 0.5, 0.0),
+                cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+            )
+        })
+        .expect("ruling evaluation")
+        {
+            super::InverseResolution::Unique(geometry) => geometry,
+            super::InverseResolution::NoMatch => panic!("interior ruling did not match"),
+            super::InverseResolution::Ambiguous => panic!("interior ruling was ambiguous"),
+        };
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve) = geometry else {
+            panic!("expected affine line pcurve");
+        };
+        let origin = line_pcurve.origin().as_raw();
+        let direction = line_pcurve.direction().as_raw();
+        assert!(origin.u.abs() < 1.0e-12);
+        assert!((origin.v - 0.5).abs() < 1.0e-12);
+        assert!((direction.u - 2.0 / 3.0).abs() < 1.0e-12);
+        assert!(direction.v.abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn interior_linear_axis_rational_nurbs_isocurve_has_exact_pcurve() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .expect("test context");
+        let surface = test_nurbs_surface(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![-0.1, -0.1, 0.9, 0.9],
+            3,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, -1.0),
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 3.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, -1.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 3.0),
+                cadmpeg_ir::math::Point3::new(2.0, 0.0, -1.0),
+                cadmpeg_ir::math::Point3::new(2.0, 0.0, 3.0),
+            ],
+            Some(vec![1.0, 1.0, 2.0, 2.0, 1.0, 1.0]),
+        );
+        let curve = test_nurbs_curve(
+            2,
+            surface.u_knots().to_vec(),
+            vec![
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(2.0, 0.0, 0.0),
+            ],
+            Some(vec![1.0, 2.0, 1.0]),
+        );
+        let geometry = match super::nurbs_isocurve_pcurve(&ctx, &surface, &curve)
+            .expect("isocurve lanes pair")
+        {
+            super::InverseResolution::Unique(geometry) => geometry,
+            super::InverseResolution::NoMatch => panic!("interior isocurve did not match"),
+            super::InverseResolution::Ambiguous => panic!("interior isocurve was ambiguous"),
+        };
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve) = geometry else {
+            panic!("expected isoparametric line pcurve");
+        };
+        let origin = line_pcurve.origin().as_raw();
+        let direction = line_pcurve.direction().as_raw();
+        assert!(origin.u.abs() < 1.0e-12);
+        assert!((origin.v - 0.15).abs() < 1.0e-12);
+        assert!((direction.u - 1.0).abs() < 1.0e-12);
+        assert!(direction.v.abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn extended_nurbs_isocurve_clamps_the_carrier_before_matching() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .expect("test context");
+        let surface = test_nurbs_surface(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+            ],
+            None,
+        );
+        let curve = test_nurbs_curve(
+            1,
+            vec![-1.0, -1.0, 2.0, 2.0],
+            vec![
+                cadmpeg_ir::math::Point3::new(0.5, -1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.5, 2.0, 0.0),
+            ],
+            None,
+        );
+        let resolution = super::derive_nurbs_edge_pcurve(&ctx, &surface, &curve, [0.2, 0.8])
+            .expect("isocurve lanes pair");
+        let super::NurbsPcurveResolution::Exact(
+            cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve),
+        ) = resolution
+        else {
+            panic!("extended isocurve was not certified");
+        };
+        let origin = line_pcurve.origin().as_raw();
+        let direction = line_pcurve.direction().as_raw();
+        assert!((origin.u - 0.5).abs() < 1e-12);
+        assert!(origin.v.abs() < 1e-12);
+        assert!(direction.u.abs() < 1e-12);
+        assert!((direction.v - 1.0).abs() < 1e-12);
+        let clamped = super::clamp_nurbs_curve_to_domain(&curve, [0.0, 1.0])
+            .expect("the clamped lanes are a curve")
+            .expect("clamped segment");
+        let expected = cadmpeg_ir::eval::nurbs_surface_isocurve(
+            &ctx,
+            &surface,
+            cadmpeg_ir::geometry::nurbs::SurfaceParameterAxis::U,
+            0.5,
+        )
+        .expect("build the NURBS surface isocurve")
+        .expect("surface isocurve");
+        assert!(super::nurbs_representation_matches(&expected, &clamped));
+    }
+
+    #[test]
+    fn extended_quadratic_isocurve_preserves_the_inserted_homogeneous_segment() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .expect("test context");
+        let surface = test_nurbs_surface(
+            1,
+            2,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            2,
+            3,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 0.5, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.5, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+            ],
+            None,
+        );
+        let curve = test_nurbs_curve(
+            2,
+            vec![-1.0, -1.0, -1.0, 2.0, 2.0, 2.0],
+            vec![
+                cadmpeg_ir::math::Point3::new(0.5, -1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.5, 0.5, 0.0),
+                cadmpeg_ir::math::Point3::new(0.5, 2.0, 0.0),
+            ],
+            None,
+        );
+        let resolution = super::derive_nurbs_edge_pcurve(&ctx, &surface, &curve, [0.1, 0.9])
+            .expect("isocurve lanes pair");
+        assert!(
+            matches!(resolution, super::NurbsPcurveResolution::Exact(cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(
+                            line_pcurve,
+                        )) if {
+                            let origin = line_pcurve.origin().as_raw();
+            let direction = line_pcurve.direction().as_raw();
+                            (origin.u - 0.5).abs() <= f64::EPSILON * 64.0
+                                && origin.v.abs() <= f64::EPSILON * 64.0
+                                && direction.u.abs() <= f64::EPSILON * 64.0
+                                && (direction.v - 1.0).abs() <= f64::EPSILON * 64.0
+                        })
+        );
+        let clamped = super::clamp_nurbs_curve_to_domain(&curve, [0.0, 1.0])
+            .expect("the clamped lanes are a curve")
+            .expect("clamped quadratic segment");
+        let expected = cadmpeg_ir::eval::nurbs_surface_isocurve(
+            &ctx,
+            &surface,
+            cadmpeg_ir::geometry::nurbs::SurfaceParameterAxis::U,
+            0.5,
+        )
+        .expect("build the NURBS surface isocurve")
+        .expect("quadratic surface isocurve");
+        assert!(super::nurbs_representation_matches(&expected, &clamped));
+    }
+
+    #[test]
+    fn extended_rational_isocurve_compares_weights_after_homogeneous_clamping() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .expect("test context");
+        let surface = test_nurbs_surface(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+            ],
+            Some(vec![1.0, 1.2, 1.0, 1.2]),
+        );
+        let curve = test_nurbs_curve(
+            1,
+            vec![-1.0, -1.0, 2.0, 2.0],
+            vec![
+                cadmpeg_ir::math::Point3::new(0.5, -1.5, 0.0),
+                cadmpeg_ir::math::Point3::new(0.5, 2.4 / 1.4, 0.0),
+            ],
+            Some(vec![0.8, 1.4]),
+        );
+        let resolution = super::derive_nurbs_edge_pcurve(&ctx, &surface, &curve, [0.2, 0.8])
+            .expect("isocurve lanes pair");
+        assert!(
+            matches!(resolution, super::NurbsPcurveResolution::Exact(cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(
+                            line_pcurve,
+                        )) if {
+                            let origin = line_pcurve.origin().as_raw();
+            let direction = line_pcurve.direction().as_raw();
+                            (origin.u - 0.5).abs() <= f64::EPSILON * 64.0
+                                && origin.v.abs() <= f64::EPSILON * 64.0
+                                && direction.u.abs() <= f64::EPSILON * 64.0
+                                && (direction.v - 1.0).abs() <= f64::EPSILON * 64.0
+                        })
+        );
+        let clamped = super::clamp_nurbs_curve_to_domain(&curve, [0.0, 1.0])
+            .expect("the clamped lanes are a curve")
+            .expect("clamped rational segment");
+        let expected = cadmpeg_ir::eval::nurbs_surface_isocurve(
+            &ctx,
+            &surface,
+            cadmpeg_ir::geometry::nurbs::SurfaceParameterAxis::U,
+            0.5,
+        )
+        .expect("build the NURBS surface isocurve")
+        .expect("rational surface isocurve");
+        assert!(super::nurbs_representation_matches(&expected, &clamped));
+    }
+
+    #[test]
+    fn degree_one_nurbs_cache_pcurve_keeps_measured_chordal_error() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .expect("test context");
+        let surface = test_nurbs_surface(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            3,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.5, 0.0, 1.0),
+                cadmpeg_ir::math::Point3::new(0.5, 1.0, 1.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+            ],
+            None,
+        );
+        let curve = test_nurbs_curve(
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+            ],
+            None,
+        );
+        let resolution = super::derive_nurbs_edge_pcurve(&ctx, &surface, &curve, [0.0, 1.0])
+            .expect("isocurve lanes pair");
+        let super::NurbsPcurveResolution::Cache {
+            geometry: cadmpeg_ir::geometry::pcurve::PcurveGeometry::Nurbs { nurbs },
+            fit_tolerance,
+        } = resolution
+        else {
+            panic!("degree-one cache was not accepted");
+        };
+        assert_eq!(nurbs.degree(), 1);
+        assert_eq!(nurbs.knots(), curve.knots());
+        assert_eq!(nurbs.control_points().len(), 2);
+        assert!(nurbs.weights().is_none());
+        assert!(!nurbs.periodic());
+        assert!(fit_tolerance > 0.4);
+        assert!(fit_tolerance < 0.6);
+    }
+
+    #[test]
+    fn off_surface_nurbs_edge_is_classified_before_cache_inversion() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .expect("test context");
+        let surface = test_nurbs_surface(
+            1,
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+            ],
+            None,
+        );
+        let curve = test_nurbs_curve(
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 10.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 10.0),
+            ],
+            None,
+        );
+        assert!(matches!(
+            super::derive_nurbs_edge_pcurve(&ctx, &surface, &curve, [0.0, 1.0])
+                .expect("isocurve lanes pair"),
+            super::NurbsPcurveResolution::OffSurface
+        ));
+    }
+
+    #[test]
+    fn v_linear_surface_line_has_axis_symmetric_inverse() {
+        let surface = test_nurbs_surface(
+            2,
+            1,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            3,
+            2,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.5, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.5, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+            ],
+            None,
+        );
+        let geometry = match with_test_context(|ctx| {
+            super::ruled_surface_line_pcurve(
+                ctx,
+                &surface,
+                cadmpeg_ir::geometry::nurbs::SurfaceParameterAxis::U,
+                cadmpeg_ir::math::Point3::new(0.5, 0.0, 0.0),
+                cadmpeg_ir::math::Vector3::new(0.0, 1.0, 0.0),
+            )
+        })
+        .expect("ruling evaluation")
+        {
+            super::InverseResolution::Unique(geometry) => geometry,
+            super::InverseResolution::NoMatch => panic!("transposed ruling did not match"),
+            super::InverseResolution::Ambiguous => panic!("transposed ruling was ambiguous"),
+        };
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve) = geometry else {
+            panic!("expected affine line pcurve");
+        };
+        let origin = line_pcurve.origin().as_raw();
+        let direction = line_pcurve.direction().as_raw();
+        assert!((origin.u - 0.5).abs() < 1.0e-8);
+        assert!(origin.v.abs() < 1.0e-12);
+        assert!(direction.u.abs() < 1.0e-12);
+        assert!((direction.v - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn repeated_ruled_surface_line_candidates_are_ambiguous() {
+        let surface = test_nurbs_surface(
+            1,
+            2,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            2,
+            3,
+            &[
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 1.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+            ],
+            None,
+        );
+        assert!(matches!(
+            with_test_context(|ctx| super::ruled_surface_line_pcurve(
+                ctx,
+                &surface,
+                cadmpeg_ir::geometry::nurbs::SurfaceParameterAxis::V,
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+            ))
+            .expect("ruling evaluation"),
+            super::InverseResolution::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn repeated_nurbs_endpoint_candidates_are_ambiguous() {
+        let curve = test_nurbs_curve(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(1.0, 0.0, 0.0),
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+            ],
+            None,
+        );
+        assert!(matches!(
+            with_test_context(|ctx| super::nurbs_parameter_at_point(
+                ctx,
+                &curve,
+                cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0)
+            ))
+            .expect("inverse evaluation"),
+            super::InverseResolution::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn ambiguous_cylindrical_endpoint_withholds_the_derived_pcurve() {
+        use cadmpeg_ir::annotations::AnnotationBuilder;
+        use cadmpeg_ir::geometry::{Curve, Surface};
+        use cadmpeg_ir::ids::{CurveId, EdgeId, FaceId, LoopId, PointId, SurfaceId, VertexId};
+        use cadmpeg_ir::topology::{Coedge, Edge, Face, Loop, Point, Sense, Vertex};
+
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .unwrap();
+
+        let surface_id = SurfaceId::mint("test:model:entity#surface").expect("identity grammar");
+        let curve_id = CurveId::mint("test:model:entity#curve").expect("identity grammar");
+        let loop_id = LoopId::mint("test:model:entity#loop").expect("identity grammar");
+        let edge_id = EdgeId::mint("test:model:entity#edge").expect("identity grammar");
+        let start_vertex =
+            VertexId::mint("test:model:entity#start-vertex").expect("identity grammar");
+        let end_vertex = VertexId::mint("test:model:entity#end-vertex").expect("identity grammar");
+        let start_point = PointId::mint("test:model:entity#start-point").expect("identity grammar");
+        let end_point = PointId::mint("test:model:entity#end-point").expect("identity grammar");
+        let coedge_id =
+            cadmpeg_ir::ids::CoedgeId::mint("test:model:entity#coedge").expect("identity grammar");
+        let mut brep = super::Brep {
+            surfaces: vec![Surface {
+                id: surface_id.clone(),
+                geometry: cadmpeg_ir::geometry::SurfaceGeometry::Solved(
+                    SolvedSurfaceGeometry::Cylinder(
+                        cadmpeg_ir::geometry::analytic::CylinderSurface::try_new(
+                            cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0),
+                            cadmpeg_ir::math::Vector3::new(0.0, 0.0, 1.0),
+                            cadmpeg_ir::math::Vector3::new(1.0, 0.0, 0.0),
+                            1000.0,
+                        )
+                        .unwrap(),
+                    ),
+                ),
+                source_object: None,
+            }],
+            curves: vec![Curve {
+                parameter_range: None,
+                id: curve_id.clone(),
+                geometry: cadmpeg_ir::geometry::CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(
+                    test_nurbs_curve(
+                        2,
+                        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                        vec![
+                            cadmpeg_ir::math::Point3::new(1000.0, 0.0, 0.0),
+                            cadmpeg_ir::math::Point3::new(1000.0, 0.0, 1000.0),
+                            cadmpeg_ir::math::Point3::new(1000.0, 0.0, 0.0),
+                        ],
+                        None,
+                    ),
+                )),
+                source_object: None,
+            }],
+            faces: vec![Face {
+                id: FaceId::mint("test:model:entity#face").expect("identity grammar"),
+                shell: cadmpeg_ir::ids::ShellId::mint("test:model:entity#shell")
+                    .expect("identity grammar"),
+                surface: surface_id,
+                sense: Sense::Forward,
+                loops: cadmpeg_ir::topology::FaceLoops::unspecified(vec![loop_id.clone()]),
+                name: None,
+                color: None,
+                tolerance: None,
+            }],
+            loops: vec![Loop {
+                id: loop_id.clone(),
+                face: FaceId::mint("test:model:entity#face").expect("identity grammar"),
+                boundary: cadmpeg_ir::topology::LoopBoundary::Ring(
+                    cadmpeg_ir::topology::LoopRing::new(vec![coedge_id.clone()], Vec::new())
+                        .expect("valid loop ring"),
+                ),
+            }],
+            coedges: vec![Coedge {
+                id: coedge_id,
+                owner_loop: loop_id,
+                edge: edge_id.clone(),
+                radial_next: cadmpeg_ir::ids::CoedgeId::mint("test:model:entity#coedge")
+                    .expect("identity grammar"),
+                sense: Sense::Forward,
+                pcurves: Vec::new(),
+                use_curve: None,
+            }],
+            edges: vec![Edge {
+                id: edge_id,
+                carrier: cadmpeg_ir::topology::EdgeCarrier::unbounded(Some(curve_id)),
+                start: start_vertex.clone(),
+                end: end_vertex.clone(),
+                tolerance: None,
+            }],
+            vertices: vec![
+                Vertex {
+                    id: start_vertex,
+                    point: start_point.clone(),
+                    tolerance: None,
+                },
+                Vertex {
+                    id: end_vertex,
+                    point: end_point.clone(),
+                    tolerance: None,
+                },
+            ],
+            points: vec![
+                Point::new(
+                    start_point,
+                    cadmpeg_ir::features::FinitePoint3::new(cadmpeg_ir::math::Point3::new(
+                        1000.0, 0.0, 0.0,
+                    ))
+                    .expect("a finite position is a point"),
+                    None,
+                ),
+                Point::new(
+                    end_point,
+                    cadmpeg_ir::features::FinitePoint3::new(cadmpeg_ir::math::Point3::new(
+                        1000.0, 0.0, 0.0,
+                    ))
+                    .expect("a finite position is a point"),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut annotations = AnnotationBuilder::new();
+        let source_stream =
+            cadmpeg_ir::annotations::StreamHandle::new(cadmpeg_ir::stream_name!("test"));
+        super::derive_cylindrical_pcurves(&ctx, &mut brep, &mut annotations, &source_stream)
+            .expect("cylindrical pcurve derivation");
+
+        assert!(brep.pcurves.is_empty());
+        assert_eq!(brep.stats.ambiguous_pcurve_parameters, 1);
+    }
+}
+
+#[cfg(test)]
+mod curve_orientation_tests;
+
+#[cfg(test)]
+mod cylindrical_pcurve_tests;
+
+#[cfg(test)]
+mod numerical_range_tests;
+
+#[cfg(test)]
+mod nurbs_subset_evaluation_tests;
+
+#[cfg(test)]
+mod partition_framing_tests;
+
+#[cfg(test)]
+mod periodic_seam_tests;
+#[cfg(test)]
+mod tolerant_edge_tests;
+
+#[cfg(test)]
+mod vertex_loop_tests;
+
+#[cfg(test)]
+mod ownership_loss_tests;
+
+#[cfg(test)]
+mod edge_free_tests;
+
+#[cfg(test)]
+mod offset_support_tests;
+
+#[cfg(test)]
+mod approximation_loss_tests;
+
+/// Standalone XT must have a complete schema-framed node graph; legacy byte
+/// probes for embedded host streams are not an admission path for these files.
+pub(crate) fn standalone_node_graph_supported(payload: &[u8], offset: usize) -> bool {
+    let Some(records) = topology::nodes::sequence(payload) else { return false; };
+    topology::nodes::tables(&records, payload, offset).is_some()
+        && typed::nodes::facts(&records, offset).is_some()
+}
+
+/// Check each source topology identity so derived seam entities cannot mask a
+/// dropped source loop, edge, vertex, or bounded FIN.
+pub(crate) fn standalone_topology_complete(
+    records: &cadmpeg_parasolid::records::PrimaryRecords<'_>,
+    brep: &Brep,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let loops: HashSet<_> = brep.loops.iter().map(|v| &v.id).collect();
+    let edges: HashSet<_> = brep.edges.iter().map(|v| &v.id).collect();
+    let vertices: HashSet<_> = brep.vertices.iter().map(|v| &v.id).collect();
+    let coedges: HashSet<_> = brep.coedges.iter().map(|v| &v.id).collect();
+    for node in records.nodes() {
+        let transferred = match node.kind() {
+            15 => loops.contains(&id_loop(node.index()))
+                || brep.merged_source_loops.contains(&id_loop(node.index())),
+            16 => edges.contains(&id_edge(node.index())),
+            18 => vertices.contains(&id_vertex(node.index())),
+            17 if node.pointer("loop").is_some_and(|p| p > 1)
+                && node.pointer("edge").is_some_and(|p| p > 1) => {
+                coedges.contains(&id_coedge(node.index()))
+            }
+            _ => true,
+        };
+        if !transferred {
+            return Err(cadmpeg_core::CodecError::NotImplemented(format!(
+                "Parasolid topology node type {} identity {} was not transferred",
+                node.kind(), node.index(),
+            )));
+        }
+    }
+    Ok(())
+}
+

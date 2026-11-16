@@ -44,7 +44,7 @@ impl TestGate {
     }
 }
 
-type Indexes = HashMap<usize, (Arc<Mesh>, Option<Arc<MeshIndex>>)>;
+type Indexes = HashMap<(usize, bool), (Arc<Mesh>, Option<Arc<MeshIndex>>)>;
 
 /// Meshes up to this many triangles and edge points get their index at once (it takes well under
 /// a millisecond); larger ones on a worker.
@@ -54,12 +54,49 @@ const AT_ONCE: usize = 20_000;
 impl PickIndexes {
     /// The index of `mesh`, or `None` while it is being made (the caller scans the mesh).
     pub(crate) fn of(&self, mesh: &Arc<Mesh>) -> Option<Arc<MeshIndex>> {
-        let key = Arc::as_ptr(mesh) as usize;
-        let Ok(mut map) = self.0.lock() else { return Some(Arc::new(MeshIndex::new(mesh))) };
+        self.lookup(mesh, false)
+    }
+
+    pub(crate) fn for_edges(&self, mesh: &Arc<Mesh>) -> Option<Arc<MeshIndex>> {
+        self.lookup(mesh, mesh.display_only_edges)
+    }
+
+    /// Let a large scan start indexing its faces during the first draw; do not spin up a
+    /// worker per part when an entire assembly appears. Other bodies index on demand.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn warm_scan(&self, mesh: &Arc<Mesh>) {
+        let key = (Arc::as_ptr(mesh) as usize, false);
+        if mesh.triangles.len() > AT_ONCE
+            && self.0.lock().is_ok_and(|map| !map.contains_key(&key) && map.values().filter(|(_, i)| i.is_none()).take(2).count() < 2)
+        {
+            let _ = self.of(mesh);
+        }
+    }
+
+    fn lookup(&self, mesh: &Arc<Mesh>, edges_only: bool) -> Option<Arc<MeshIndex>> {
+        let make = move |m: &Mesh| {
+            if edges_only {
+                MeshIndex::edges(m)
+            } else if m.display_only_edges {
+                MeshIndex::faces(m)
+            } else {
+                MeshIndex::new(m)
+            }
+        };
+        let key = (Arc::as_ptr(mesh) as usize, edges_only);
+        let Ok(mut map) = self.0.lock() else { return Some(Arc::new(make(mesh))) };
         if let Some((_, index)) = map.get(&key) {
             return index.clone();
         }
-        let size = mesh.triangles.len() + mesh.edges.iter().map(Vec::len).sum::<usize>();
+        let size = if edges_only && mesh.edges.len() > AT_ONCE {
+            mesh.edges.len()
+        } else if edges_only {
+            mesh.edges.iter().map(Vec::len).sum()
+        } else if mesh.display_only_edges || mesh.triangles.len() > AT_ONCE {
+            mesh.triangles.len()
+        } else {
+            mesh.triangles.len() + mesh.edges.iter().map(Vec::len).sum::<usize>()
+        };
         #[cfg(not(target_arch = "wasm32"))]
         if size > AT_ONCE {
             map.insert(key, (mesh.clone(), None));
@@ -69,7 +106,7 @@ impl PickIndexes {
             let started = std::thread::Builder::new().name("pick-index".into()).spawn(move || {
                 #[cfg(test)]
                 gate.wait_open();
-                let index = Arc::new(MeshIndex::new(&source));
+                let index = Arc::new(make(&source));
                 if let Ok(mut map) = indexes.lock()
                     && let Some(slot) = map.get_mut(&key)
                 {
@@ -81,7 +118,7 @@ impl PickIndexes {
             }
         }
         let _ = size;
-        let index = Arc::new(MeshIndex::new(mesh));
+        let index = Arc::new(make(mesh));
         map.insert(key, (mesh.clone(), Some(index.clone())));
         Some(index)
     }
@@ -89,7 +126,7 @@ impl PickIndexes {
     /// Drops the indexes of meshes `keep` no longer names (a new model state).
     pub(crate) fn retain(&self, keep: impl Fn(usize) -> bool) {
         if let Ok(mut map) = self.0.lock() {
-            map.retain(|k, _| keep(*k));
+            map.retain(|(k, _), _| keep(*k));
         }
     }
 

@@ -142,6 +142,8 @@ pub enum ButtonKey {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ButtonJob {
+    /// Explicitly unassigned; retain the row so it can be configured before the next press.
+    Disabled,
     /// Opens Preferences at Navigation, where the 3D mouse's settings are.
     Settings,
     /// A view as `SolveApp::animate_view` takes it: `fit`, `home` or a standard view (`top`, …).
@@ -233,7 +235,7 @@ pub fn buttons_hook(app: &mut SolveApp, ctx: &egui::Context, seen: Buttons, raw:
     let buttons = seen.down;
     let pressed = (buttons & !app.space_mouse.buttons) | seen.taps;
     app.space_mouse.buttons = buttons;
-    app.space_mouse.seen |= buttons;
+    app.space_mouse.seen |= buttons | seen.taps;
     // The keyboard's own modifiers, from what the window was told before anything is added to it.
     // egui drops its modifiers when the window loses focus, so those go too.
     let mut focused = ctx.input(|i| i.focused);
@@ -306,6 +308,7 @@ pub fn buttons_hook(app: &mut SolveApp, ctx: &egui::Context, seen: Buttons, raw:
 // down, because `buttons_hook` adds them to every key event of the frame after all the jobs have run.
 fn run_button_job(app: &mut SolveApp, job: &ButtonJob, modifiers: egui::Modifiers, raw: &mut egui::RawInput) {
     match job {
+        ButtonJob::Disabled => {}
         // Navigation, where the 3D mouse's section is.
         ButtonJob::Settings => crate::prefs::open_at(app, crate::prefs::PAGE_MOUSE3D),
         ButtonJob::View(view) => app.animate_view(view),
@@ -316,7 +319,9 @@ fn run_button_job(app: &mut SolveApp, job: &ButtonJob, modifiers: egui::Modifier
         }
         ButtonJob::Key(_) => {}
         ButtonJob::Command(id) => {
-            if solidcraft_engine::find_command(id).is_some_and(|c| c.info(&app.session).enabled) {
+            if solidcraft_engine::panels::ContextualPanelAction::from_command_id(id).is_none()
+                && solidcraft_engine::find_command(id).is_some_and(|c| crate::render_workspace::interactive_command_info(app, c).enabled)
+            {
                 app.start(id);
             }
         }
@@ -850,6 +855,25 @@ mod tests {
         assert!(app.session.undo.is_empty(), "a view setting, not an edit");
     }
 
+    #[test]
+    fn wireless_button_mappings_are_independent_and_an_unassigned_button_does_nothing() {
+        let mut app = app();
+        let device = "hid 256f:c652";
+        app.space_mouse.device = Some(device.into());
+        app.preferences
+            .space_mouse_buttons
+            .insert(device.into(), [(1, ButtonJob::Disabled), (2, ButtonJob::Command("view.perspective".into()))].into());
+        let ctx = window(true);
+        let before = app.ui.perspective;
+        press(&mut app, &ctx, 0b01, vec![]);
+        assert_eq!(app.ui.perspective, before);
+        press(&mut app, &ctx, 0b11, vec![]);
+        assert_eq!(app.ui.perspective, !before);
+        press(&mut app, &ctx, 0b11, vec![]);
+        assert_eq!(app.ui.perspective, !before, "holding both buttons must not repeat a command");
+        assert!(app.session.undo.is_empty());
+    }
+
     /// The keyboard and a button hold the same modifier: it stays down until both let go, whichever
     /// lets go first, for each of Shift, Ctrl and Alt.
     #[test]
@@ -913,6 +937,7 @@ mod tests {
         let tap = Buttons { device: Some("hid 046d:c62b".into()), down: 0, taps: ESC, pending: false, generation: 0 };
         assert_eq!(escapes(&press_seen(&mut app, &ctx, tap)), 1);
         assert_eq!(app.space_mouse.buttons, 0);
+        assert_ne!(app.space_mouse.seen & ESC, 0, "a quick tap must reveal its mapping row in Preferences");
         let nothing = Buttons { device: Some("hid 046d:c62b".into()), down: 0, taps: 0, pending: false, generation: 0 };
         assert_eq!(escapes(&press_seen(&mut app, &ctx, nothing)), 0, "and not again");
     }

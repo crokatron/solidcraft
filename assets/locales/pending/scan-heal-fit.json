@@ -1,0 +1,10 @@
+{
+  "en": {
+    "cmd.mesh.heal_scan": "Heal Scan",
+    "help.mesh.heal_scan": "Weld coincident vertices, remove duplicate and degenerate facets, correct inconsistent winding and patch simple planar openings up to 32 edges. Review the repair report and undo the operation as a single edit.",
+    "cmd.mesh.fit_region_plane": "Fit Region Plane",
+    "help.mesh.fit_region_plane": "Pick a triangle to grow a region by normal angle and fit a construction plane to its surface. The report shows the RMS and maximum distances from the scan to the fitted plane.",
+    "cmd.mesh.fit_region_cylinder": "Fit Region Cylinder",
+    "help.mesh.fit_region_cylinder": "Pick a cylindrical side patch to fit a solid cylinder. Adjust the region angle to include more of the side. Review its radius, height and radial error."
+  }
+}

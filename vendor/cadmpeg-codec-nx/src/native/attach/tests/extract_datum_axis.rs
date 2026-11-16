@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::native::attach::feature_projection::non_boolean_feature_definition;
+use cadmpeg_ir::features::{FeatureDefinition, FeatureOperation, UnresolvedFamily};
+
+#[test]
+fn nx_extract_datum_axis_retains_unresolved_axis_family() {
+    for kind in ["DATUM_AXIS", "EXTRACT_DATUM_AXIS"] {
+        let definition = non_boolean_feature_definition(kind, &[], None, None, None);
+
+        assert_eq!(
+            definition,
+            FeatureDefinition::Operation(FeatureOperation::Unresolved {
+                family: UnresolvedFamily::DatumAxis
+            })
+        );
+        assert_eq!(definition.body_output_family(), None);
+    }
+}

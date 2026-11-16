@@ -521,6 +521,7 @@ pub(super) fn geometry_preview(document: &[u8], model: &SavedModel) -> Result<De
             return Err(invalid("regenerated display budget"));
         }
         let displayed = MeshData {
+            appearance: None,
             name: entry.name.clone(),
             positions: positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
             triangles: faces.iter().flatten().copied().collect(),

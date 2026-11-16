@@ -898,3 +898,287 @@ fn a_click_on_an_arrow_puts_the_box_on_its_axis() {
         assert_eq!((x.as_str(), y.as_str(), z.as_str()), ("0 mm", "0 mm", "0 mm"), "a click moves nothing");
     }
 }
+
+#[test]
+fn handles_only_repositions_and_reorients_without_moving_bodies() {
+    let mut h = move_triad_fixture();
+    let before = h.app.session.doc.to_json();
+    let mut d = h.app.dialog.take().unwrap();
+    set_handles_only(&h.app, &mut d, true);
+    if let Kind::Move { x, rz, .. } = &mut d.kind {
+        *x = "7 mm".into();
+        *rz = "90 deg".into();
+    }
+    assert!(is_identity(&transform(&h.app, &params(&h.app, &d).unwrap()).unwrap()));
+    let positioned = shown_handle_frame(&h.app, &d).unwrap();
+    assert!((crate::move_handles::axes(&positioned)[0] - Vec3::Y).len() < 1e-10);
+    set_handles_only(&h.app, &mut d, false);
+    assert!(is_identity(&transform(&h.app, &params(&h.app, &d).unwrap()).unwrap()), "unchecking must not move the body");
+    assert_eq!(h.app.session.doc.to_json(), before);
+    drag(&h.app, &mut d, Drag { handle: gizmo::Handle::Axis(0), change: Change::Translate(Vec3::Y * 5.), started: true, done: true });
+    let delta = transform(&h.app, &params(&h.app, &d).unwrap()).unwrap();
+    assert!((apply_point(&delta, Vec3::ZERO) - Vec3::Y * 5.).len() < 1e-9, "local X follows oriented handles");
+    h.app.dialog = Some(d);
+}
+
+#[test]
+fn body_csys_alignment_preserves_roll_and_composes_pending_move_once() {
+    for angle in [0.7345293, std::f64::consts::PI] {
+        let h = move_triad_fixture();
+        let mut d = h.app.dialog.clone().unwrap();
+        if let Kind::Move { x, .. } = &mut d.kind {
+            *x = "4 mm".into();
+        }
+        set_handles_only(&h.app, &mut d, true);
+        let source = rigid(Vec3::new(17., -9., 4.), Vec3::ZERO, Vec3::new(1., 2., 3.), 0.32);
+        set_handle_frame(&h.app, &mut d, source);
+        set_handles_only(&h.app, &mut d, false);
+        let target = rigid(Vec3::new(-3., 11., 29.), Vec3::ZERO, Vec3::new(-2., 1., 3.), angle);
+        align_handle_frame(&h.app, &mut d, target).unwrap();
+        let expected = mat_mul(&solidcraft_engine::origins::frame_delta(&source, &target).unwrap(), &rigid(Vec3::X * 4., Vec3::ZERO, Vec3::Z, 0.));
+        let actual = transform(&h.app, &params(&h.app, &d).unwrap()).unwrap();
+        for (a, b) in actual.iter().flatten().zip(expected.iter().flatten()) {
+            assert!((a - b).abs() < 1e-9, "{actual:?} != {expected:?}");
+        }
+    }
+}
+
+#[test]
+fn rotation_about_positioned_body_handles_keeps_the_pivot_fixed() {
+    let h = move_triad_fixture();
+    let mut d = h.app.dialog.clone().unwrap();
+    set_handles_only(&h.app, &mut d, true);
+    let source = rigid(Vec3::new(15., 4., -9.), Vec3::ZERO, Vec3::Z, 0.73);
+    set_handle_frame(&h.app, &mut d, source);
+    set_handles_only(&h.app, &mut d, false);
+    if let Kind::Move { rx, .. } = &mut d.kind {
+        *rx = "37 deg".into();
+    }
+    let moved = transform(&h.app, &params(&h.app, &d).unwrap()).unwrap();
+    let pivot = crate::move_handles::origin(&source);
+    assert!((apply_point(&moved, pivot) - pivot).len() < 1e-10);
+    assert!((apply_point(&moved, pivot + crate::move_handles::axes(&source)[0]) - (pivot + crate::move_handles::axes(&source)[0])).len() < 1e-10);
+}
+
+fn wait_move_confirmation(h: &mut crate::scenario::Harness) {
+    for _ in 0..1000 {
+        h.frames(1);
+        if h.app.applying.is_none() {
+            h.frames(2);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("move confirmation did not finish");
+}
+
+#[test]
+fn handle_only_ok_apply_and_cancel_do_not_create_identity_features() {
+    for action in ["Apply", "OK", "Cancel"] {
+        let mut h = move_triad_fixture();
+        let before = h.app.session.doc.to_json();
+        h.step(&json!({"click":{"handle":"move:handles_only"}})).unwrap();
+        h.frames(2);
+        {
+            let d = h.app.dialog.as_mut().unwrap();
+            if let Kind::Move { x, rz, .. } = &mut d.kind {
+                *x = "12 mm".into();
+                *rz = "60 deg".into();
+            }
+        }
+        h.frames(2);
+        h.step(&json!({"click":{"handle":format!("dialog:{action}")}})).unwrap();
+        wait_move_confirmation(&mut h);
+        assert_eq!(h.app.session.doc.to_json(), before, "handle-only {action} must not create geometry or history");
+        assert_eq!(h.app.dialog.is_some(), action == "Apply");
+    }
+}
+
+#[test]
+fn remembered_handle_only_apply_is_noop_and_oriented_drag_retains_distance() {
+    let mut h = move_triad_fixture();
+    let before = h.app.session.doc.to_json();
+    h.app.dialog.as_mut().unwrap().extra.insert("handles_only".into(), json!(true));
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"dialog:Apply"}})).unwrap();
+    wait_move_confirmation(&mut h);
+    assert_eq!(h.app.session.doc.to_json(), before);
+    assert!(h.app.dialog.is_some());
+    let mut h = move_triad_fixture();
+    let mut d = h.app.dialog.take().unwrap();
+    set_handles_only(&h.app, &mut d, true);
+    set_handles_only(&h.app, &mut d, false);
+    drag(&h.app, &mut d, Drag { handle: gizmo::Handle::Axis(0), change: Change::Translate(Vec3::X * 5.), started: true, done: true });
+    let Kind::Move { x, .. } = &d.kind else { panic!("move") };
+    assert_eq!(len(&h.app, x).unwrap(), 5.);
+}
+
+#[test]
+fn geometry_snap_rows_position_handles_then_move_body_about_snapped_origin() {
+    let mut h = move_triad_fixture();
+    let before = h.app.session.doc.to_json();
+    h.step(&json!({"click":{"handle":"move:handles_only"}})).unwrap();
+    h.frames(2);
+    let pick = |h: &mut crate::scenario::Harness, handle: &str, point: [f64; 3], direction: Option<[f64; 3]>| {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+        h.frames(1);
+        crate::move_handle_snap::accept(
+            &h.ctx,
+            &solidcraft_engine::geometry_snap::GeometrySnap { point, direction, label: "exact test target".into() },
+        );
+        h.frames(3);
+    };
+    pick(&mut h, "move-snap:origin", [12., 7., 3.], None);
+    pick(&mut h, "move-snap:axis:0", [0.; 3], Some([0., 1., 0.]));
+    let d = h.app.dialog.as_ref().unwrap();
+    assert!(is_identity(&transform(&h.app, &params(&h.app, d).unwrap()).unwrap()));
+    assert_eq!(h.app.session.doc.to_json(), before);
+    let t = triad(&h.app, d).unwrap();
+    assert!((t.center - Vec3::new(12., 7., 3.)).len() < 1e-9);
+    assert!((t.axes[0] - Vec3::Y).len() < 1e-9);
+    h.step(&json!({"click":{"handle":"move:handles_only"}})).unwrap();
+    h.frames(2);
+    pick(&mut h, "move-snap:origin", [22., 7., 3.], None);
+    let d = h.app.dialog.as_ref().unwrap();
+    let translated = transform(&h.app, &params(&h.app, d).unwrap()).unwrap();
+    assert!((apply_point(&translated, Vec3::ZERO) - Vec3::X * 10.).len() < 1e-9);
+    pick(&mut h, "move-snap:axis:0", [0.; 3], Some([0., 0., 1.]));
+    let d = h.app.dialog.as_ref().unwrap();
+    let rotation = mat_mul(&transform(&h.app, &params(&h.app, d).unwrap()).unwrap(), &mat_inverse(&translated).unwrap());
+    let pivot = Vec3::new(22., 7., 3.);
+    assert!((apply_point(&rotation, pivot) - pivot).len() < 1e-9);
+}
+
+#[test]
+fn geometry_snap_picks_body_at_its_pending_preview_position() {
+    let mut h = move_triad_fixture();
+    h.app.home.open = false;
+    h.app.cam.distance = 200.;
+    if let Kind::Move { x, y, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *x = "30 mm".into();
+        *y = "30 mm".into();
+    }
+    h.frames(3);
+    h.step(&json!({"click":{"handle":"move:handles_only"}})).unwrap();
+    h.frames(3);
+    h.step(&json!({"click":{"handle":"move-snap:origin"}})).unwrap();
+    h.frames(1);
+    h.step(&json!({"click":{"world":[50.,60.,10.]}})).unwrap();
+    h.frames(3);
+    let t = triad(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert!((t.center - Vec3::new(50., 60., 10.)).len() < 1e-7, "preview vertex snap {:?}", t.center);
+}
+
+#[test]
+fn body_axis_handle_click_aligns_planar_face_even_in_center_snap_mode() {
+    let mut h = move_triad_fixture();
+    h.app.home.open = false;
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"corner":[50,40,0]})).unwrap();
+    h.call("ui.camera", json!({"target":[30,20,5],"distance":180,"yaw":0.7,"pitch":0.5,"roll":0}));
+    h.frames(3);
+    for handle in ["move:handles_only", "move-snap:mode"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+        h.frames(2);
+    }
+    h.step(&json!({"widget":"Circle / face center"})).unwrap();
+    h.frames(2);
+    let before = h.app.session.doc.to_json();
+    let origin = triad(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().center;
+    h.step(&json!({"click":{"handle":"move_x"}})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click":{"world":[55.,45.,10.]}})).unwrap();
+    h.frames(3);
+    let t = triad(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert!((t.axes[0] - Vec3::Z).len() < 1e-8, "selected X aligns with the planar face normal: {:?}", t.axes);
+    assert!((t.center - origin).len() < 1e-8);
+    assert_eq!(h.app.session.doc.to_json(), before);
+}
+
+#[test]
+fn body_face_center_mode_survives_handles_only_toggle() {
+    let mut h = move_triad_fixture();
+    h.app.home.open = false;
+    h.app.run("solid.cylinder", json!({"diameter":10,"height":20,"base":[50,40,0]})).unwrap();
+    h.app.cam.distance = 180.;
+    h.frames(3);
+    for handle in ["move:handles_only", "move-snap:mode"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+        h.frames(2);
+    }
+    h.step(&json!({"widget":"Circle / face center"})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click":{"world":[55.,40.,10.]}})).unwrap();
+    h.frames(3);
+    let t = triad(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert!((t.center - Vec3::new(50., 40., 10.)).len() < 1e-8);
+    for handle in ["move:handles_only", "move-snap:origin"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+        h.frames(2);
+    }
+    h.step(&json!({"click":{"world":[55.,40.,10.]}})).unwrap();
+    h.frames(3);
+    let d = h.app.dialog.as_ref().unwrap();
+    assert!(is_identity(&transform(&h.app, &params(&h.app, d).unwrap()).unwrap()), "same face centre must not move the body after toggling");
+}
+
+#[test]
+fn body_automatic_hover_midpoint_marker_is_clickable_without_mode_change() {
+    let mut h = move_triad_fixture();
+    h.app.home.open = false;
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"corner":[50,40,0]})).unwrap();
+    h.app.cam.distance = 180.;
+    h.frames(3);
+    h.step(&json!({"click":{"handle":"move:handles_only"}})).unwrap();
+    h.frames(2);
+    let before = h.app.session.doc.to_json();
+    h.step(&json!({"move":{"world":[53.,50.,10.]}})).unwrap();
+    h.frames(12);
+    let projected = h.call("ui.worldToScreen", json!({"points":[[55.,50.,10.]]}));
+    let target = &projected["result"][0];
+    let handles = h.call("ui.handles", json!({"prefix":"move-snap:candidate:"}));
+    assert!(
+        handles["result"].as_array().unwrap().iter().any(|handle| {
+            (handle["x"].as_f64().unwrap() - target[0].as_f64().unwrap()).hypot(handle["y"].as_f64().unwrap() - target[1].as_f64().unwrap()) < 2.
+        }),
+        "edge midpoint must be shown before a click"
+    );
+    assert_eq!(h.app.session.doc.to_json(), before);
+    h.step(&json!({"click":{"world":[55.,50.,10.]}})).unwrap();
+    h.frames(3);
+    let d = h.app.dialog.as_ref().unwrap();
+    let t = triad(&h.app, d).unwrap();
+    assert!((t.center - Vec3::new(55., 50., 10.)).len() < 1e-8);
+    assert!(is_identity(&transform(&h.app, &params(&h.app, d).unwrap()).unwrap()));
+    assert_eq!(h.app.session.doc.to_json(), before);
+}
+
+#[test]
+fn body_inferred_face_target_stays_clickable_beside_numeric_move_box() {
+    let mut h = move_triad_fixture();
+    h.app.home.open = false;
+    h.call("ui.resize", json!({"width":3072,"height":1690}));
+    h.app.run("solid.cylinder", json!({"diameter":10,"height":20,"base":[60,35,0]})).unwrap();
+    h.app.run("solid.cone", json!({"radius":8,"top_radius":2,"height":20,"base":[85,35,0]})).unwrap();
+    h.call("ui.camera", json!({"target":[35,20,5],"distance":210,"yaw":0.7,"pitch":0.5,"roll":0}));
+    h.frames(3);
+    h.step(&json!({"click":{"handle":"move:handles_only"}})).unwrap();
+    h.frames(2);
+    h.step(&json!({"move":{"world":[65.,35.,20.]}})).unwrap();
+    h.frames(12);
+    h.step(&json!({"click":{"world":[60.,35.,20.]}})).unwrap();
+    h.frames(3);
+    let first = triad(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert!((first.center - Vec3::new(60., 35., 20.)).len() < 1e-8, "circle centre must be inferred first");
+    h.step(&json!({"click":{"handle":"move:handles_only"}})).unwrap();
+    h.frames(2);
+    h.step(&json!({"move":{"world":[90.,35.,10.]}})).unwrap();
+    h.frames(12);
+    h.step(&json!({"click":{"world":[85.,35.,10.]}})).unwrap();
+    h.frames(3);
+    let d = h.app.dialog.as_ref().unwrap();
+    let moved = transform(&h.app, &params(&h.app, d).unwrap()).unwrap();
+    assert!(
+        (apply_point(&moved, Vec3::ZERO) - Vec3::new(25., 0., -10.)).len() < 1e-8,
+        "numeric canvas box must not intercept the inferred cone-centre click"
+    );
+}

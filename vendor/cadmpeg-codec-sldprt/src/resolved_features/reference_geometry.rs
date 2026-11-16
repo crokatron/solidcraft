@@ -1,0 +1,2997 @@
+//! Reference-plane, reference-axis, reference-point, and coordinate-system geometry.
+
+use super::compact_reference_planes::principal_sketch_frame;
+use super::curves::{
+    sketch_plane_frames, SketchPlaneUAxisSource, CONSTRUCTED_MID_PLANE_U_AXIS_SOURCE,
+    REFERENCE_PLANE_U_AXIS_SOURCE_PROPERTY,
+};
+use super::scalars::FeatureObjectNames;
+use super::selections::{
+    compact_component_path_end_at, component_face_reference_in_record, COMPACT_EDGE_VECTOR_MARKER,
+};
+use super::{is_class_token, CLASS_MARKER, NAME_MARKER};
+use crate::classification::{
+    classify, native_object_class, principal_plane_with_siblings, FeatureClass, NativeClassKind,
+};
+use crate::records::{FeatureInputLane, FeatureInputName};
+use cadmpeg_core::decode::{DecodeContext, View};
+use cadmpeg_core::CodecError;
+use cadmpeg_ir::math::{Point3, Vector3};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use crate::layout::constructed_reference_plane_fixed_frame as fixed_plane;
+use crate::layout::constructed_reference_plane_matrix_frame as matrix_plane;
+use crate::layout::coordinate_system_component_path_prefix as cs_path_pre;
+use crate::layout::coordinate_system_component_path_suffix as cs_path_suf;
+use crate::layout::coordinate_system_component_point as cs_pt;
+use crate::layout::coordinate_system_endpoint_path_prefix as ep_path_pre;
+use crate::layout::coordinate_system_endpoint_path_suffix as ep_path_suf;
+use crate::layout::coordinate_system_extended_component_point as cs_ext;
+use crate::layout::coordinate_system_line_axis as line_axis;
+use crate::layout::coordinate_system_ordinal_axis_tail as ordinal_tail;
+use crate::layout::coordinate_system_two_point_separator as two_pt_sep;
+use crate::layout::coordinate_system_two_point_tail as two_pt_tail;
+use crate::layout::coordinate_system_xy_tail as xy_tail;
+use crate::layout::reference_point_long_solved_cache as pt_long;
+use crate::layout::reference_point_short_solved_cache as pt_short;
+use crate::records::ObjectId;
+use cadmpeg_core::decode::{index_from_u64, u64_from_index};
+
+const EPS_REFERENCE_GEOMETRY_RECONCILE_REFERENCE_PLANE_FRAME_WITH_SOURCE_E9: f64 = 1e-9;
+const EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_TWO_POINT_FRAME_E9: f64 = 1e-9;
+const EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_LINE_AXES_E12: f64 = 1e-12;
+const EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_LINE_AXES_E9: f64 = 1e-9;
+const EPS_REFERENCE_GEOMETRY_OFFSET_PLANE_REFERENCE_FRAME_MATCHES_E9: f64 = 1e-9;
+const EPS_REFERENCE_GEOMETRY_OFFSET_PLANE_REFERENCE_FRAME_MATCHES_E8: f64 = 1e-8;
+const EPS_REFERENCE_GEOMETRY_COMPLETE_REFERENCE_AXIS_TRIAD_E12: f64 = 1e-12;
+const EPS_REFERENCE_GEOMETRY_EXPLICIT_REFERENCE_AXIS_FRAME_E12: f64 = 1e-12;
+const EPS_REFERENCE_GEOMETRY_CONSTRAINT_MIDPLANE_FRAME_E9: f64 = 1e-9;
+const EPS_REFERENCE_GEOMETRY_ANGLED_REFERENCE_PLANE_FRAME_E9: f64 = 1e-9;
+const EPS_REFERENCE_GEOMETRY_MATRIX_REFERENCE_PLANE_FRAME_CANDIDATES_E9: f64 = 1e-9;
+const EPS_REFERENCE_GEOMETRY_COMPACT_REFERENCE_PLANE_FRAME_E9: f64 = 1e-9;
+
+fn reconcile_reference_plane_frame_with_source(
+    explicit: Option<(Point3, Vector3, Vector3)>,
+    constraint: Option<(Point3, Vector3, Vector3)>,
+) -> Option<((Point3, Vector3, Vector3), SketchPlaneUAxisSource)> {
+    let (Some(explicit), Some(constraint)) = (explicit, constraint) else {
+        return explicit
+            .map(|frame| (frame, SketchPlaneUAxisSource::Native))
+            .or_else(|| {
+                constraint.map(|frame| (frame, SketchPlaneUAxisSource::ConstructedMidPlane))
+            });
+    };
+    let explicit_distance =
+        explicit.1.x * explicit.0.x + explicit.1.y * explicit.0.y + explicit.1.z * explicit.0.z;
+    let alignment = explicit.1.x * constraint.1.x
+        + explicit.1.y * constraint.1.y
+        + explicit.1.z * constraint.1.z;
+    let constraint_distance = constraint.1.x * constraint.0.x
+        + constraint.1.y * constraint.0.y
+        + constraint.1.z * constraint.0.z;
+    if (alignment.abs() - 1.0).abs()
+        <= EPS_REFERENCE_GEOMETRY_RECONCILE_REFERENCE_PLANE_FRAME_WITH_SOURCE_E9
+        && (explicit_distance - alignment.signum() * constraint_distance).abs()
+            <= EPS_REFERENCE_GEOMETRY_RECONCILE_REFERENCE_PLANE_FRAME_WITH_SOURCE_E9
+    {
+        Some((explicit, SketchPlaneUAxisSource::Native))
+    } else {
+        Some((constraint, SketchPlaneUAxisSource::ConstructedMidPlane))
+    }
+}
+
+fn plane_frame_source(feature: &crate::records::Feature) -> String {
+    match feature.source_id {
+        Some(crate::records::FeatureSource::Reserved) => "-1".to_owned(),
+        Some(crate::records::FeatureSource::Id(id)) => id.value().to_string(),
+        None => feature.id.clone(),
+    }
+}
+
+/// Add validated reference-plane frames to a projection copy of history.
+pub(crate) fn enrich_history_reference_planes(
+    ctx: &DecodeContext<'_>,
+    histories: &mut [crate::records::FeatureHistory],
+    lanes: &[FeatureInputLane],
+) -> Result<(), CodecError> {
+    let mut candidates = BTreeMap::<(usize, usize), Vec<(Point3, Vector3, Vector3)>>::new();
+    let mut candidate_sources = BTreeMap::<(usize, usize), Vec<SketchPlaneUAxisSource>>::new();
+    let mut reference_candidates = BTreeMap::<(usize, usize), Vec<String>>::new();
+    let mut reference_frame_candidates =
+        BTreeMap::<(usize, usize), Vec<(Point3, Vector3, Vector3)>>::new();
+    let mut explicit_reference_indices = HashSet::new();
+    let mut face_feature_candidates = BTreeMap::<(usize, usize), Vec<String>>::new();
+    let mut face_native_candidates = BTreeMap::<(usize, usize), Vec<String>>::new();
+    let mut known_sources = Vec::new();
+    let mut features_by_source = Vec::new();
+    let mut known_reference_plane_sources = Vec::new();
+    for history in histories.iter() {
+        let mut sources = HashSet::new();
+        let mut by_source = HashMap::new();
+        let mut reference_sources = HashSet::new();
+        for (index, feature) in history.features.iter().enumerate() {
+            let Some(source) = feature.source_value() else {
+                continue;
+            };
+            sources.insert(source);
+            by_source.insert(source, index);
+            if classify(feature) == Some(FeatureClass::ReferencePlane) {
+                reference_sources.insert(source);
+            }
+        }
+        known_sources.push(sources);
+        features_by_source.push(by_source);
+        known_reference_plane_sources.push(reference_sources);
+    }
+    for lane in lanes {
+        let names = FeatureObjectNames::new(&lane.names);
+        let mut starts = Vec::new();
+        for (history_index, history) in histories.iter().enumerate() {
+            for (feature_index, feature) in history.features.iter().enumerate() {
+                if let Some(name) = names.of(feature) {
+                    starts.push((name.offset, history_index, feature_index));
+                }
+            }
+        }
+        starts.sort_by_key(|left| left.0);
+        for (index, &(start, history_index, feature_index)) in starts.iter().enumerate() {
+            let feature = &histories[history_index].features[feature_index];
+            if classify(feature) != Some(FeatureClass::ReferencePlane)
+                || principal_plane_with_siblings(feature, &histories[history_index].features)
+                    .is_some()
+                || feature.properties.contains_key("Origin")
+                || feature.properties.contains_key("Normal")
+                || feature.properties.contains_key("UAxis")
+            {
+                continue;
+            }
+            let Some(end) = starts
+                .get(index + 1)
+                .map_or(Some(lane.native_payload.len()), |next| {
+                    index_from_u64(next.0)
+                })
+            else {
+                continue;
+            };
+            let Ok(start) = usize::try_from(start) else {
+                continue;
+            };
+            let Some(bytes) = lane.native_payload.get(start..end) else {
+                continue;
+            };
+            let self_source = feature.source_value();
+            if let Some(source) = offset_plane_reference_source(
+                bytes,
+                &known_sources[history_index],
+                &known_reference_plane_sources[history_index],
+                self_source,
+            ) {
+                let index = (history_index, feature_index);
+                explicit_reference_indices.insert(index);
+                let source = source.to_string();
+                reference_candidates.entry(index).or_default().push(source);
+            }
+            if let Some((relative_offset, owner)) = legacy_offset_plane_face_alias(bytes) {
+                let native = format!(
+                    "sldprt:feature-input:legacy-face-alias#{}:{}:{}",
+                    lane.id,
+                    start + relative_offset,
+                    owner,
+                );
+                face_native_candidates
+                    .entry((history_index, feature_index))
+                    .or_default()
+                    .push(native);
+                if let Some(&target_index) = features_by_source[history_index].get(&owner) {
+                    let target = &histories[history_index].features[target_index].id;
+                    let target = target.clone();
+                    face_feature_candidates
+                        .entry((history_index, feature_index))
+                        .or_default()
+                        .push(target);
+                }
+            }
+            if let Some((relative_offset, components)) =
+                component_face_reference_in_record(ctx, bytes)?
+            {
+                let mut native = format!(
+                    "sldprt:feature-input:surface-component-ids#{}:{}:",
+                    lane.id,
+                    start + relative_offset,
+                );
+                for (position, local_id) in components
+                    .iter()
+                    .filter_map(|component| component.local_id)
+                    .enumerate()
+                {
+                    if position > 0 {
+                        native.push(',');
+                    }
+                    native.push_str(&local_id.to_string());
+                }
+                face_native_candidates
+                    .entry((history_index, feature_index))
+                    .or_default()
+                    .push(native);
+            }
+            let offset_frames = feature
+                .parameters
+                .get("D1")
+                .and_then(|value| crate::history::literals::parse_dimension_length_mm(value));
+            let offset_frames = match offset_frames {
+                Some(distance) => offset_reference_plane_frame_pair(bytes, distance),
+                None => None,
+            };
+            if let Some((offset, reference)) = offset_frames {
+                let index = (history_index, feature_index);
+                reference_frame_candidates
+                    .entry(index)
+                    .or_default()
+                    .push(reference);
+                candidates.entry(index).or_default().push(offset);
+                candidate_sources
+                    .entry(index)
+                    .or_default()
+                    .push(SketchPlaneUAxisSource::Native);
+            }
+            let constraint = constraint_midplane_frame(bytes)?;
+            let mut anchored_frames = Vec::new();
+            for class in &lane.classes {
+                let frame = (|| {
+                    let offset = usize::try_from(class.offset).ok()?;
+                    (start..end).contains(&offset).then(|| {
+                        constraint_reference_plane_frame(&lane.native_payload, offset, &class.name)
+                    })?
+                })();
+                if let Some(frame) = frame {
+                    anchored_frames.push(frame);
+                }
+            }
+            anchored_frames.sort_by(|left, right| {
+                reference_plane_frame_key(left).cmp(&reference_plane_frame_key(right))
+            });
+            anchored_frames.dedup_by_key(|frame| reference_plane_frame_key(frame));
+            let explicit = if offset_frames.is_some() {
+                None
+            } else if anchored_frames.is_empty() {
+                match explicit_reference_plane_frame(bytes) {
+                    Ok(frame) => frame,
+                    Err(()) if constraint.is_some() => None,
+                    Err(()) => continue,
+                }
+            } else {
+                let [frame] = anchored_frames.as_slice() else {
+                    continue;
+                };
+                Some(*frame)
+            };
+            let Some((frame, u_axis_source)) =
+                reconcile_reference_plane_frame_with_source(explicit, constraint)
+            else {
+                continue;
+            };
+            let (origin, normal, u_axis) = frame;
+            let index = (history_index, feature_index);
+            candidates
+                .entry(index)
+                .or_default()
+                .push((origin, normal, u_axis));
+            candidate_sources
+                .entry(index)
+                .or_default()
+                .push(u_axis_source);
+        }
+    }
+    let mut face_reference_indices = HashSet::new();
+    for &index in face_native_candidates
+        .keys()
+        .chain(face_feature_candidates.keys())
+    {
+        face_reference_indices.insert(index);
+    }
+    for index in &face_reference_indices {
+        reference_candidates.remove(index);
+        explicit_reference_indices.remove(index);
+    }
+    for ((history_index, feature_index), mut native) in face_native_candidates {
+        native.sort_unstable_by(Ord::cmp);
+        native.dedup();
+        if let [native] = native.as_slice() {
+            histories[history_index].features[feature_index]
+                .properties
+                .insert(
+                    cadmpeg_core::nonblank_literal!("ReferenceFaceNative"),
+                    native.clone(),
+                );
+        }
+    }
+    for ((history_index, feature_index), mut targets) in face_feature_candidates {
+        targets.sort_unstable_by(Ord::cmp);
+        targets.dedup();
+        if let [target] = targets.as_slice() {
+            histories[history_index].features[feature_index]
+                .properties
+                .insert(
+                    cadmpeg_core::nonblank_literal!("ReferenceFaceFeature"),
+                    target.clone(),
+                );
+        }
+    }
+    let mut unique_frames = HashMap::new();
+    for (&index, frames) in &candidates {
+        if let Some(&frame) = frames.first() {
+            if frames.iter().skip(1).all(|candidate| *candidate == frame) {
+                unique_frames.insert(index, frame);
+            }
+        }
+    }
+    let mut unique_u_axis_sources = HashMap::new();
+    for (&index, sources) in &candidate_sources {
+        let source = sources
+            .iter()
+            .find(|source| **source == SketchPlaneUAxisSource::Native)
+            .copied()
+            .or_else(|| sources.first().copied());
+        if let Some(source) = source {
+            unique_u_axis_sources.insert(index, source);
+        }
+    }
+    let mut unique_reference_frames = HashMap::new();
+    for (&index, frames) in &reference_frame_candidates {
+        if let Some(&frame) = frames.first() {
+            if frames.iter().skip(1).all(|candidate| *candidate == frame) {
+                unique_reference_frames.insert(index, frame);
+            }
+        }
+    }
+    let mut frames_by_reference = Vec::new();
+    for (history_index, history) in histories.iter().enumerate() {
+        for (feature_index, feature) in history.features.iter().enumerate() {
+            let Some(plane) = principal_plane_with_siblings(feature, &history.features) else {
+                continue;
+            };
+            let reference = plane_frame_source(feature);
+            frames_by_reference.push((
+                reference,
+                (history_index, feature_index),
+                principal_sketch_frame(plane),
+            ));
+        }
+    }
+    for (&index, &frame) in &unique_frames {
+        let feature = &histories[index.0].features[index.1];
+        let reference = plane_frame_source(feature);
+        frames_by_reference.push((reference, index, frame));
+    }
+    for (&index, frames) in &reference_frame_candidates {
+        if reference_candidates.contains_key(&index) || face_reference_indices.contains(&index) {
+            continue;
+        }
+        let mut sources = Vec::new();
+        for &reference in frames {
+            let selected = select_reference_plane_frame_source(
+                frames_by_reference
+                    .iter()
+                    .filter(|(_, candidate_index, candidate)| {
+                        candidate_index.0 == index.0
+                            && (candidate_index.1 < index.1
+                                || principal_plane_with_siblings(
+                                    &histories[candidate_index.0].features[candidate_index.1],
+                                    &histories[candidate_index.0].features,
+                                )
+                                .is_some())
+                            && offset_plane_reference_frame_matches(*candidate, reference, 0.0)
+                    })
+                    .map(|(source, _, _)| source.as_str()),
+            );
+            if let Some(source) = selected {
+                sources.push(source);
+            }
+        }
+        sources.sort_unstable_by(Ord::cmp);
+        sources.dedup();
+        if let [source] = sources.as_slice() {
+            let source = (*source).to_owned();
+            reference_candidates.entry(index).or_default().push(source);
+        }
+    }
+    for (&index, &frame) in &unique_frames {
+        let feature = &histories[index.0].features[index.1];
+        if !feature.parameters.contains_key("D1")
+            || reference_candidates.contains_key(&index)
+            || face_reference_indices.contains(&index)
+        {
+            continue;
+        }
+        let Some(distance) = feature
+            .parameters
+            .get("D1")
+            .and_then(|value| crate::history::literals::parse_dimension_length_mm(value))
+        else {
+            continue;
+        };
+        if let Some(source) = select_reference_plane_frame_source(
+            frames_by_reference
+                .iter()
+                .filter(|(_, candidate_index, candidate)| {
+                    candidate_index.0 == index.0
+                        && offset_plane_reference_frame_matches(*candidate, frame, distance.get())
+                })
+                .map(|(source, _, _)| source.as_str()),
+        ) {
+            let source = source.to_owned();
+            reference_candidates.entry(index).or_default().push(source);
+        }
+    }
+    for ((history_index, feature_index), mut sources) in reference_candidates {
+        let index = (history_index, feature_index);
+        if !explicit_reference_indices.contains(&index) {
+            if let Some(offset) = unique_frames.get(&index) {
+                if let Some(distance) = histories[history_index].features[feature_index]
+                    .parameters
+                    .get("D1")
+                    .and_then(|value| crate::history::literals::parse_dimension_length_mm(value))
+                {
+                    let compatible = |source: &String| {
+                        frames_by_reference.iter().any(
+                            |(candidate_source, candidate_index, candidate)| {
+                                candidate_source == source
+                                    && candidate_index.0 == history_index
+                                    && offset_plane_reference_frame_matches(
+                                        *candidate,
+                                        *offset,
+                                        distance.get(),
+                                    )
+                            },
+                        )
+                    };
+                    if sources.iter().any(&compatible) {
+                        sources.retain(compatible);
+                    }
+                }
+            }
+        }
+        sources.sort_unstable_by(Ord::cmp);
+        sources.dedup();
+        let [source] = sources.as_slice() else {
+            continue;
+        };
+        histories[history_index].features[feature_index]
+            .properties
+            .insert(cadmpeg_core::nonblank_literal!("Reference"), source.clone());
+    }
+    for ((history_index, feature_index), (origin, normal, u_axis)) in unique_reference_frames {
+        let feature = &mut histories[history_index].features[feature_index];
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("ReferenceFaceOrigin"),
+            format!("{}mm,{}mm,{}mm", origin.x, origin.y, origin.z),
+        );
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("ReferenceFaceNormal"),
+            format!("{},{},{}", normal.x, normal.y, normal.z),
+        );
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("ReferenceFaceUAxis"),
+            format!("{},{},{}", u_axis.x, u_axis.y, u_axis.z),
+        );
+    }
+    for ((history_index, feature_index), mut frames) in candidates {
+        frames.sort_by(|left, right| {
+            reference_plane_frame_key(left).cmp(&reference_plane_frame_key(right))
+        });
+        frames.dedup();
+        let [(origin, normal, u_axis)] = frames.as_slice() else {
+            continue;
+        };
+        let feature = &mut histories[history_index].features[feature_index];
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("Origin"),
+            format!("{}mm,{}mm,{}mm", origin.x, origin.y, origin.z),
+        );
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("Normal"),
+            format!("{},{},{}", normal.x, normal.y, normal.z),
+        );
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("UAxis"),
+            format!("{},{},{}", u_axis.x, u_axis.y, u_axis.z),
+        );
+        if unique_u_axis_sources.get(&(history_index, feature_index))
+            == Some(&SketchPlaneUAxisSource::ConstructedMidPlane)
+        {
+            feature.properties.insert(
+                cadmpeg_core::nonblank_const!(REFERENCE_PLANE_U_AXIS_SOURCE_PROPERTY),
+                CONSTRUCTED_MID_PLANE_U_AXIS_SOURCE.to_owned(),
+            );
+        } else {
+            feature
+                .properties
+                .remove(REFERENCE_PLANE_U_AXIS_SOURCE_PROPERTY);
+        }
+    }
+    Ok(())
+}
+
+/// Add solved model-space positions to reference-point history records.
+pub(crate) fn enrich_history_reference_points(
+    histories: &mut [crate::records::FeatureHistory],
+    lanes: &[FeatureInputLane],
+) {
+    let mut candidates = BTreeMap::<(usize, usize), Option<Point3>>::new();
+    for lane in lanes {
+        let names = FeatureObjectNames::new(&lane.names);
+        let mut starts = Vec::new();
+        for (history_index, history) in histories.iter().enumerate() {
+            for (feature_index, feature) in history.features.iter().enumerate() {
+                if let Some(name) = names.of(feature) {
+                    starts.push((name.offset, history_index, feature_index));
+                }
+            }
+        }
+        starts.sort_by_key(|left| left.0);
+        for (index, &(_, history_index, feature_index)) in starts.iter().enumerate() {
+            let feature = &histories[history_index].features[feature_index];
+            if feature.input_class.as_deref() != Some("moRefPoint_c")
+                || feature.properties.contains_key("Position")
+            {
+                continue;
+            }
+            let Some(name) = names.of(feature) else {
+                continue;
+            };
+            let record_end = starts
+                .get(index + 1)
+                .and_then(|next| usize::try_from(next.0).ok())
+                .unwrap_or(lane.native_payload.len());
+            if let Some(point) = resolved_reference_point(&lane.native_payload, name, record_end) {
+                let key = (history_index, feature_index);
+                if let Some(existing) = candidates.get_mut(&key) {
+                    if existing.is_some_and(|existing| {
+                        reference_point_key(&existing) != reference_point_key(&point)
+                    }) {
+                        *existing = None;
+                    }
+                } else {
+                    candidates.insert(key, Some(point));
+                }
+            }
+        }
+    }
+
+    for ((history_index, feature_index), point) in candidates {
+        let Some(point) = point else {
+            continue;
+        };
+        let value = format!("{}mm,{}mm,{}mm", point.x, point.y, point.z);
+        histories[history_index].features[feature_index]
+            .properties
+            .insert(cadmpeg_core::nonblank_literal!("Position"), value);
+    }
+}
+
+fn resolved_reference_point(
+    payload: &[u8],
+    name: &FeatureInputName,
+    record_end: usize,
+) -> Option<Point3> {
+    const HEADER_PREFIX: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0xc0];
+    const NATIVE_TO_IR: f64 = 1000.0;
+
+    let object_id = name.object_id.and_then(ObjectId::value)?;
+    let name_start = usize::try_from(name.offset).ok()?;
+    let name_end = name_start
+        .checked_add(NAME_MARKER.len() + 1)?
+        .checked_add(name.value.encode_utf16().count().checked_mul(2)?)?;
+    let header = payload.get(name_end..name_end.checked_add(16)?)?;
+    if header[..HEADER_PREFIX.len()] != HEADER_PREFIX
+        || header[pt_short::OBJECT_ID..pt_short::ZERO_AFTER_ID] != object_id.to_le_bytes()
+        || header[pt_short::ZERO_AFTER_ID..pt_short::ZERO_AFTER_ID + 4] != [0; 4]
+    {
+        return None;
+    }
+
+    let points = [
+        (
+            pt_short::ZERO_BEFORE_POSITION,
+            pt_short::POSITION,
+            pt_short::CONSTRUCTION_FORM,
+            pt_short::ZERO_TRAILER,
+            pt_short::LEN,
+        ),
+        (
+            pt_long::ZERO_BEFORE_POSITION,
+            pt_long::POSITION,
+            pt_long::CONSTRUCTION_FORM,
+            pt_long::ZERO_TRAILER,
+            pt_long::LEN,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(zero_before, position, form, trailer, len)| {
+        let start = name_end.checked_add(position)?;
+        let end = name_end.checked_add(len)?;
+        if end > record_end
+            || payload.get(name_end + zero_before..start) != Some(&[0; 16])
+            || !matches!(View::u16_le_at(payload, name_end + form)?, 4 | 5)
+            || payload.get(name_end + trailer..end) != Some(&[0; 8])
+        {
+            return None;
+        }
+        let scalar = |offset: usize| {
+            let native = View::f64_le_at(payload, start + offset)?;
+            let value = native * NATIVE_TO_IR;
+            value.is_finite().then_some(value)
+        };
+        Some(Point3::new(scalar(0)?, scalar(8)?, scalar(16)?))
+    });
+    let mut unique = None;
+    for point in points {
+        match unique {
+            Some(existing) if reference_point_key(&existing) != reference_point_key(&point) => {
+                return None;
+            }
+            None => unique = Some(point),
+            Some(_) => {}
+        }
+    }
+    unique
+}
+
+fn reference_point_key(point: &Point3) -> [u64; 3] {
+    [
+        (point.x + 0.0).to_bits(),
+        (point.y + 0.0).to_bits(),
+        (point.z + 0.0).to_bits(),
+    ]
+}
+
+/// Add solved model-space frames to complete coordinate-system history records.
+pub(crate) fn enrich_history_coordinate_systems(
+    ctx: &DecodeContext<'_>,
+    histories: &mut [crate::records::FeatureHistory],
+    lanes: &[FeatureInputLane],
+) -> Result<(), CodecError> {
+    let mut candidates =
+        BTreeMap::<(usize, usize), Option<(Point3, Vector3, Vector3, Vector3)>>::new();
+    for lane in lanes {
+        let names = FeatureObjectNames::new(&lane.names);
+        let mut starts = Vec::new();
+        for (history_index, history) in histories.iter().enumerate() {
+            for (feature_index, feature) in history.features.iter().enumerate() {
+                if let Some(name) = names.of(feature) {
+                    starts.push((name.offset, history_index, feature_index));
+                }
+            }
+        }
+        starts.sort_by_key(|left| left.0);
+        for (index, &(start, history_index, feature_index)) in starts.iter().enumerate() {
+            let feature = &histories[history_index].features[feature_index];
+            if feature.input_class.as_deref() != Some("moCoordSys_c")
+                || feature.properties.contains_key("Origin")
+                || feature.properties.contains_key("XAxis")
+                || feature.properties.contains_key("YAxis")
+                || feature.properties.contains_key("ZAxis")
+            {
+                continue;
+            }
+            let end = starts
+                .get(index + 1)
+                .and_then(|next| usize::try_from(next.0).ok())
+                .unwrap_or(lane.native_payload.len());
+            let Ok(start) = usize::try_from(start) else {
+                continue;
+            };
+            let Some(record) = lane.native_payload.get(start..end) else {
+                continue;
+            };
+            if let Some(frame) = resolved_coordinate_system(ctx, record)? {
+                let key = (history_index, feature_index);
+                if let Some(existing) = candidates.get_mut(&key) {
+                    if existing.is_some_and(|existing| {
+                        coordinate_system_frame_key(&existing)
+                            != coordinate_system_frame_key(&frame)
+                    }) {
+                        *existing = None;
+                    }
+                } else {
+                    candidates.insert(key, Some(frame));
+                }
+            }
+        }
+    }
+
+    for ((history_index, feature_index), frame) in candidates {
+        let Some((origin, x_axis, y_axis, z_axis)) = frame else {
+            continue;
+        };
+        let feature = &mut histories[history_index].features[feature_index];
+        let origin_text = format!("{}mm,{}mm,{}mm", origin.x, origin.y, origin.z);
+        feature
+            .properties
+            .insert(cadmpeg_core::nonblank_literal!("Origin"), origin_text);
+        for (name, axis) in [
+            (cadmpeg_core::nonblank_literal!("XAxis"), x_axis),
+            (cadmpeg_core::nonblank_literal!("YAxis"), y_axis),
+            (cadmpeg_core::nonblank_literal!("ZAxis"), z_axis),
+        ] {
+            let text = format!("{},{},{}", axis.x, axis.y, axis.z);
+            feature.properties.insert(name, text);
+        }
+    }
+    Ok(())
+}
+
+fn resolved_coordinate_system(
+    ctx: &DecodeContext<'_>,
+    record: &[u8],
+) -> Result<Option<(Point3, Vector3, Vector3, Vector3)>, CodecError> {
+    if let Some(frame) = coordinate_system_two_point_frame(ctx, record)? {
+        return Ok(Some(frame));
+    }
+    let Some((origin, generation, origin_end)) = coordinate_system_origin(ctx, record)? else {
+        return Ok(None);
+    };
+    Ok((|| {
+        let mut axes = coordinate_system_line_axes(record, generation, origin_end);
+        let Some(first_axis) = axes.next() else {
+            let (x_axis, y_axis) = coordinate_system_ordinal_axes(record, origin_end, origin)?;
+            return Some((origin, x_axis, y_axis, x_axis.cross(y_axis).unit()?));
+        };
+        let second_axis = axes.next();
+        if axes.next().is_some() {
+            return None;
+        }
+        let (mut x_axis, mut y_axis, tail_offsets) = match (first_axis, second_axis) {
+            ((offset, point, direction), None) => (
+                direction,
+                Vector3::new(point.x - origin.x, point.y - origin.y, point.z - origin.z),
+                [
+                    Some((offset.checked_add(line_axis::LEN)?, false)),
+                    Some((offset.checked_add(line_axis::LEN + 2)?, true)),
+                ],
+            ),
+            ((first_offset, _, first_direction), Some((last_offset, _, last_direction)))
+                if first_offset < last_offset =>
+            {
+                (
+                    first_direction,
+                    last_direction,
+                    [
+                        Some((last_offset.checked_add(line_axis::LEN)?, false)),
+                        None,
+                    ],
+                )
+            }
+            _ => return None,
+        };
+        let flips = coordinate_system_tail(record, tail_offsets.into_iter().flatten(), origin)?;
+
+        if flips[0] == 1 {
+            x_axis = Vector3::new(-x_axis.x, -x_axis.y, -x_axis.z);
+        }
+        if flips[1] == 1 {
+            y_axis = Vector3::new(-y_axis.x, -y_axis.y, -y_axis.z);
+        }
+        let x_axis = x_axis.unit()?;
+        let projection = x_axis.dot(y_axis);
+        let y_axis = Vector3::new(
+            y_axis.x - projection * x_axis.x,
+            y_axis.y - projection * x_axis.y,
+            y_axis.z - projection * x_axis.z,
+        )
+        .unit()?;
+        let z_axis = x_axis.cross(y_axis).unit()?;
+        Some((origin, x_axis, y_axis, z_axis))
+    })())
+}
+
+fn coordinate_system_ordinal_axes(
+    record: &[u8],
+    origin_end: usize,
+    origin: Point3,
+) -> Option<(Vector3, Vector3)> {
+    let tail = record.get(origin_end..)?;
+    if !matches!(tail.len(), 37 | 39)
+        || tail.get(ordinal_tail::ZERO_BEFORE_ORIGIN_Z..ordinal_tail::ORIGIN_Z)? != [0; 23]
+        || tail
+            .get(ordinal_tail::LEN..)?
+            .chunks_exact(2)
+            .any(|token| token == [0, 0])
+    {
+        return None;
+    }
+    let ordinals = [
+        usize::from(View::u16_le_at(tail, ordinal_tail::X_AXIS_ORDINAL)?),
+        usize::from(View::u16_le_at(tail, ordinal_tail::Y_AXIS_ORDINAL)?),
+    ];
+    if ordinals[0] == ordinals[1] || ordinals.iter().any(|ordinal| !(1..=3).contains(ordinal)) {
+        return None;
+    }
+    let repeated_z = finite_f64(tail, ordinal_tail::ORIGIN_Z)? * 1000.0;
+    if (repeated_z + 0.0).to_bits() != (origin.z + 0.0).to_bits() {
+        return None;
+    }
+    let basis = [
+        Vector3::new(1.0, 0.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+    ];
+    Some((basis[ordinals[0] - 1], basis[ordinals[1] - 1]))
+}
+
+fn coordinate_system_tail(
+    record: &[u8],
+    offsets: impl IntoIterator<Item = (usize, bool)>,
+    origin: Point3,
+) -> Option<[u8; 3]> {
+    let mut candidates = offsets.into_iter().filter_map(|(offset, has_zero_gap)| {
+        if has_zero_gap && record.get(offset.checked_sub(2)?..offset) != Some(&[0; 2]) {
+            return None;
+        }
+        let bytes = record.get(offset..offset.checked_add(xy_tail::LEN)?)?;
+        let flips: [u8; 3] = bytes.get(..xy_tail::ORIGIN)?.try_into().ok()?;
+        if flips.iter().any(|value| !matches!(value, 0 | 1))
+            || flips[2] != 0
+            || bytes.get(xy_tail::TERMINATOR..xy_tail::LEN) == Some(&[0, 0])
+        {
+            return None;
+        }
+        let tail_origin = Point3::new(
+            finite_f64(bytes, xy_tail::ORIGIN)? * 1000.0,
+            finite_f64(bytes, xy_tail::ORIGIN + 8)? * 1000.0,
+            finite_f64(bytes, xy_tail::ORIGIN + 16)? * 1000.0,
+        );
+        (reference_point_key(&tail_origin) == reference_point_key(&origin)).then_some(flips)
+    });
+    let flips = candidates.next()?;
+    candidates.next().is_none().then_some(flips)
+}
+
+#[derive(Clone, Copy)]
+struct CoordinateSystemOrigin {
+    point: Point3,
+    generation: u32,
+    start: usize,
+    end: usize,
+    extended: bool,
+}
+
+fn coordinate_system_origin(
+    ctx: &DecodeContext<'_>,
+    record: &[u8],
+) -> Result<Option<(Point3, u32, usize)>, CodecError> {
+    let mut candidates = coordinate_system_origins(ctx, record);
+    let candidate = if let Some(candidate) = candidates.next().transpose()? {
+        if candidates.next().transpose()?.is_some() {
+            return Ok(None);
+        }
+        candidate
+    } else {
+        let mut endpoint_candidates = coordinate_system_endpoint_origins(ctx, record);
+        let Some(candidate) = endpoint_candidates.next().transpose()? else {
+            return Ok(None);
+        };
+        if endpoint_candidates.next().transpose()?.is_some() {
+            return Ok(None);
+        }
+        candidate
+    };
+    Ok(Some((candidate.point, candidate.generation, candidate.end)))
+}
+
+fn coordinate_system_endpoint_origins<'a>(
+    ctx: &'a DecodeContext<'_>,
+    record: &'a [u8],
+) -> impl Iterator<Item = Result<CoordinateSystemOrigin, CodecError>> + 'a {
+    const PREFIX: &[u8] = &[
+        0x2f, 0x80, 0x02, 0, 0, 0, 0x40, 0, 0, 0x75, 0, 0, 0, 0x75, 0, 0, 0,
+    ];
+    const NULL_SLOT: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+    const HANDLES: &[u8] = &[0xc7, 0xcf, 0xff, 0xff, 0xc7, 0xcf, 0xff, 0xff];
+    record
+        .windows(COMPACT_EDGE_VECTOR_MARKER.len())
+        .enumerate()
+        .map(
+            move |(marker, bytes)| -> Result<Option<CoordinateSystemOrigin>, CodecError> {
+                if bytes != COMPACT_EDGE_VECTOR_MARKER {
+                    return Ok(None);
+                }
+                let header = (|| {
+                    let prefix = marker.checked_sub(ep_path_pre::COMPONENT_MARKER)?;
+                    if record.get(prefix..prefix + ep_path_pre::ZERO_HEADER)? != PREFIX
+                        || record.get(
+                            prefix + ep_path_pre::ZERO_HEADER..prefix + ep_path_pre::SENTINEL,
+                        )? != [0; 28]
+                        || record.get(
+                            prefix + ep_path_pre::SENTINEL
+                                ..prefix + ep_path_pre::ZERO_BEFORE_SELECTOR,
+                        )? != [0xff; 16]
+                        || record.get(
+                            prefix + ep_path_pre::ZERO_BEFORE_SELECTOR
+                                ..prefix + ep_path_pre::SELECTOR,
+                        )? != [0; 8]
+                        || record.get(
+                            prefix + ep_path_pre::ZERO_BEFORE_COUNT
+                                ..prefix + ep_path_pre::PATH_ENTRY_COUNT,
+                        )? != [0; 7]
+                    {
+                        return None;
+                    }
+                    let selector = View::u32_le_at(record, prefix + ep_path_pre::SELECTOR)?;
+                    let token = View::u32_le_at(record, prefix + ep_path_pre::TOKEN)?;
+                    if matches!(selector, 0 | u32::MAX) || matches!(token, 0 | u32::MAX) {
+                        return None;
+                    }
+                    Some(prefix)
+                })();
+                let Some(prefix) = header else {
+                    return Ok(None);
+                };
+                let Some(path_end) = compact_component_path_end_at(ctx, record, marker)? else {
+                    return Ok(None);
+                };
+                Ok((|| {
+                    if record.get(path_end..path_end + 8)? != NULL_SLOT {
+                        return None;
+                    }
+                    let trailer = path_end.checked_add(8)?;
+                    if record.get(trailer..trailer + ep_path_suf::ONE)? != [0; 70]
+                        || record.get(
+                            trailer + ep_path_suf::ONE..trailer + ep_path_suf::ZERO_BEFORE_OBJECT,
+                        )? != 1u32.to_le_bytes()
+                        || record.get(
+                            trailer + ep_path_suf::ZERO_BEFORE_OBJECT
+                                ..trailer + ep_path_suf::OBJECT_ID,
+                        )? != [0; 4]
+                        || record.get(
+                            trailer + ep_path_suf::ZERO_BEFORE_HANDLES
+                                ..trailer + ep_path_suf::HANDLES,
+                        )? != [0; 12]
+                    {
+                        return None;
+                    }
+                    let object = View::u32_le_at(record, trailer + ep_path_suf::OBJECT_ID)?;
+                    let handles = trailer.checked_add(ep_path_suf::HANDLES)?;
+                    if matches!(object, 0 | u32::MAX)
+                        || record.get(handles..handles + 8)? != HANDLES
+                        || record.get(
+                            trailer + ep_path_suf::ZERO_BEFORE_GENERATION
+                                ..trailer + ep_path_suf::GENERATION,
+                        )? != [0; 4]
+                        || record.get(
+                            trailer + ep_path_suf::ZERO_BEFORE_ORIGIN
+                                ..trailer + ep_path_suf::ORIGIN,
+                        )? != [0; 8]
+                    {
+                        return None;
+                    }
+                    let generation = View::u32_le_at(record, trailer + ep_path_suf::GENERATION)?;
+                    if matches!(generation, 0 | u32::MAX) {
+                        return None;
+                    }
+                    Some(CoordinateSystemOrigin {
+                        point: Point3::new(
+                            finite_f64(record, trailer + ep_path_suf::ORIGIN)? * 1000.0,
+                            finite_f64(record, trailer + ep_path_suf::ORIGIN + 8)? * 1000.0,
+                            finite_f64(record, trailer + ep_path_suf::ORIGIN + 16)? * 1000.0,
+                        ),
+                        generation,
+                        start: prefix,
+                        end: trailer.checked_add(ep_path_suf::LEN)?,
+                        extended: false,
+                    })
+                })())
+            },
+        )
+        .filter_map(Result::transpose)
+}
+
+fn coordinate_system_origins<'a>(
+    ctx: &'a DecodeContext<'_>,
+    record: &'a [u8],
+) -> impl Iterator<Item = Result<CoordinateSystemOrigin, CodecError>> + 'a {
+    const PREFIX_SUFFIX: &[u8] = &[0x80, 0x02, 0, 0, 0, 0, 0, 0, 0];
+    const HANDLES: &[u8] = &[0xc7, 0xcf, 0xff, 0xff, 0xc7, 0xcf, 0xff, 0xff];
+    record
+        .windows(PREFIX_SUFFIX.len() + 1)
+        .enumerate()
+        .map(
+            move |(prefix, bytes)| -> Result<Option<CoordinateSystemOrigin>, CodecError> {
+                if !(matches!(bytes[0], 0x2d | 0x2f) && bytes[1..] == *PREFIX_SUFFIX) {
+                    return Ok(None);
+                }
+                let header = (|| {
+                    if record.get(prefix + cs_pt::ZERO_HEADER..prefix + cs_pt::SENTINEL)
+                        != Some(&[0; 35])
+                        || record.get(prefix + cs_pt::SENTINEL..prefix + cs_pt::ZERO_BEFORE_SOURCE)
+                            != Some(&[0xff; 16])
+                        || record.get(prefix + cs_pt::ZERO_BEFORE_SOURCE..prefix + cs_pt::SOURCE_ID)
+                            != Some(&[0; 8])
+                    {
+                        return None;
+                    }
+                    let source = View::u32_le_at(record, prefix + cs_pt::SOURCE_ID)?;
+                    if source == 0 {
+                        return None;
+                    }
+                    Some(())
+                })();
+                if header.is_none() {
+                    return Ok(None);
+                }
+                if let Some(candidate) =
+                    coordinate_system_component_path_origin(ctx, record, prefix)?
+                {
+                    return Ok(Some(CoordinateSystemOrigin {
+                        point: candidate.0,
+                        generation: candidate.1,
+                        start: prefix,
+                        end: candidate.2,
+                        extended: false,
+                    }));
+                }
+                Ok((|| {
+                    let stamp = View::u32_le_at(record, prefix + cs_pt::SOURCE_STAMP)?;
+                    if stamp == 0 || stamp == u32::MAX {
+                        return None;
+                    }
+                    let (object, generation, origin_offset, record_len, extended) = if record
+                        .get(prefix + cs_pt::ZERO_SELECTOR..prefix + cs_pt::ONE_SELECTOR)
+                        == Some(&[0; 2])
+                        && record
+                            .get(prefix + cs_pt::ONE_SELECTOR..prefix + cs_pt::ZERO_BEFORE_OBJECT)
+                            == Some(&1u16.to_le_bytes())
+                        && record.get(prefix + cs_pt::ZERO_BEFORE_OBJECT..prefix + cs_pt::OBJECT_ID)
+                            == Some(&[0; 6])
+                        && record.get(prefix + cs_pt::ZERO_BEFORE_HANDLES..prefix + cs_pt::HANDLES)
+                            == Some(&[0; 12])
+                        && record
+                            .get(prefix + cs_pt::HANDLES..prefix + cs_pt::ZERO_BEFORE_GENERATION)
+                            == Some(HANDLES)
+                        && record
+                            .get(prefix + cs_pt::ZERO_BEFORE_GENERATION..prefix + cs_pt::GENERATION)
+                            == Some(&[0; 4])
+                        && record.get(prefix + cs_pt::ZERO_BEFORE_ORIGIN..prefix + cs_pt::ORIGIN)
+                            == Some(&[0; 8])
+                    {
+                        (
+                            View::u32_le_at(record, prefix + cs_pt::OBJECT_ID)?,
+                            View::u32_le_at(record, prefix + cs_pt::GENERATION)?,
+                            cs_pt::ORIGIN,
+                            cs_pt::LEN,
+                            false,
+                        )
+                    } else if record
+                        .get(prefix + cs_ext::SENTINEL..prefix + cs_ext::ZERO_BEFORE_COUNT)
+                        == Some(&[0xff; 4])
+                        && record.get(
+                            prefix + cs_ext::ZERO_BEFORE_COUNT..prefix + cs_ext::REFERENCE_COUNT,
+                        ) == Some(&[0; 4])
+                        && record.get(prefix + cs_ext::ONE..prefix + cs_ext::ZERO_BEFORE_OBJECT)
+                            == Some(&1u32.to_le_bytes())
+                        && record
+                            .get(prefix + cs_ext::ZERO_BEFORE_OBJECT..prefix + cs_ext::OBJECT_ID)
+                            == Some(&[0; 4])
+                        && record
+                            .get(prefix + cs_ext::ZERO_BEFORE_HANDLES..prefix + cs_ext::HANDLES)
+                            == Some(&[0; 12])
+                        && record
+                            .get(prefix + cs_ext::HANDLES..prefix + cs_ext::ZERO_BEFORE_GENERATION)
+                            == Some(HANDLES)
+                        && record.get(
+                            prefix + cs_ext::ZERO_BEFORE_GENERATION..prefix + cs_ext::GENERATION,
+                        ) == Some(&[0; 4])
+                        && record.get(prefix + cs_ext::ZERO_BEFORE_ORIGIN..prefix + cs_ext::ORIGIN)
+                            == Some(&[0; 8])
+                    {
+                        let reference = View::u32_le_at(record, prefix + cs_ext::REFERENCE_ID)?;
+                        let count = View::u32_le_at(record, prefix + cs_ext::REFERENCE_COUNT)?;
+                        if matches!(reference, 0 | u32::MAX) || matches!(count, 0 | u32::MAX) {
+                            return None;
+                        }
+                        (
+                            View::u32_le_at(record, prefix + cs_ext::OBJECT_ID)?,
+                            View::u32_le_at(record, prefix + cs_ext::GENERATION)?,
+                            cs_ext::ORIGIN,
+                            cs_ext::LEN,
+                            true,
+                        )
+                    } else {
+                        return None;
+                    };
+                    if object == 0 || generation == 0 || generation == u32::MAX {
+                        return None;
+                    }
+                    Some(CoordinateSystemOrigin {
+                        point: Point3::new(
+                            finite_f64(record, prefix + origin_offset)? * 1000.0,
+                            finite_f64(record, prefix + origin_offset + 8)? * 1000.0,
+                            finite_f64(record, prefix + origin_offset + 16)? * 1000.0,
+                        ),
+                        generation,
+                        start: prefix,
+                        end: prefix.checked_add(record_len)?,
+                        extended,
+                    })
+                })())
+            },
+        )
+        .filter_map(Result::transpose)
+}
+
+fn coordinate_system_two_point_frame(
+    ctx: &DecodeContext<'_>,
+    record: &[u8],
+) -> Result<Option<(Point3, Vector3, Vector3, Vector3)>, CodecError> {
+    let mut origins = coordinate_system_origins(ctx, record);
+    let (Some(origin), Some(axis_point)) =
+        (origins.next().transpose()?, origins.next().transpose()?)
+    else {
+        return Ok(None);
+    };
+    if origins.next().transpose()?.is_some() {
+        return Ok(None);
+    }
+    Ok((|| {
+        if !origin.extended || !axis_point.extended || origin.generation != axis_point.generation {
+            return None;
+        }
+        let separator = record.get(origin.end..axis_point.start)?;
+        if separator.len() != two_pt_sep::LEN
+            || separator.get(two_pt_sep::SELECTORS..two_pt_sep::FIRST_TOKEN)? != [2, 0, 1, 0, 0, 0]
+            || separator.get(two_pt_sep::ONE..two_pt_sep::FINAL_TOKENS)? != [1, 0]
+            || [
+                two_pt_sep::FIRST_TOKEN,
+                two_pt_sep::FINAL_TOKENS,
+                two_pt_sep::FINAL_TOKENS + 2,
+            ]
+            .into_iter()
+            .any(|offset| separator.get(offset..offset + 2) == Some(&[0, 0]))
+        {
+            return None;
+        }
+        let tail = record.get(axis_point.end..)?;
+        if tail.len() != two_pt_tail::LEN
+            || tail.get(two_pt_tail::SEPARATOR) != Some(&0)
+            || tail.get(two_pt_tail::ZERO_BEFORE_ORIGIN..two_pt_tail::ORIGIN)? != [0; 3]
+            || tail.get(two_pt_tail::TERMINAL_TOKEN..two_pt_tail::LEN) == Some(&[0, 0])
+        {
+            return None;
+        }
+        let cached_origin = Point3::new(
+            finite_f64(tail, two_pt_tail::ORIGIN)? * 1000.0,
+            finite_f64(tail, two_pt_tail::ORIGIN + 8)? * 1000.0,
+            finite_f64(tail, two_pt_tail::ORIGIN + 16)? * 1000.0,
+        );
+        if reference_point_key(&cached_origin) != reference_point_key(&origin.point)
+            || (finite_f64(tail, two_pt_tail::ORIGIN_YZ)? * 1000.0 + 0.0).to_bits()
+                != (origin.point.y + 0.0).to_bits()
+            || (finite_f64(tail, two_pt_tail::ORIGIN_YZ + 8)? * 1000.0 + 0.0).to_bits()
+                != (origin.point.z + 0.0).to_bits()
+        {
+            return None;
+        }
+        let x_axis = Vector3::new(
+            finite_f64(tail, two_pt_tail::X_DIRECTION)?,
+            finite_f64(tail, two_pt_tail::X_DIRECTION + 8)?,
+            finite_f64(tail, two_pt_tail::X_DIRECTION + 16)?,
+        );
+        let repeated = Vector3::new(
+            finite_f64(tail, two_pt_tail::REPEATED_X_DIRECTION)?,
+            finite_f64(tail, two_pt_tail::REPEATED_X_DIRECTION + 8)?,
+            finite_f64(tail, two_pt_tail::REPEATED_X_DIRECTION + 16)?,
+        );
+        if (x_axis.dot(x_axis) - 1.0).abs()
+            > EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_TWO_POINT_FRAME_E9
+            || x_axis != repeated
+        {
+            return None;
+        }
+        let y_source = Vector3::new(
+            axis_point.point.x - origin.point.x,
+            axis_point.point.y - origin.point.y,
+            axis_point.point.z - origin.point.z,
+        );
+        let projection = x_axis.dot(y_source);
+        let y_axis = Vector3::new(
+            y_source.x - projection * x_axis.x,
+            y_source.y - projection * x_axis.y,
+            y_source.z - projection * x_axis.z,
+        )
+        .unit()?;
+        Some((origin.point, x_axis, y_axis, x_axis.cross(y_axis).unit()?))
+    })())
+}
+
+fn coordinate_system_component_path_origin(
+    ctx: &DecodeContext<'_>,
+    record: &[u8],
+    prefix: usize,
+) -> Result<Option<(Point3, u32, usize)>, CodecError> {
+    const HANDLES: &[u8] = &[0xc7, 0xcf, 0xff, 0xff, 0xc7, 0xcf, 0xff, 0xff];
+    const NULL_SLOT: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+    let marker = (|| {
+        let marker = prefix.checked_add(cs_path_pre::COMPONENT_MARKER)?;
+        if record.get(prefix + cs_path_pre::SENTINEL..prefix + cs_path_pre::PATH_ENTRY_COUNT)?
+            != [0xff; 7]
+        {
+            return None;
+        }
+        Some(marker)
+    })();
+    let Some(marker) = marker else {
+        return Ok(None);
+    };
+    let Some(path_end) = compact_component_path_end_at(ctx, record, marker)? else {
+        return Ok(None);
+    };
+    Ok((|| {
+        let trailer = if record.get(path_end..path_end + NULL_SLOT.len()) == Some(NULL_SLOT) {
+            path_end + NULL_SLOT.len()
+        } else {
+            path_end
+        };
+        if record.get(trailer..trailer + cs_path_suf::ONE)? != [0; 14]
+            || record.get(trailer + cs_path_suf::ONE..trailer + cs_path_suf::ZERO_BEFORE_OBJECT)?
+                != 1u32.to_le_bytes()
+            || record
+                .get(trailer + cs_path_suf::ZERO_BEFORE_OBJECT..trailer + cs_path_suf::OBJECT_ID)?
+                != [0; 4]
+            || record
+                .get(trailer + cs_path_suf::ZERO_BEFORE_HANDLES..trailer + cs_path_suf::HANDLES)?
+                != [0; 12]
+        {
+            return None;
+        }
+        let object = View::u32_le_at(record, trailer + cs_path_suf::OBJECT_ID)?;
+        let handles = trailer.checked_add(cs_path_suf::HANDLES)?;
+        if matches!(object, 0 | u32::MAX)
+            || record.get(handles..handles + 8)? != HANDLES
+            || record.get(
+                trailer + cs_path_suf::ZERO_BEFORE_GENERATION..trailer + cs_path_suf::GENERATION,
+            )? != [0; 4]
+            || record
+                .get(trailer + cs_path_suf::ZERO_BEFORE_ORIGIN..trailer + cs_path_suf::ORIGIN)?
+                != [0; 8]
+        {
+            return None;
+        }
+        let generation = View::u32_le_at(record, trailer + cs_path_suf::GENERATION)?;
+        if matches!(generation, 0 | u32::MAX) {
+            return None;
+        }
+        Some((
+            Point3::new(
+                finite_f64(record, trailer + cs_path_suf::ORIGIN)? * 1000.0,
+                finite_f64(record, trailer + cs_path_suf::ORIGIN + 8)? * 1000.0,
+                finite_f64(record, trailer + cs_path_suf::ORIGIN + 16)? * 1000.0,
+            ),
+            generation,
+            trailer.checked_add(cs_path_suf::LEN)?,
+        ))
+    })())
+}
+
+fn coordinate_system_line_axes(
+    record: &[u8],
+    generation: u32,
+    origin_end: usize,
+) -> impl Iterator<Item = (usize, Point3, Vector3)> + '_ {
+    const PREFIX: &[u8] = &[0xc7, 0xcf, 0xff, 0xff, 0xc7, 0xcf, 0xff, 0xff];
+    record
+        .windows(PREFIX.len())
+        .enumerate()
+        .filter(move |(prefix, bytes)| *prefix >= origin_end && *bytes == PREFIX)
+        .filter_map(move |(prefix, _)| {
+            if record
+                .get(prefix + line_axis::ZERO_BEFORE_GENERATION..prefix + line_axis::GENERATION)
+                != Some(&[0; 4])
+                || record
+                    .get(prefix + line_axis::GENERATION..prefix + line_axis::ZERO_BEFORE_SCALAR)
+                    != Some(&generation.to_le_bytes())
+                || record
+                    .get(prefix + line_axis::ZERO_BEFORE_SCALAR..prefix + line_axis::CARRIER_SCALAR)
+                    != Some(&[0; 16])
+                || record.get(prefix + line_axis::SEPARATOR) != Some(&0)
+            {
+                return None;
+            }
+            let scalar = finite_f64(record, prefix + line_axis::CARRIER_SCALAR)?;
+            let point = Point3::new(
+                finite_f64(record, prefix + line_axis::LINE_POINT)? * 1000.0,
+                finite_f64(record, prefix + line_axis::LINE_POINT + 8)? * 1000.0,
+                finite_f64(record, prefix + line_axis::LINE_POINT + 16)? * 1000.0,
+            );
+            let direction = Vector3::new(
+                finite_f64(record, prefix + line_axis::DIRECTION)?,
+                finite_f64(record, prefix + line_axis::DIRECTION + 8)?,
+                finite_f64(record, prefix + line_axis::DIRECTION + 16)?,
+            );
+            let repeated = Vector3::new(
+                finite_f64(record, prefix + line_axis::REPEATED_DIRECTION)?,
+                finite_f64(record, prefix + line_axis::REPEATED_DIRECTION + 8)?,
+                finite_f64(record, prefix + line_axis::REPEATED_DIRECTION + 16)?,
+            );
+            let repeated_matches = (direction.x - repeated.x).abs()
+                <= EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_LINE_AXES_E12
+                && (direction.y - repeated.y).abs()
+                    <= EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_LINE_AXES_E12
+                && (direction.z - repeated.z).abs()
+                    <= EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_LINE_AXES_E12;
+            (scalar > 0.0
+                && (direction.norm() - 1.0).abs()
+                    <= EPS_REFERENCE_GEOMETRY_COORDINATE_SYSTEM_LINE_AXES_E9
+                && repeated_matches)
+                .then_some((prefix, point, direction))
+        })
+}
+
+fn finite_f64(bytes: &[u8], offset: usize) -> Option<f64> {
+    let value = View::f64_le_at(bytes, offset)?;
+    value.is_finite().then_some(value)
+}
+
+fn coordinate_system_frame_key(
+    (origin, x_axis, y_axis, z_axis): &(Point3, Vector3, Vector3, Vector3),
+) -> [u64; 12] {
+    let bits = |value: f64| (value + 0.0).to_bits();
+    [
+        bits(origin.x),
+        bits(origin.y),
+        bits(origin.z),
+        bits(x_axis.x),
+        bits(x_axis.y),
+        bits(x_axis.z),
+        bits(y_axis.x),
+        bits(y_axis.y),
+        bits(y_axis.z),
+        bits(z_axis.x),
+        bits(z_axis.y),
+        bits(z_axis.z),
+    ]
+}
+
+fn select_reference_plane_frame_source<'a>(
+    candidates: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let mut candidates = candidates;
+    let source = candidates.next()?;
+    candidates
+        .all(|candidate| candidate == source)
+        .then_some(source)
+}
+
+fn offset_plane_reference_frame_matches(
+    reference: (Point3, Vector3, Vector3),
+    offset: (Point3, Vector3, Vector3),
+    distance: f64,
+) -> bool {
+    let (reference_origin, reference_normal, _) = reference;
+    let (offset_origin, offset_normal, _) = offset;
+    let delta = Vector3::new(
+        offset_origin.x - reference_origin.x,
+        offset_origin.y - reference_origin.y,
+        offset_origin.z - reference_origin.z,
+    );
+    let axial = delta.dot(reference_normal);
+    let tangential = Vector3::new(
+        delta.x - axial * reference_normal.x,
+        delta.y - axial * reference_normal.y,
+        delta.z - axial * reference_normal.z,
+    );
+    let tangential_length = tangential.norm();
+    (reference_normal.dot(offset_normal).abs() - 1.0).abs()
+        <= EPS_REFERENCE_GEOMETRY_OFFSET_PLANE_REFERENCE_FRAME_MATCHES_E9
+        && tangential_length <= EPS_REFERENCE_GEOMETRY_OFFSET_PLANE_REFERENCE_FRAME_MATCHES_E8
+        && (axial.abs() - distance.abs()).abs()
+            <= EPS_REFERENCE_GEOMETRY_OFFSET_PLANE_REFERENCE_FRAME_MATCHES_E8
+}
+
+/// Resolve sketch-block definition ownership and placement from typed object records.
+pub(crate) fn enrich_history_sketch_block_references(
+    histories: &mut [crate::records::FeatureHistory],
+    lanes: &[FeatureInputLane],
+) {
+    for history in histories {
+        let mut by_source = HashMap::<u32, Option<(usize, NativeClassKind)>>::new();
+        for (feature_index, feature) in history.features.iter().enumerate() {
+            let Some(source) = feature.source_value() else {
+                continue;
+            };
+            let identity = (
+                feature_index,
+                native_object_class(feature.input_class.as_deref().unwrap_or_default()),
+            );
+            by_source
+                .entry(source)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(identity));
+        }
+        let mut candidates = HashMap::<usize, Vec<u32>>::new();
+        let mut placement_candidates = HashMap::<usize, Vec<Point3>>::new();
+        for lane in lanes {
+            let mut names = Vec::new();
+            for name in &lane.names {
+                names.push(name);
+            }
+            names.sort_by_key(|left| left.offset);
+            let mut instance_names = Vec::new();
+            for &name in &names {
+                let Some(source) = name.object_id.and_then(ObjectId::value) else {
+                    continue;
+                };
+                let Some((feature_index, kind)) = by_source.get(&source).and_then(|entry| *entry)
+                else {
+                    continue;
+                };
+                if kind == NativeClassKind::SketchBlockInstance {
+                    instance_names.push((name, feature_index));
+                }
+            }
+            let mut definitions_by_local_id = HashMap::<u16, Option<u32>>::new();
+            for (position, (name, _)) in instance_names.iter().enumerate() {
+                let Some(next) =
+                    names.get(names.partition_point(|next| next.offset <= name.offset))
+                else {
+                    continue;
+                };
+                let Some(definition_source) =
+                    next.object_id.and_then(ObjectId::value).filter(|source| {
+                        by_source
+                            .get(source)
+                            .and_then(|entry| *entry)
+                            .is_some_and(|(_, kind)| kind == NativeClassKind::SketchBlockDefinition)
+                    })
+                else {
+                    continue;
+                };
+                let end = instance_names
+                    .get(position + 1)
+                    .and_then(|(next, _)| usize::try_from(next.offset).ok())
+                    .unwrap_or(lane.native_payload.len());
+                let Some(start) = usize::try_from(name.offset).ok() else {
+                    continue;
+                };
+                let Some(local_id) = sketch_block_record_local_id(&lane.native_payload, start, end)
+                else {
+                    continue;
+                };
+                definitions_by_local_id
+                    .entry(local_id)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(definition_source));
+            }
+            for (position, (name, instance_index)) in instance_names.iter().enumerate() {
+                let end = instance_names
+                    .get(position + 1)
+                    .and_then(|(next, _)| usize::try_from(next.offset).ok())
+                    .unwrap_or(lane.native_payload.len());
+                let Some(start) = usize::try_from(name.offset).ok() else {
+                    continue;
+                };
+                if let Some(origin) = sketch_block_record_origin(&lane.native_payload, start, end)
+                    .or_else(|| {
+                        sketch_block_identity_normalization_origin(&lane.native_payload, start, end)
+                    })
+                {
+                    placement_candidates
+                        .entry(*instance_index)
+                        .or_default()
+                        .push(origin);
+                }
+            }
+            for pair in names.windows(2) {
+                let (Some(instance_source), Some(definition_source)) = (
+                    pair[0].object_id.and_then(ObjectId::value),
+                    pair[1].object_id.and_then(ObjectId::value),
+                ) else {
+                    continue;
+                };
+                let Some((instance_index, NativeClassKind::SketchBlockInstance)) =
+                    by_source.get(&instance_source).and_then(|entry| *entry)
+                else {
+                    continue;
+                };
+                let Some((_, NativeClassKind::SketchBlockDefinition)) =
+                    by_source.get(&definition_source).and_then(|entry| *entry)
+                else {
+                    continue;
+                };
+                candidates
+                    .entry(instance_index)
+                    .or_default()
+                    .push(definition_source);
+            }
+            for (position, (name, instance_index)) in instance_names.iter().enumerate() {
+                let end = instance_names
+                    .get(position + 1)
+                    .and_then(|(next, _)| usize::try_from(next.offset).ok())
+                    .unwrap_or(lane.native_payload.len());
+                let Some(local_id) = sketch_block_compact_local_id(&lane.native_payload, name, end)
+                else {
+                    continue;
+                };
+                let Some(definition_source) = definitions_by_local_id
+                    .get(&local_id)
+                    .and_then(|entry| *entry)
+                else {
+                    continue;
+                };
+                candidates
+                    .entry(*instance_index)
+                    .or_default()
+                    .push(definition_source);
+            }
+        }
+        for (feature_index, mut sources) in candidates {
+            sources.sort_unstable_by(Ord::cmp);
+            sources.dedup();
+            let [source] = sources.as_slice() else {
+                continue;
+            };
+            let value = source.to_string();
+            let properties = &mut history.features[feature_index].properties;
+            properties.insert(cadmpeg_core::nonblank_literal!("BlockDefinition"), value);
+        }
+        for (feature_index, mut origins) in placement_candidates {
+            origins.sort_by(|left, right| {
+                [left.x.to_bits(), left.y.to_bits(), left.z.to_bits()].cmp(&[
+                    right.x.to_bits(),
+                    right.y.to_bits(),
+                    right.z.to_bits(),
+                ])
+            });
+            origins.dedup();
+            let [origin] = origins.as_slice() else {
+                continue;
+            };
+            let value = format!("{}mm,{}mm,{}mm", origin.x, origin.y, origin.z);
+            let properties = &mut history.features[feature_index].properties;
+            properties.insert(cadmpeg_core::nonblank_literal!("BlockOrigin"), value);
+        }
+    }
+}
+
+fn sketch_block_record_identity(payload: &[u8], start: usize, end: usize) -> Option<(u16, usize)> {
+    let bytes = payload.get(start..end)?;
+    bytes
+        .windows(44)
+        .enumerate()
+        .rev()
+        .find_map(|(relative, window)| {
+            let local_id = View::u16_le_at(window, 18)?;
+            (window.get(..4) == Some(&[0xff; 4])
+                && window.get(12..18) == Some(&[0x02, 0, 0, 0, 0, 0])
+                && local_id != 0
+                && window.get(40..44) == Some(&[0, 0, 1, 0]))
+            .then_some((local_id, start + relative))
+        })
+}
+
+fn sketch_block_record_local_id(payload: &[u8], start: usize, end: usize) -> Option<u16> {
+    sketch_block_record_identity(payload, start, end).map(|(local_id, _)| local_id)
+}
+
+fn sketch_block_record_origin(payload: &[u8], start: usize, end: usize) -> Option<Point3> {
+    const ABSOLUTE_POINT_CLASS: &[u8] = b"moAbsolutePoint_c";
+    const NATIVE_TO_IR: f64 = 1000.0;
+
+    let (_, identity) = sketch_block_record_identity(payload, start, end)?;
+    let body = identity.checked_add(44)?;
+    let class_len = u16::try_from(ABSOLUTE_POINT_CLASS.len())
+        .ok()?
+        .to_le_bytes();
+    if payload.get(body..body + CLASS_MARKER.len()) == Some(CLASS_MARKER)
+        && payload.get(body + 4..body + 6) == Some(&class_len)
+        && payload.get(body + 6..body + 6 + ABSOLUTE_POINT_CLASS.len())
+            == Some(ABSOLUTE_POINT_CLASS)
+    {
+        return Some(Point3::new(0.0, 0.0, 0.0));
+    }
+    let point_token = View::u16_le_at(payload, body)?;
+    if !is_class_token(point_token) {
+        return None;
+    }
+    let scalar = |relative: usize| {
+        let value = View::f64_le_at(payload, body + 2 + relative)? * NATIVE_TO_IR;
+        (value.is_finite() && value.abs() <= 1.0e9).then_some(value)
+    };
+    Some(Point3::new(scalar(0)?, scalar(8)?, scalar(16)?))
+}
+
+fn sketch_block_identity_normalization_origin(
+    payload: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<Point3> {
+    const CLASS: &[u8] = b"sgBlock";
+    const NATIVE_TO_IR: f64 = 1000.0;
+
+    let bytes = payload.get(start..end)?;
+    let record_len = CLASS_MARKER.len() + 2 + CLASS.len();
+    let class_len = u16::try_from(CLASS.len()).ok()?.to_le_bytes();
+    let mut records = bytes
+        .windows(record_len)
+        .enumerate()
+        .filter_map(|(relative, record)| {
+            (record.get(..CLASS_MARKER.len()) == Some(CLASS_MARKER)
+                && record.get(CLASS_MARKER.len()..CLASS_MARKER.len() + 2) == Some(&class_len)
+                && record.get(CLASS_MARKER.len() + 2..) == Some(CLASS))
+            .then_some(start + relative + record_len)
+        });
+    let body = records.next()?;
+    if records.next().is_some() {
+        return None;
+    }
+    let scalar = |relative: usize| {
+        let value = View::f64_le_at(payload, body + relative)?;
+        value.is_finite().then_some(value)
+    };
+    let basis = [
+        scalar(72)?,
+        scalar(80)?,
+        scalar(88)?,
+        scalar(96)?,
+        scalar(104)?,
+        scalar(112)?,
+        scalar(120)?,
+        scalar(128)?,
+        scalar(136)?,
+    ];
+    if basis != [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        || payload.get(body + 144..body + 152) != Some(&1_u64.to_le_bytes())
+        || scalar(176)? != 1.0
+    {
+        return None;
+    }
+    let translation = [scalar(152)?, scalar(160)?, scalar(168)?];
+    (translation.iter().all(|value| value.abs() <= 1.0e6)).then(|| {
+        Point3::new(
+            -translation[0] * NATIVE_TO_IR,
+            -translation[1] * NATIVE_TO_IR,
+            -translation[2] * NATIVE_TO_IR,
+        )
+    })
+}
+
+fn sketch_block_compact_local_id(
+    payload: &[u8],
+    name: &FeatureInputName,
+    record_end: usize,
+) -> Option<u16> {
+    let name_start = usize::try_from(name.offset).ok()?;
+    let name_end = name_start
+        .checked_add(NAME_MARKER.len() + 1)?
+        .checked_add(name.value.encode_utf16().count().checked_mul(2)?)?;
+    let header_start = name_end.checked_add(28)?;
+    let header = View::u16_le_at(payload, header_start)?;
+    (sketch_block_record_local_id(payload, name_start, record_end)? == header).then_some(header)
+}
+
+/// Add the two serialized construction-plane operands to plane-intersection axes.
+pub(crate) fn enrich_history_reference_axes(
+    histories: &mut [crate::records::FeatureHistory],
+    lanes: &[FeatureInputLane],
+) {
+    let mut known_sources = HashSet::new();
+    for source in histories
+        .iter()
+        .flat_map(|history| &history.features)
+        .filter_map(crate::records::Feature::source_value)
+    {
+        known_sources.insert(source);
+    }
+    for lane in lanes {
+        let names = FeatureObjectNames::new(&lane.names);
+        let mut starts = Vec::new();
+        for (history_index, history) in histories.iter().enumerate() {
+            for (feature_index, feature) in history.features.iter().enumerate() {
+                if let Some(name) = names.of(feature) {
+                    starts.push((name.offset, history_index, feature_index));
+                }
+            }
+        }
+        starts.sort_by_key(|left| left.0);
+        for (index, &(start, history_index, feature_index)) in starts.iter().enumerate() {
+            let feature = &histories[history_index].features[feature_index];
+            if native_object_class(feature.input_class.as_deref().unwrap_or_default())
+                != NativeClassKind::ReferenceAxis
+                || feature.properties.contains_key("Planes")
+            {
+                continue;
+            }
+            let Some(end) = starts
+                .get(index + 1)
+                .map_or(Some(lane.native_payload.len()), |next| {
+                    index_from_u64(next.0)
+                })
+            else {
+                continue;
+            };
+            let Ok(start) = usize::try_from(start) else {
+                continue;
+            };
+            let Some(bytes) = lane.native_payload.get(start..end) else {
+                continue;
+            };
+            let mut axis_data_classes = Vec::new();
+            for class in &lane.classes {
+                if matches!(
+                    class.name.as_str(),
+                    "moPlaneInterAxisData_c" | "moSurfaceAxisData_c" | "moTwoPtsAxisData_c"
+                ) && (u64_from_index(start)..u64_from_index(end)).contains(&class.offset)
+                {
+                    axis_data_classes.push(class);
+                }
+            }
+            let mut anchored_frames = Vec::new();
+            for class in &axis_data_classes {
+                let Some(body) = usize::try_from(class.offset)
+                    .ok()
+                    .and_then(|offset| offset.checked_add(6 + class.name.len()))
+                else {
+                    continue;
+                };
+                let Some(end) = body.checked_add(88) else {
+                    continue;
+                };
+                let Some(payload) = lane.native_payload.get(body..end) else {
+                    continue;
+                };
+                if let Some(frame) = explicit_reference_axis_frame(payload) {
+                    anchored_frames.push(frame);
+                }
+            }
+            anchored_frames.sort_by(|left, right| {
+                reference_axis_frame_key(left).cmp(&reference_axis_frame_key(right))
+            });
+            anchored_frames.dedup_by_key(|frame| reference_axis_frame_key(frame));
+            let explicit_frame = if axis_data_classes.is_empty() {
+                explicit_reference_axis_frame(bytes)
+            } else {
+                let [frame] = anchored_frames.as_slice() else {
+                    continue;
+                };
+                Some(*frame)
+            };
+            if let Some((origin, direction)) = explicit_frame {
+                let feature = &mut histories[history_index].features[feature_index];
+                feature.properties.insert(
+                    cadmpeg_core::nonblank_literal!("Origin"),
+                    format!("{}mm,{}mm,{}mm", origin.x, origin.y, origin.z),
+                );
+                feature.properties.insert(
+                    cadmpeg_core::nonblank_literal!("Direction"),
+                    format!("{},{},{}", direction.x, direction.y, direction.z),
+                );
+                continue;
+            }
+            let Some([first, second]) = plane_intersection_axis_sources(bytes, &known_sources)
+            else {
+                continue;
+            };
+            histories[history_index].features[feature_index]
+                .properties
+                .insert(
+                    cadmpeg_core::nonblank_literal!("Planes"),
+                    format!("{first},{second}"),
+                );
+        }
+    }
+
+    for history in histories.iter_mut() {
+        for ReferenceAxisTriad(axes, pairs) in legacy_reference_axis_triads(&history.features) {
+            for (axis_index, planes) in axes.into_iter().zip(pairs) {
+                let axis = &mut history.features[axis_index];
+                if !axis.properties.contains_key("Planes") {
+                    axis.properties.insert(
+                        cadmpeg_core::nonblank_literal!("Planes"),
+                        format!("{},{}", planes[0], planes[1]),
+                    );
+                }
+            }
+        }
+    }
+
+    let Ok(projected) = crate::history::project::project_features(histories) else {
+        return;
+    };
+    let plane_frames = sketch_plane_frames(&projected, histories);
+    for feature in histories
+        .iter_mut()
+        .flat_map(|history| &mut history.features)
+    {
+        if native_object_class(feature.input_class.as_deref().unwrap_or_default())
+            != NativeClassKind::ReferenceAxis
+            || feature.properties.contains_key("Origin")
+            || feature.properties.contains_key("Direction")
+        {
+            continue;
+        }
+        let Some([first, second]) = feature.properties.get("Planes").and_then(|planes| {
+            let mut sources = planes.split(',').map(str::parse::<u32>);
+            let pair = [sources.next()?.ok()?, sources.next()?.ok()?];
+            sources.next().is_none().then_some(pair)
+        }) else {
+            continue;
+        };
+        let Some(frame) = plane_frames
+            .get(&first)
+            .zip(plane_frames.get(&second))
+            .and_then(|(first, second)| {
+                plane_intersection_axis_frame(first.as_tuple(), second.as_tuple())
+            })
+        else {
+            continue;
+        };
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("Origin"),
+            format!("{}mm,{}mm,{}mm", frame.0.x, frame.0.y, frame.0.z),
+        );
+        feature.properties.insert(
+            cadmpeg_core::nonblank_literal!("Direction"),
+            format!("{},{},{}", frame.1.x, frame.1.y, frame.1.z),
+        );
+    }
+
+    for history in histories {
+        let mut completions = Vec::new();
+        for ReferenceAxisTriad(indices, _) in legacy_reference_axis_triads(&history.features) {
+            let Some(completion) = (|| {
+                let frames = indices.map(|index| {
+                    let feature = &history.features[index];
+                    Some((
+                        crate::history::literals::parse_point3_mm(
+                            feature.properties.get("Origin")?,
+                        )?
+                        .get(),
+                        crate::history::literals::parse_vector3(
+                            feature.properties.get("Direction")?,
+                        )?,
+                    ))
+                });
+                let (missing, frame) = complete_reference_axis_triad(frames)?;
+                Some((indices[missing], frame))
+            })() else {
+                continue;
+            };
+            completions.push(completion);
+        }
+        for (index, (origin, direction)) in completions {
+            let feature = &mut history.features[index];
+            feature.properties.insert(
+                cadmpeg_core::nonblank_literal!("Origin"),
+                format!("{}mm,{}mm,{}mm", origin.x, origin.y, origin.z),
+            );
+            feature.properties.insert(
+                cadmpeg_core::nonblank_literal!("Direction"),
+                format!("{},{},{}", direction.x, direction.y, direction.z),
+            );
+        }
+    }
+}
+
+fn complete_reference_axis_triad(
+    frames: [Option<(Point3, Vector3)>; 3],
+) -> Option<(usize, (Point3, Vector3))> {
+    const ANGULAR_TOLERANCE: f64 = 1e-9;
+    const POSITION_TOLERANCE_MM: f64 = 1e-8;
+
+    let missing = frames.iter().position(Option::is_none)?;
+    if frames.iter().filter(|frame| frame.is_none()).count() != 1 {
+        return None;
+    }
+    let present = (0..3)
+        .filter_map(|index| frames[index].map(|frame| (index, frame)))
+        .collect::<Vec<_>>();
+    let [(_, (first_origin, first_direction)), (_, (second_origin, second_direction))] =
+        present.as_slice()
+    else {
+        return None;
+    };
+    let normalize = |direction: Vector3| {
+        let length = direction.norm();
+        (length.is_finite() && length > EPS_REFERENCE_GEOMETRY_COMPLETE_REFERENCE_AXIS_TRIAD_E12)
+            .then(|| {
+                Vector3::new(
+                    direction.x / length,
+                    direction.y / length,
+                    direction.z / length,
+                )
+            })
+    };
+    let first_direction = normalize(*first_direction)?;
+    let second_direction = normalize(*second_direction)?;
+    if first_direction.dot(second_direction).abs() > ANGULAR_TOLERANCE {
+        return None;
+    }
+    let displacement = Vector3::new(
+        second_origin.x - first_origin.x,
+        second_origin.y - first_origin.y,
+        second_origin.z - first_origin.z,
+    );
+    let first_along = displacement.dot(first_direction);
+    let first_point = Point3::new(
+        first_origin.x + first_direction.x * first_along,
+        first_origin.y + first_direction.y * first_along,
+        first_origin.z + first_direction.z * first_along,
+    );
+    let second_along = displacement.dot(second_direction);
+    let second_point = Point3::new(
+        second_origin.x - second_direction.x * second_along,
+        second_origin.y - second_direction.y * second_along,
+        second_origin.z - second_direction.z * second_along,
+    );
+    let separation = Vector3::new(
+        first_point.x - second_point.x,
+        first_point.y - second_point.y,
+        first_point.z - second_point.z,
+    );
+    let scale = [
+        first_point.x,
+        first_point.y,
+        first_point.z,
+        second_point.x,
+        second_point.y,
+        second_point.z,
+    ]
+    .into_iter()
+    .map(f64::abs)
+    .fold(1.0_f64, f64::max);
+    if separation.norm() > POSITION_TOLERANCE_MM * scale {
+        return None;
+    }
+    let origin = Point3::new(
+        (first_point.x + second_point.x) * 0.5,
+        (first_point.y + second_point.y) * 0.5,
+        (first_point.z + second_point.z) * 0.5,
+    );
+    let directions = frames.map(|frame| frame.and_then(|(_, direction)| normalize(direction)));
+    let direction = match missing {
+        0 => directions[2]?.cross(directions[1]?),
+        1 => directions[0]?.cross(directions[2]?),
+        2 => directions[1]?.cross(directions[0]?),
+        _ => return None,
+    };
+    Some((missing, (origin, normalize(direction)?)))
+}
+
+fn explicit_reference_axis_frame(payload: &[u8]) -> Option<(Point3, Vector3)> {
+    const NATIVE_TO_IR: f64 = 1000.0;
+    const UNIT_TOLERANCE: f64 = 1e-9;
+    const ORIGIN_ZERO_TOLERANCE_MM: f64 = 1e-9;
+    const DIRECTION_ZERO_TOLERANCE: f64 = 1e-12;
+
+    let scalar = |bytes: &[u8], offset: usize| {
+        let value = View::f64_le_at(bytes, offset)?;
+        value.is_finite().then_some(value)
+    };
+    let candidate = |bytes: &[u8]| {
+        let first = Vector3::new(scalar(bytes, 0)?, scalar(bytes, 8)?, scalar(bytes, 16)?);
+        let second = Vector3::new(scalar(bytes, 24)?, scalar(bytes, 32)?, scalar(bytes, 40)?);
+        let _first_parameter = scalar(bytes, 48)?;
+        let _second_parameter = scalar(bytes, 56)?;
+        let stored_direction =
+            Vector3::new(scalar(bytes, 64)?, scalar(bytes, 72)?, scalar(bytes, 80)?);
+        let delta = Vector3::new(second.x - first.x, second.y - first.y, second.z - first.z);
+        let delta_length = (delta.x * delta.x + delta.y * delta.y + delta.z * delta.z).sqrt();
+        let direction_length = (stored_direction.x * stored_direction.x
+            + stored_direction.y * stored_direction.y
+            + stored_direction.z * stored_direction.z)
+            .sqrt();
+        if delta_length <= EPS_REFERENCE_GEOMETRY_EXPLICIT_REFERENCE_AXIS_FRAME_E12
+            || (direction_length - 1.0).abs() > UNIT_TOLERANCE
+            || [first.x, first.y, first.z, second.x, second.y, second.z]
+                .into_iter()
+                .any(|value| value.abs() > 1.0e6)
+        {
+            return None;
+        }
+        let direction = Vector3::new(
+            stored_direction.x / direction_length,
+            stored_direction.y / direction_length,
+            stored_direction.z / direction_length,
+        );
+        let aligned =
+            (delta.x * direction.x + delta.y * direction.y + delta.z * direction.z) / delta_length;
+        if aligned < 1.0 - UNIT_TOLERANCE {
+            return None;
+        }
+        let projection = first.x * direction.x + first.y * direction.y + first.z * direction.z;
+        let origin = Point3::new(
+            (first.x - projection * direction.x) * NATIVE_TO_IR,
+            (first.y - projection * direction.y) * NATIVE_TO_IR,
+            (first.z - projection * direction.z) * NATIVE_TO_IR,
+        );
+        let canonical_zero =
+            |value: f64, tolerance: f64| if value.abs() <= tolerance { 0.0 } else { value };
+        Some((
+            Point3::new(
+                canonical_zero(origin.x, ORIGIN_ZERO_TOLERANCE_MM),
+                canonical_zero(origin.y, ORIGIN_ZERO_TOLERANCE_MM),
+                canonical_zero(origin.z, ORIGIN_ZERO_TOLERANCE_MM),
+            ),
+            Vector3::new(
+                canonical_zero(direction.x, DIRECTION_ZERO_TOLERANCE),
+                canonical_zero(direction.y, DIRECTION_ZERO_TOLERANCE),
+                canonical_zero(direction.z, DIRECTION_ZERO_TOLERANCE),
+            ),
+        ))
+    };
+    let mut unique = None;
+    for bytes in payload.windows(88) {
+        let Some(frame) = candidate(bytes) else {
+            continue;
+        };
+        match unique {
+            Some(existing)
+                if reference_axis_frame_key(&existing) != reference_axis_frame_key(&frame) =>
+            {
+                return None;
+            }
+            None => unique = Some(frame),
+            Some(_) => {}
+        }
+    }
+    unique
+}
+
+fn reference_axis_frame_key((origin, direction): &(Point3, Vector3)) -> [u64; 6] {
+    [
+        origin.x.to_bits(),
+        origin.y.to_bits(),
+        origin.z.to_bits(),
+        direction.x.to_bits(),
+        direction.y.to_bits(),
+        direction.z.to_bits(),
+    ]
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReferenceAxisTriad([usize; 3], [[u32; 2]; 3]);
+
+fn legacy_reference_axis_triads(features: &[crate::records::Feature]) -> Vec<ReferenceAxisTriad> {
+    let mut by_source = HashMap::<u32, Option<usize>>::new();
+    for (index, feature) in features.iter().enumerate() {
+        let Some(source) = feature.source_value() else {
+            continue;
+        };
+        if let Some(existing) = by_source.get_mut(&source) {
+            *existing = None;
+        } else {
+            by_source.insert(source, Some(index));
+        }
+    }
+    let mut triads = Vec::new();
+    for first in features {
+        let Some(source) = first.source_value() else {
+            continue;
+        };
+        let mut indices = [0usize; 6];
+        let mut complete = true;
+        for (offset, index) in indices.iter_mut().enumerate() {
+            let Some(candidate_source) = u32::try_from(offset)
+                .ok()
+                .and_then(|offset| source.checked_add(offset))
+            else {
+                complete = false;
+                break;
+            };
+            let Some(candidate_index) = by_source.get(&candidate_source).copied().flatten() else {
+                complete = false;
+                break;
+            };
+            *index = candidate_index;
+        }
+        if !complete
+            || indices[..3].iter().any(|index| {
+                native_object_class(features[*index].input_class.as_deref().unwrap_or_default())
+                    != NativeClassKind::ReferencePlane
+            })
+            || indices[3..].iter().any(|index| {
+                native_object_class(features[*index].input_class.as_deref().unwrap_or_default())
+                    != NativeClassKind::ReferenceAxis
+            })
+        {
+            continue;
+        }
+        let [Some(first_source), Some(second_source), Some(third_source)] = [
+            features[indices[0]].source_value(),
+            features[indices[1]].source_value(),
+            features[indices[2]].source_value(),
+        ] else {
+            continue;
+        };
+        triads.push(ReferenceAxisTriad(
+            [indices[3], indices[4], indices[5]],
+            [
+                [first_source, second_source],
+                [first_source, third_source],
+                [third_source, second_source],
+            ],
+        ));
+    }
+    triads
+}
+
+fn plane_intersection_axis_frame(
+    first: (Point3, Vector3, Vector3),
+    second: (Point3, Vector3, Vector3),
+) -> Option<(Point3, Vector3)> {
+    let (first_origin, first_normal, _) = first;
+    let (second_origin, second_normal, _) = second;
+    let direction = first_normal.cross(second_normal);
+    let squared_length = direction.dot(direction);
+    if !squared_length.is_finite() || squared_length <= 1.0e-18 {
+        return None;
+    }
+    let first_distance = first_normal.x * first_origin.x
+        + first_normal.y * first_origin.y
+        + first_normal.z * first_origin.z;
+    let second_distance = second_normal.x * second_origin.x
+        + second_normal.y * second_origin.y
+        + second_normal.z * second_origin.z;
+    let first_term = second_normal.cross(direction);
+    let second_term = direction.cross(first_normal);
+    let origin = Point3::new(
+        (first_distance * first_term.x + second_distance * second_term.x) / squared_length,
+        (first_distance * first_term.y + second_distance * second_term.y) / squared_length,
+        (first_distance * first_term.z + second_distance * second_term.z) / squared_length,
+    );
+    let length = squared_length.sqrt();
+    let direction = Vector3::new(
+        direction.x / length,
+        direction.y / length,
+        direction.z / length,
+    );
+    [
+        origin.x,
+        origin.y,
+        origin.z,
+        direction.x,
+        direction.y,
+        direction.z,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+    .then_some((origin, direction))
+}
+
+fn plane_intersection_axis_sources(
+    payload: &[u8],
+    known_sources: &HashSet<u32>,
+) -> Option<[u32; 2]> {
+    const RECORD_LEN: usize = 46;
+    const TERMINATOR: &[u8] = &[0xc7, 0xcf, 0xff, 0xff, 0xc7, 0xcf, 0xff, 0xff];
+    let mut sources = [0; 2];
+    let mut source_count = 0;
+    for bytes in payload.windows(RECORD_LEN) {
+        let source = (|| {
+            let source = View::u32_le_at(bytes, 0)?;
+            (known_sources.contains(&source)
+                && bytes.get(8..14)?.iter().all(|byte| *byte == 0)
+                && bytes.get(14..16) == Some(&[1, 0])
+                && bytes.get(16..22)?.iter().all(|byte| *byte == 0)
+                && bytes.get(22).is_some_and(|object| *object != 0xff)
+                && bytes.get(23..30)?.iter().all(|byte| *byte == 0)
+                && matches!(bytes.get(30), Some(0 | 3))
+                && bytes.get(31..38)?.iter().all(|byte| *byte == 0)
+                && bytes.get(38..46) == Some(TERMINATOR))
+            .then_some(source)
+        })();
+        if let Some(source) = source {
+            if sources[..source_count].contains(&source) {
+                continue;
+            }
+            let slot = sources.get_mut(source_count)?;
+            *slot = source;
+            source_count += 1;
+        }
+    }
+    (source_count == 2).then_some(sources)
+}
+
+fn compact_offset_plane_source(payload: &[u8]) -> Option<u32> {
+    const TRAILER: &[u8] = &[
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x2d, 0x80, 0x2b, 0x80,
+    ];
+    let mut unique = None;
+    for bytes in payload.windows(4 + TRAILER.len()) {
+        let Some(source) = View::u32_le_at(bytes, 0) else {
+            continue;
+        };
+        if source == 0 || bytes.get(4..) != Some(TRAILER) {
+            continue;
+        }
+        match unique {
+            Some(existing) if existing != source => return None,
+            None => unique = Some(source),
+            Some(_) => {}
+        }
+    }
+    unique
+}
+
+fn structured_offset_plane_sources(payload: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    const RECORD_LEN: usize = 140;
+    const TERMINATOR: &[u8] = &[0xc7, 0xcf, 0xff, 0xff, 0xc7, 0xcf, 0xff, 0xff];
+    payload.windows(RECORD_LEN).filter_map(|bytes| {
+        let header = bytes.get(4..8)?;
+        let identity = bytes.get(8..20)?;
+        let link = bytes.get(28..32)?;
+        let source = View::u32_le_at(bytes, 44)?;
+        let address = bytes.get(116..120)?;
+        (bytes.get(..4) == Some(&4u32.to_le_bytes())
+            && header != [0; 4]
+            && bytes.get(48..52) == Some(header)
+            && identity != [0; 12]
+            && bytes.get(32..44) == Some(identity)
+            && bytes.get(52..64) == Some(identity)
+            && bytes.get(76..88) == Some(identity)
+            && bytes.get(20..28) == Some(&[0; 8])
+            && link != [0; 4]
+            && bytes.get(72..76) == Some(link)
+            && bytes.get(64..68) == Some(&1u32.to_le_bytes())
+            && bytes.get(68..72) == Some(&[0; 4])
+            && bytes.get(88..92) == Some(&1u32.to_le_bytes())
+            && bytes.get(92..108) == Some(&[0; 16])
+            && bytes.get(108..112) == Some(&1u32.to_le_bytes())
+            && bytes.get(112..116) == Some(&[0; 4])
+            && address != [0; 4]
+            && bytes.get(120..132) == Some(&[0; 12])
+            && bytes.get(132..140) == Some(TERMINATOR))
+        .then_some(source)
+    })
+}
+
+fn classed_offset_plane_sources(payload: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    const TRAILER: &[u8] = b"\xff\xff\x01\x00\x1b\x00moFromSktEnt3IntSurfIdRep_c\x00\x00";
+    payload.windows(4 + TRAILER.len()).filter_map(|bytes| {
+        let source = View::u32_le_at(bytes, 0)?;
+        (bytes.get(4..) == Some(TRAILER)).then_some(source)
+    })
+}
+
+fn offset_plane_reference_source(
+    payload: &[u8],
+    known_sources: &HashSet<u32>,
+    known_reference_plane_sources: &HashSet<u32>,
+    self_source: Option<u32>,
+) -> Option<u32> {
+    const RECORD_LEN: usize = 46;
+    const TERMINATOR: &[u8] = &[0xc7, 0xcf, 0xff, 0xff, 0xc7, 0xcf, 0xff, 0xff];
+    let typed_sources = payload.windows(RECORD_LEN).filter_map(|bytes| {
+        let source = View::u32_le_at(bytes, 0)?;
+        let signature = bytes.get(4..8)?;
+        let selector = View::u32_le_at(bytes, 10)?;
+        (known_reference_plane_sources.contains(&source)
+            && Some(source) != self_source
+            && signature != [0; 4]
+            && bytes.get(8..10) == Some(&[0, 0])
+            && selector <= 3
+            && bytes.get(14..18) == Some(&1u32.to_le_bytes())
+            && bytes.get(18..22) == Some(&[0; 4])
+            && bytes.get(26..38) == Some(&[0; 12])
+            && bytes.get(38..46) == Some(TERMINATOR))
+        .then_some(source)
+    });
+    let compact_sources = compact_offset_plane_source(payload)
+        .filter(|source| Some(*source) != self_source && known_sources.contains(source));
+    let structured_sources = structured_offset_plane_sources(payload)
+        .filter(|source| Some(*source) != self_source && known_sources.contains(source));
+    let classed_sources = classed_offset_plane_sources(payload)
+        .filter(|source| Some(*source) != self_source && known_sources.contains(source));
+    let mut unique = None;
+    for source in typed_sources
+        .chain(compact_sources)
+        .chain(structured_sources)
+        .chain(classed_sources)
+    {
+        match unique {
+            Some(existing) if existing != source => return None,
+            None => unique = Some(source),
+            Some(_) => {}
+        }
+    }
+    unique
+}
+
+fn legacy_offset_plane_face_alias(payload: &[u8]) -> Option<(usize, u32)> {
+    const TERMINATOR: &[u8] = b"\xc7\xcf\xff\xff\xc7\xcf\xff\xff";
+    let mut unique = None;
+    for (offset, body) in payload.windows(115).enumerate() {
+        let alias = (|| {
+            let token = View::u16_le_at(body, 0)?;
+            if !is_class_token(token)
+                || body[2..6] != 2u32.to_le_bytes()
+                || body[6..42] != [0; 36]
+                || body[42..45] != [0; 3]
+                || body[45..61] != [0xff; 16]
+                || body[61..69] != [0; 8]
+                || body[69..73] != 2u32.to_le_bytes()
+                || body[73..77] == [0; 4]
+                || body[77..83] != [0, 0, 3, 0, 0, 0]
+                || body[83..91] != [1, 0, 0, 0, 0, 0, 0, 0]
+                || body[95..99] != [0; 4]
+                || body[99..103] != 3u32.to_le_bytes()
+                || body[103..107] != [0; 4]
+                || &body[107..115] != TERMINATOR
+            {
+                return None;
+            }
+            let owner = View::u32_le_at(body, 91)?;
+            (owner != 0 && owner != u32::MAX).then_some((offset, owner))
+        })();
+        let Some(alias) = alias else {
+            continue;
+        };
+        match unique {
+            Some(existing) if existing != alias => return None,
+            None => unique = Some(alias),
+            Some(_) => {}
+        }
+    }
+    unique
+}
+
+const MINIMAL_REFERENCE_PLANE_FRAME_LEN: usize = 81;
+const COMPACT_REFERENCE_PLANE_FRAME_LEN: usize = 82;
+const ANGLED_REFERENCE_PLANE_FRAME_LEN: usize = 121;
+const REFERENCE_PLANE_FRAME_TOLERANCE: f64 = 1.0e-9;
+
+type PlaneFrame = (Point3, Vector3, Vector3);
+
+pub(super) fn explicit_reference_plane_frame(payload: &[u8]) -> Result<Option<PlaneFrame>, ()> {
+    let frames = matrix_reference_plane_frame_candidates(payload)
+        .map(|(_, frame)| frame)
+        .chain(fixed_reference_plane_frame_candidates(payload).map(|(_, frame)| frame))
+        .chain(minimal_reference_plane_frame(payload));
+    let mut first = None;
+    for frame in frames {
+        match first {
+            None => first = Some(frame),
+            Some(existing) if existing != frame => return Err(()),
+            Some(_) => {}
+        }
+    }
+    for (offset, frame) in raw_angled_reference_plane_frame_candidates(payload) {
+        if strong_reference_plane_overlap(payload, offset, ANGLED_REFERENCE_PLANE_FRAME_LEN) {
+            continue;
+        }
+        match first {
+            None => first = Some(frame),
+            Some(existing) if existing != frame => return Err(()),
+            Some(_) => {}
+        }
+    }
+    for (offset, frame) in compact_reference_plane_frame_candidates(payload) {
+        if strong_reference_plane_overlap(payload, offset, COMPACT_REFERENCE_PLANE_FRAME_LEN) {
+            continue;
+        }
+        match first {
+            None => first = Some(frame),
+            Some(existing) if existing != frame => return Err(()),
+            Some(_) => {}
+        }
+    }
+    Ok(first)
+}
+
+fn strong_reference_plane_overlap(payload: &[u8], offset: usize, len: usize) -> bool {
+    let preceding_bytes = matrix_plane::LEN.max(fixed_plane::LEN) - 1;
+    let start = offset
+        .checked_sub(preceding_bytes)
+        .map_or(0, std::convert::identity);
+    let end = offset
+        .checked_add(len)
+        .unwrap_or(payload.len())
+        .min(payload.len());
+    (start..end).any(|strong_offset| {
+        let matrix = strong_offset
+            .checked_add(matrix_plane::LEN)
+            .and_then(|end| payload.get(strong_offset..end));
+        if ranges_overlap(offset, len, strong_offset, matrix_plane::LEN)
+            && matrix.and_then(matrix_reference_plane_frame).is_some()
+        {
+            return true;
+        }
+        let fixed = strong_offset
+            .checked_add(fixed_plane::LEN)
+            .and_then(|end| payload.get(strong_offset..end));
+        ranges_overlap(offset, len, strong_offset, fixed_plane::LEN)
+            && fixed
+                .and_then(|bytes| {
+                    fixed_reference_plane_frame(bytes)
+                        .or_else(|| repeated_normal_reference_plane_frame(bytes))
+                })
+                .is_some()
+    })
+}
+
+fn constraint_reference_plane_frame(
+    payload: &[u8],
+    class_offset: usize,
+    class_name: &str,
+) -> Option<(Point3, Vector3, Vector3)> {
+    let body = class_offset.checked_add(6 + class_name.len())?;
+    match class_name {
+        "moConstraintCoincLineAtAnglePlaneRefplaneData_c" => {
+            matrix_reference_plane_frame(payload.get(body..body + matrix_plane::LEN)?)
+        }
+        "moConstraintCoincLineParallelPlaneRefplaneData_c"
+        | "moConstraintPerpPlnTanOneCylinderRefplaneData_c"
+        | "moFacePtRefPlnData_c"
+        | "moFixedRefPlnData_c" => {
+            let frame = payload.get(body..body + fixed_plane::LEN)?;
+            if class_name == "moFixedRefPlnData_c" {
+                fixed_reference_plane_frame(frame)
+                    .or_else(|| repeated_normal_reference_plane_frame(frame))
+            } else {
+                fixed_reference_plane_frame(frame)
+            }
+        }
+        "moDefaultRefPlnData_c" | "moConstraintPrllPlnTanOneCylinderRefplaneData_c" => {
+            minimal_reference_plane_frame(
+                payload.get(body..body + MINIMAL_REFERENCE_PLANE_FRAME_LEN)?,
+            )
+        }
+        "moFaceRefPlnData_c" => {
+            fixed_reference_plane_frame(payload.get(body..body + fixed_plane::LEN)?).or_else(|| {
+                minimal_reference_plane_frame(
+                    payload.get(body..body + MINIMAL_REFERENCE_PLANE_FRAME_LEN)?,
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn reference_plane_frame_key(
+    (origin, normal, u_axis): &(Point3, Vector3, Vector3),
+) -> [u64; 9] {
+    let canonical_bits = |value: f64| if value == 0.0 { 0 } else { value.to_bits() };
+    [
+        canonical_bits(origin.x),
+        canonical_bits(origin.y),
+        canonical_bits(origin.z),
+        canonical_bits(normal.x),
+        canonical_bits(normal.y),
+        canonical_bits(normal.z),
+        canonical_bits(u_axis.x),
+        canonical_bits(u_axis.y),
+        canonical_bits(u_axis.z),
+    ]
+}
+
+fn fixed_reference_plane_frame(bytes: &[u8]) -> Option<(Point3, Vector3, Vector3)> {
+    const NATIVE_TO_IR: f64 = 1000.0;
+    if bytes.len() != fixed_plane::LEN || bytes.get(fixed_plane::FRAME_MARKER) != Some(&1) {
+        return None;
+    }
+    let scalar = |offset| {
+        let value = View::f64_le_at(bytes, offset)?;
+        value.is_finite().then_some(value)
+    };
+    let native_origin = [
+        scalar(fixed_plane::ORIGIN)?,
+        scalar(fixed_plane::ORIGIN + 8)?,
+        scalar(fixed_plane::ORIGIN + 16)?,
+    ];
+    let origin = Point3::new(
+        native_origin[0] * NATIVE_TO_IR,
+        native_origin[1] * NATIVE_TO_IR,
+        native_origin[2] * NATIVE_TO_IR,
+    );
+    let normal = Vector3::new(
+        scalar(fixed_plane::NORMAL)?,
+        scalar(fixed_plane::NORMAL + 8)?,
+        scalar(fixed_plane::NORMAL + 16)?,
+    );
+    let u_axis = Vector3::new(
+        scalar(fixed_plane::U_AXIS)?,
+        scalar(fixed_plane::U_AXIS + 8)?,
+        scalar(fixed_plane::U_AXIS + 16)?,
+    );
+    let v_axis = Vector3::new(
+        scalar(fixed_plane::V_AXIS)?,
+        scalar(fixed_plane::V_AXIS + 8)?,
+        scalar(fixed_plane::V_AXIS + 16)?,
+    );
+    ([normal, u_axis, v_axis]
+        .into_iter()
+        .all(|vector| (vector.norm() - 1.0).abs() <= REFERENCE_PLANE_FRAME_TOLERANCE)
+        && normal.dot(u_axis).abs() <= REFERENCE_PLANE_FRAME_TOLERANCE
+        && normal.dot(v_axis).abs() <= REFERENCE_PLANE_FRAME_TOLERANCE
+        && u_axis.dot(v_axis).abs() <= REFERENCE_PLANE_FRAME_TOLERANCE)
+        .then_some((origin, normal, u_axis))
+}
+
+fn repeated_normal_reference_plane_frame(bytes: &[u8]) -> Option<(Point3, Vector3, Vector3)> {
+    const NATIVE_TO_IR: f64 = 1000.0;
+    if bytes.len() != fixed_plane::LEN || bytes.get(fixed_plane::FRAME_MARKER) != Some(&1) {
+        return None;
+    }
+    let scalar = |offset| {
+        let value = View::f64_le_at(bytes, offset)?;
+        value.is_finite().then_some(value)
+    };
+    let origin = Point3::new(
+        scalar(fixed_plane::ORIGIN)? * NATIVE_TO_IR,
+        scalar(fixed_plane::ORIGIN + 8)? * NATIVE_TO_IR,
+        scalar(fixed_plane::ORIGIN + 16)? * NATIVE_TO_IR,
+    );
+    let normal = Vector3::new(
+        scalar(fixed_plane::NORMAL)?,
+        scalar(fixed_plane::NORMAL + 8)?,
+        scalar(fixed_plane::NORMAL + 16)?,
+    );
+    let first_axis = Vector3::new(
+        scalar(fixed_plane::U_AXIS)?,
+        scalar(fixed_plane::U_AXIS + 8)?,
+        scalar(fixed_plane::U_AXIS + 16)?,
+    );
+    let second_axis = Vector3::new(
+        scalar(fixed_plane::V_AXIS)?,
+        scalar(fixed_plane::V_AXIS + 8)?,
+        scalar(fixed_plane::V_AXIS + 16)?,
+    );
+    let unit = |vector: Vector3| (vector.norm() - 1.0).abs() <= REFERENCE_PLANE_FRAME_TOLERANCE;
+    let plane_axis = |vector: Vector3| {
+        unit(vector) && normal.dot(vector).abs() <= REFERENCE_PLANE_FRAME_TOLERANCE
+    };
+    let repeated_normal = |vector: Vector3| {
+        unit(vector)
+            && (normal.dot(vector).abs() - 1.0).abs() <= REFERENCE_PLANE_FRAME_TOLERANCE
+            && normal.cross(vector).norm() <= REFERENCE_PLANE_FRAME_TOLERANCE
+    };
+    let u_axis = if plane_axis(first_axis) && repeated_normal(second_axis) {
+        first_axis
+    } else if plane_axis(second_axis) && repeated_normal(first_axis) {
+        second_axis
+    } else {
+        return None;
+    };
+    Some((origin, normal, u_axis))
+}
+
+type ReferencePlaneFrame = (Point3, Vector3, Vector3);
+
+fn fixed_reference_plane_frame_candidates(
+    payload: &[u8],
+) -> impl Iterator<Item = (usize, ReferencePlaneFrame)> + '_ {
+    payload
+        .windows(fixed_plane::LEN)
+        .enumerate()
+        .filter(|(offset, _)| {
+            payload
+                .get(*offset..*offset + matrix_plane::LEN)
+                .and_then(matrix_reference_plane_frame)
+                .is_none()
+        })
+        .filter_map(|(offset, bytes)| {
+            fixed_reference_plane_frame(bytes)
+                .or_else(|| repeated_normal_reference_plane_frame(bytes))
+                .map(|frame| (offset, frame))
+        })
+}
+
+fn offset_reference_plane_frame_pair(
+    payload: &[u8],
+    distance: cadmpeg_ir::scalar::Length,
+) -> Option<(ReferencePlaneFrame, ReferencePlaneFrame)> {
+    let valid_pair = |result: ReferencePlaneFrame, reference: ReferencePlaneFrame| {
+        offset_plane_reference_frame_matches(reference, result, distance.get())
+            .then_some((result, reference))
+    };
+    let mut matrix_candidates = Vec::new();
+    for candidate in matrix_reference_plane_frame_candidates(payload) {
+        matrix_candidates.push(candidate);
+    }
+    let mut fixed_candidates = Vec::new();
+    for candidate in fixed_reference_plane_frame_candidates(payload) {
+        fixed_candidates.push(candidate);
+    }
+    if let [(_, result), (_, reference)] = fixed_candidates.as_slice() {
+        return valid_pair(*result, *reference);
+    }
+    let mut matrix_unique = [None; 3];
+    let mut matrix_count = 0;
+    for (_, frame) in &matrix_candidates {
+        if matrix_unique[..matrix_count].contains(&Some(*frame)) {
+            continue;
+        }
+        if matrix_count == matrix_unique.len() {
+            break;
+        }
+        matrix_unique[matrix_count] = Some(*frame);
+        matrix_count += 1;
+    }
+    if let [Some(result), Some(reference), None] = matrix_unique {
+        return valid_pair(result, reference);
+    }
+    let mut frames = Vec::new();
+    for offset in 0..payload.len() {
+        let fixed = fixed_candidates
+            .iter()
+            .find_map(|(fixed_offset, frame)| (*fixed_offset == offset).then_some(*frame));
+        let matrix = matrix_candidates
+            .iter()
+            .find_map(|(matrix_offset, frame)| (*matrix_offset == offset).then_some(*frame));
+        let compact = match payload.get(offset..offset + COMPACT_REFERENCE_PLANE_FRAME_LEN) {
+            Some(window) => compact_reference_plane_frame(window),
+            None => None,
+        };
+        let candidates = [
+            fixed,
+            matrix,
+            payload
+                .get(offset..offset + MINIMAL_REFERENCE_PLANE_FRAME_LEN)
+                .and_then(minimal_reference_plane_frame),
+            compact,
+        ];
+        for frame in candidates.into_iter().flatten() {
+            if !frames.contains(&(offset, frame)) {
+                frames.push((offset, frame));
+            }
+        }
+    }
+    let mut unique_pair = None;
+    let mut ambiguous = false;
+    for (result_index, (result_offset, result)) in frames.iter().enumerate() {
+        for (reference_offset, reference) in frames.iter().skip(result_index + 1) {
+            if result_offset >= reference_offset {
+                continue;
+            }
+            if let Some(pair) = valid_pair(*result, *reference) {
+                match unique_pair {
+                    None => unique_pair = Some(pair),
+                    Some(previous) if previous != pair => ambiguous = true,
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    if ambiguous {
+        None
+    } else {
+        unique_pair
+    }
+}
+
+fn constraint_midplane_frame(
+    payload: &[u8],
+) -> Result<Option<(Point3, Vector3, Vector3)>, CodecError> {
+    const CLASS: &[u8] = b"moConstraintMidPlaneRefplaneData_c";
+    const NATIVE_TO_IR: f64 = 1000.0;
+    let record_len = CLASS_MARKER.len() + 2 + CLASS.len();
+    let class_len = u16::try_from(CLASS.len())
+        .map_err(|_| CodecError::malformed("SLDPRT midplane constraint class name is too long"))?
+        .to_le_bytes();
+    let mut unique = None;
+    let mut ambiguous = false;
+    for (offset, bytes) in payload.windows(record_len).enumerate() {
+        if bytes.get(..CLASS_MARKER.len()) != Some(CLASS_MARKER)
+            || bytes.get(CLASS_MARKER.len()..CLASS_MARKER.len() + 2) != Some(&class_len)
+            || bytes.get(CLASS_MARKER.len() + 2..) != Some(CLASS)
+        {
+            continue;
+        }
+        let body = offset + record_len;
+        let frame = (|| {
+            payload.get(body..body + 8)?;
+            let scalar = |relative| {
+                let value = View::f64_le_at(payload, body + relative)?;
+                value.is_finite().then_some(value)
+            };
+            let tolerance = scalar(8)?;
+            if tolerance.abs() > EPS_REFERENCE_GEOMETRY_CONSTRAINT_MIDPLANE_FRAME_E9 {
+                return None;
+            }
+            let distance = scalar(16)?;
+            let normal = Vector3::new(scalar(24)?, scalar(32)?, scalar(40)?);
+            let squared_norm = normal.x * normal.x + normal.y * normal.y + normal.z * normal.z;
+            if (squared_norm - 1.0).abs() > EPS_REFERENCE_GEOMETRY_CONSTRAINT_MIDPLANE_FRAME_E9 {
+                return None;
+            }
+            let reference = if normal.x.abs() <= normal.y.abs() && normal.x.abs() <= normal.z.abs()
+            {
+                Vector3::new(1.0, 0.0, 0.0)
+            } else if normal.y.abs() <= normal.z.abs() {
+                Vector3::new(0.0, 1.0, 0.0)
+            } else {
+                Vector3::new(0.0, 0.0, 1.0)
+            };
+            let projection =
+                reference.x * normal.x + reference.y * normal.y + reference.z * normal.z;
+            let u_axis = Vector3::new(
+                reference.x - projection * normal.x,
+                reference.y - projection * normal.y,
+                reference.z - projection * normal.z,
+            );
+            let u_length = (u_axis.x * u_axis.x + u_axis.y * u_axis.y + u_axis.z * u_axis.z).sqrt();
+            let u_axis = Vector3::new(
+                u_axis.x / u_length,
+                u_axis.y / u_length,
+                u_axis.z / u_length,
+            );
+            Some((
+                Point3::new(
+                    normal.x * distance * NATIVE_TO_IR,
+                    normal.y * distance * NATIVE_TO_IR,
+                    normal.z * distance * NATIVE_TO_IR,
+                ),
+                normal,
+                u_axis,
+            ))
+        })();
+        if let Some(frame) = frame {
+            match unique {
+                None => unique = Some(frame),
+                Some(previous) if previous != frame => ambiguous = true,
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(if ambiguous { None } else { unique })
+}
+
+fn raw_angled_reference_plane_frame_candidates(
+    payload: &[u8],
+) -> impl Iterator<Item = (usize, (Point3, Vector3, Vector3))> + '_ {
+    let scalar = |bytes: &[u8], relative| {
+        let value = View::f64_le_at(bytes, relative)?;
+        value.is_finite().then_some(value)
+    };
+    payload
+        .windows(ANGLED_REFERENCE_PLANE_FRAME_LEN)
+        .enumerate()
+        .filter_map(move |(offset, bytes)| {
+            if bytes.get(16) != Some(&1)
+                || bytes.get(89..113)?.iter().any(|byte| *byte != 0)
+                || scalar(bytes, 113)? != 1.0
+            {
+                return None;
+            }
+            let u_axis = Vector3::new(scalar(bytes, 17)?, scalar(bytes, 25)?, scalar(bytes, 33)?);
+            let normal = Vector3::new(scalar(bytes, 41)?, scalar(bytes, 49)?, scalar(bytes, 57)?);
+            let v_axis = Vector3::new(scalar(bytes, 65)?, scalar(bytes, 73)?, scalar(bytes, 81)?);
+            if normal.x != 0.0
+                || scalar(bytes, 0)?.to_bits() != normal.z.to_bits()
+                || scalar(bytes, 8)?.to_bits() != normal.y.to_bits()
+                || [u_axis, normal, v_axis].into_iter().any(|vector| {
+                    (vector.norm() - 1.0).abs()
+                        > EPS_REFERENCE_GEOMETRY_ANGLED_REFERENCE_PLANE_FRAME_E9
+                })
+                || u_axis.dot(normal).abs() > EPS_REFERENCE_GEOMETRY_ANGLED_REFERENCE_PLANE_FRAME_E9
+                || u_axis.dot(v_axis).abs() > EPS_REFERENCE_GEOMETRY_ANGLED_REFERENCE_PLANE_FRAME_E9
+                || normal.dot(v_axis).abs() > EPS_REFERENCE_GEOMETRY_ANGLED_REFERENCE_PLANE_FRAME_E9
+            {
+                return None;
+            }
+            Some((offset, (Point3::new(0.0, 0.0, 0.0), normal, u_axis)))
+        })
+}
+
+#[cfg(test)]
+fn angled_reference_plane_frame_candidates(
+    payload: &[u8],
+) -> impl Iterator<Item = (usize, (Point3, Vector3, Vector3))> + '_ {
+    raw_angled_reference_plane_frame_candidates(payload).filter(|(offset, _)| {
+        let start = offset.checked_sub(fixed_plane::LEN - 1).unwrap_or(0);
+        // Every angled window ends within the payload.
+        let end = offset + ANGLED_REFERENCE_PLANE_FRAME_LEN;
+        !(start..end).any(|fixed_offset| {
+            payload
+                .get(fixed_offset..)
+                .and_then(|tail| tail.get(..fixed_plane::LEN))
+                .is_some_and(|bytes| {
+                    fixed_reference_plane_frame(bytes)
+                        .or_else(|| repeated_normal_reference_plane_frame(bytes))
+                        .is_some()
+                })
+        })
+    })
+}
+
+fn matrix_reference_plane_frame(payload: &[u8]) -> Option<(Point3, Vector3, Vector3)> {
+    let mut frames = matrix_reference_plane_frame_candidates(payload).map(|(_, frame)| frame);
+    let frame = frames.next()?;
+    frames.all(|candidate| candidate == frame).then_some(frame)
+}
+
+fn matrix_reference_plane_frame_candidates(
+    payload: &[u8],
+) -> impl Iterator<Item = (usize, ReferencePlaneFrame)> + '_ {
+    const NATIVE_TO_IR: f64 = 1000.0;
+    let scalar = |bytes: &[u8], relative| {
+        let value = View::f64_le_at(bytes, relative)?;
+        value.is_finite().then_some(value)
+    };
+    payload
+        .windows(matrix_plane::LEN)
+        .enumerate()
+        .filter_map(move |(offset, bytes)| {
+            if bytes[matrix_plane::FRAME_MARKER] != 1 {
+                return None;
+            }
+            let origin = Point3::new(
+                scalar(bytes, matrix_plane::ORIGIN)? * NATIVE_TO_IR,
+                scalar(bytes, matrix_plane::ORIGIN + 8)? * NATIVE_TO_IR,
+                scalar(bytes, matrix_plane::ORIGIN + 16)? * NATIVE_TO_IR,
+            );
+            let normal = Vector3::new(
+                scalar(bytes, matrix_plane::NORMAL)?,
+                scalar(bytes, matrix_plane::NORMAL + 8)?,
+                scalar(bytes, matrix_plane::NORMAL + 16)?,
+            );
+            let rows = [
+                Vector3::new(
+                    scalar(bytes, matrix_plane::BASIS_MATRIX)?,
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 8)?,
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 16)?,
+                ),
+                Vector3::new(
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 24)?,
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 32)?,
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 40)?,
+                ),
+                Vector3::new(
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 48)?,
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 56)?,
+                    scalar(bytes, matrix_plane::BASIS_MATRIX + 64)?,
+                ),
+            ];
+            let u_axis = Vector3::new(rows[0].x, rows[1].x, rows[2].x);
+            let v_axis = Vector3::new(rows[0].y, rows[1].y, rows[2].y);
+            let matrix_normal = Vector3::new(rows[0].z, rows[1].z, rows[2].z);
+            if [normal, u_axis, v_axis, matrix_normal]
+                .into_iter()
+                .any(|vector| {
+                    (vector.norm() - 1.0).abs()
+                        > EPS_REFERENCE_GEOMETRY_MATRIX_REFERENCE_PLANE_FRAME_CANDIDATES_E9
+                })
+                || u_axis.dot(v_axis).abs()
+                    > EPS_REFERENCE_GEOMETRY_MATRIX_REFERENCE_PLANE_FRAME_CANDIDATES_E9
+                || u_axis.dot(matrix_normal).abs()
+                    > EPS_REFERENCE_GEOMETRY_MATRIX_REFERENCE_PLANE_FRAME_CANDIDATES_E9
+                || v_axis.dot(matrix_normal).abs()
+                    > EPS_REFERENCE_GEOMETRY_MATRIX_REFERENCE_PLANE_FRAME_CANDIDATES_E9
+                || normal.dot(matrix_normal)
+                    < 1.0 - EPS_REFERENCE_GEOMETRY_MATRIX_REFERENCE_PLANE_FRAME_CANDIDATES_E9
+                || u_axis.cross(v_axis).dot(matrix_normal)
+                    < 1.0 - EPS_REFERENCE_GEOMETRY_MATRIX_REFERENCE_PLANE_FRAME_CANDIDATES_E9
+            {
+                return None;
+            }
+            Some((offset, (origin, normal, u_axis)))
+        })
+}
+
+fn minimal_reference_plane_frame(payload: &[u8]) -> Option<(Point3, Vector3, Vector3)> {
+    const NATIVE_TO_IR: f64 = 1000.0;
+    let scalar = |bytes: &[u8], relative| {
+        let value = View::f64_le_at(bytes, relative)?;
+        value.is_finite().then_some(value)
+    };
+    let mut frames = payload
+        .windows(MINIMAL_REFERENCE_PLANE_FRAME_LEN)
+        .filter_map(|bytes| {
+            if bytes[56] != 0x80 || bytes[48..56].iter().any(|byte| *byte != 0) {
+                return None;
+            }
+            let origin = Point3::new(scalar(bytes, 0)?, scalar(bytes, 8)?, scalar(bytes, 16)?);
+            let normal = Vector3::new(scalar(bytes, 24)?, scalar(bytes, 32)?, scalar(bytes, 40)?);
+            let tail = [scalar(bytes, 57)?, scalar(bytes, 65)?, scalar(bytes, 73)?];
+            if normal != Vector3::new(0.0, 0.0, 1.0)
+                || tail[0].to_bits() != (-0.0_f64).to_bits()
+                || tail[1].to_bits() != (-origin.z).to_bits()
+                || tail[2] != 1.0
+            {
+                return None;
+            }
+            Some((
+                Point3::new(
+                    origin.x * NATIVE_TO_IR,
+                    origin.y * NATIVE_TO_IR,
+                    origin.z * NATIVE_TO_IR,
+                ),
+                normal,
+                Vector3::new(1.0, 0.0, 0.0),
+            ))
+        });
+    let frame = frames.next()?;
+    frames.all(|candidate| candidate == frame).then_some(frame)
+}
+
+fn compact_reference_plane_frame(payload: &[u8]) -> Option<(Point3, Vector3, Vector3)> {
+    let mut frames = compact_reference_plane_frame_candidates(payload);
+    let (_, frame) = frames.next()?;
+    frames
+        .all(|(_, candidate)| candidate == frame)
+        .then_some(frame)
+}
+
+fn compact_reference_plane_frame_candidates(
+    payload: &[u8],
+) -> impl Iterator<Item = (usize, (Point3, Vector3, Vector3))> + '_ {
+    const NATIVE_TO_IR: f64 = 1000.0;
+    let scalar = |bytes: &[u8], relative| {
+        let value = View::f64_le_at(bytes, relative)?;
+        value.is_finite().then_some(value)
+    };
+    payload
+        .windows(COMPACT_REFERENCE_PLANE_FRAME_LEN)
+        .enumerate()
+        .filter(|(_, bytes)| bytes[64] == 0 && bytes[81] == 0)
+        .flat_map(move |(offset, bytes)| {
+            let candidates = (|| {
+                let origin = Point3::new(
+                    scalar(bytes, 0)? * NATIVE_TO_IR,
+                    scalar(bytes, 8)? * NATIVE_TO_IR,
+                    scalar(bytes, 16)? * NATIVE_TO_IR,
+                );
+                let normal_xy = scalar(bytes, 24).zip(scalar(bytes, 32))?;
+                let u_axis =
+                    Vector3::new(scalar(bytes, 40)?, scalar(bytes, 48)?, scalar(bytes, 56)?);
+                let v_xy = scalar(bytes, 65).zip(scalar(bytes, 73))?;
+                if (u_axis.dot(u_axis) - 1.0).abs()
+                    > EPS_REFERENCE_GEOMETRY_COMPACT_REFERENCE_PLANE_FRAME_E9
+                {
+                    return None;
+                }
+                let remaining = 1.0 - v_xy.0 * v_xy.0 - v_xy.1 * v_xy.1;
+                if remaining < -EPS_REFERENCE_GEOMETRY_COMPACT_REFERENCE_PLANE_FRAME_E9 {
+                    return None;
+                }
+                let omitted = remaining.max(0.0).sqrt();
+                let mut pair = [omitted, -omitted].map(|v_z| {
+                    let v_axis = Vector3::new(v_xy.0, v_xy.1, v_z);
+                    let normal = u_axis.cross(v_axis);
+                    (u_axis.dot(v_axis).abs()
+                        <= EPS_REFERENCE_GEOMETRY_COMPACT_REFERENCE_PLANE_FRAME_E9
+                        && (normal.dot(normal) - 1.0).abs()
+                            <= EPS_REFERENCE_GEOMETRY_COMPACT_REFERENCE_PLANE_FRAME_E9
+                        && (normal.x - normal_xy.0).abs()
+                            <= EPS_REFERENCE_GEOMETRY_COMPACT_REFERENCE_PLANE_FRAME_E9
+                        && (normal.y - normal_xy.1).abs()
+                            <= EPS_REFERENCE_GEOMETRY_COMPACT_REFERENCE_PLANE_FRAME_E9)
+                        .then_some((offset, (origin, normal, u_axis)))
+                });
+                pair.sort_by(|left, right| {
+                    let key = |candidate: &Option<(usize, (Point3, Vector3, Vector3))>| {
+                        candidate
+                            .as_ref()
+                            .map_or([u64::MAX; 9], |(_, frame)| reference_plane_frame_key(frame))
+                    };
+                    key(left).cmp(&key(right))
+                });
+                Some(pair)
+            })();
+            candidates.into_iter().flatten().flatten()
+        })
+}
+
+fn ranges_overlap(
+    left_offset: usize,
+    left_len: usize,
+    right_offset: usize,
+    right_len: usize,
+) -> bool {
+    // A range end past `usize::MAX` lies beyond every offset.
+    right_offset
+        .checked_add(right_len)
+        .is_none_or(|right_end| left_offset < right_end)
+        && left_offset
+            .checked_add(left_len)
+            .is_none_or(|left_end| right_offset < left_end)
+}
+
+#[cfg(test)]
+mod reference_geometry_tests;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod frame_ownership;

@@ -1,0 +1,6 @@
+{
+  "en": {
+    "move.snap.axis_prompt": "Select a face normal or edge direction to align this axis. The handle origin stays fixed.",
+    "move.snap.handle_gestures": "Click an axis to align it to geometry; drag an arrow to move, or a ring to rotate."
+  }
+}

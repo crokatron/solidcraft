@@ -1,7 +1,7 @@
 //! File formats. Designs use JSON or versioned containers (`.sc`; `.solidcraft` and `.solvecraft` still open); the authoritative
 //! document rebuilds on load and optional display caches remain provisional. Bodies export
 //! as STL (binary or ASCII), OBJ, STEP and 3MF, and assemblies as URDF ([`urdf()`]); STEP, IGES,
-//! FreeCAD and Rhino files import as a base feature (see [`step_import_feature`]), 3MF and
+//! FreeCAD, Rhino, NX and Parasolid files import as a base feature (see [`step_import_feature`]), 3MF and
 //! STL files as mesh bodies (see [`mesh_import_feature`]), PLY and XYZ files as point clouds
 //! (see [`read_point_cloud`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -29,6 +29,7 @@ mod mutate;
 mod native_cad;
 pub use native_cad::{NATIVE_CAD_EXTS, is_native_cad_path, native_cad_to_step};
 pub mod paper;
+mod parasolid_out;
 mod ply;
 mod ply_complex;
 pub use ply::{ply_counts, read_ply_mesh};
@@ -53,7 +54,8 @@ pub use svg::{decode_svg, read_svg, svg_nothing_to_import, svg_sheet};
 mod gltf_in;
 pub use gltf_in::{GltfImport, Loader, MAX_GLTF_BYTES, MeshPlan, PlanPlace, glb_container, is_gltf_path, read_gltf};
 mod obj;
-pub use obj::read_obj;
+mod obj_texture_export;
+pub use obj::{read_obj, read_obj_with_assets};
 pub use threemf::{
     MAX_3MF_BYTES, MeshObject, model_xml, model_xml_parts, model_xml_with, read_3mf, weld, write_3mf, write_3mf_parts, write_3mf_with,
 };
@@ -100,7 +102,7 @@ pub const MAX_DESIGN_BYTES: usize = 256 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {
-    #[error("unsupported format `{0}` (use stl, obj, step, 3mf, glb, urdf or sc)")]
+    #[error("unsupported format `{0}` (use stl, obj, step, x_t, 3mf, glb, urdf or sc)")]
     Format(String),
     #[error("nothing to export: the design has no bodies")]
     Empty,
@@ -256,6 +258,21 @@ pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> 
     // limit applies to the design that is saved, which refuses it there.
     design::check_step_importable(&text)?;
     let imp = solidcraft_kernel::step_import_shared(&text)?;
+    let independent = std::path::Path::new(file)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ["prt", "x_t", "x_b"].iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)));
+    if independent {
+        use solidcraft_kernel::IssueKind;
+        if let Some(issue) = imp
+            .report
+            .issues
+            .iter()
+            .find(|issue| matches!(issue.kind, IssueKind::NotImported | IssueKind::Refused | IssueKind::FaceLeftOut | IssueKind::FacesNotShown))
+        {
+            return Err(IoError::Invalid(format!("{file}: the independent CAD import could not transfer all geometry: {}", issue.detail)));
+        }
+    }
     let stem = std::path::Path::new(file)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -272,7 +289,13 @@ pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> 
     Ok(StepFeature {
         name,
         body_names,
-        kind: solidcraft_doc::FeatureKind::Import { file: file_name, step: text.into(), components: imp.tree.clone(), skip: Vec::new() },
+        kind: solidcraft_doc::FeatureKind::Import {
+            file: file_name,
+            step: text.into(),
+            components: imp.tree.clone(),
+            skip: Vec::new(),
+            meshes: Vec::new(),
+        },
         warnings: iges_warnings.into_iter().chain(imp.warnings.iter().cloned()).collect(),
         import: imp,
     })
@@ -307,6 +330,16 @@ pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
 /// keeps the millimetre mesh and nothing of the unit. Only STL, OBJ and PLY files take a unit
 /// other than millimetres; a 3MF or glTF file says its own.
 pub fn mesh_import_feature_in(bytes: &[u8], file: &str, mm_per_unit: f64) -> Result<MeshFeature> {
+    mesh_import_feature_with_assets(bytes, file, mm_per_unit, &mut |name| Err(format!("asset `{name}` is unavailable")))
+}
+
+/// Read mesh bytes with a bounded relative-file loader for OBJ material/image companions.
+pub fn mesh_import_feature_with_assets(
+    bytes: &[u8],
+    file: &str,
+    mm_per_unit: f64,
+    load: &mut dyn FnMut(&str) -> std::result::Result<Vec<u8>, String>,
+) -> Result<MeshFeature> {
     let _span = solidcraft_profile::span("import", "mesh_import_feature");
     if !mm_per_unit.is_finite() || mm_per_unit <= 0.0 {
         return Err(IoError::Invalid("the unit must be a positive number of millimetres".into()));
@@ -332,7 +365,7 @@ pub fn mesh_import_feature_in(bytes: &[u8], file: &str, mm_per_unit: f64) -> Res
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Mesh".into());
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let (mut objects, warnings) = if ext == "obj" {
-        obj::read_obj(bytes, &stem)?
+        obj::read_obj_with_assets(bytes, &stem, load)?
     } else if ext == "ply" {
         ply::read_ply_mesh(bytes, &stem)?
     } else if ext == "stl" {
@@ -366,6 +399,7 @@ pub fn mesh_import_feature_in(bytes: &[u8], file: &str, mm_per_unit: f64) -> Res
             .map_err(|e| IoError::Invalid(format!("mesh `{}`: {e}", o.name)))?;
         meshes.push(solidcraft_doc::MeshData {
             name: o.name.clone(),
+            appearance: o.appearance.clone(),
             positions: o.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
             triangles: o.triangles.iter().flatten().copied().collect(),
             color: o.color,
@@ -393,6 +427,8 @@ pub enum Format {
     Obj,
     Step,
     Iges,
+    /// Independent XT text for closed CAD solids and component assemblies.
+    ParasolidText,
     ThreeMf,
     /// 3MF whose triangles carry their B-rep face, at full precision, for meshing and analysis
     /// tools (docs/formats/3mf-face-tags.md). Chosen by name only; a
@@ -417,6 +453,7 @@ impl Format {
             "obj" => Format::Obj,
             "step" | "stp" => Format::Step,
             "igs" | "iges" => Format::Iges,
+            "x_t" | "parasolid" => Format::ParasolidText,
             "3mf" => Format::ThreeMf,
             "3mf-tagged" => Format::ThreeMfTagged,
             "urdf" => Format::Urdf,
@@ -546,6 +583,8 @@ pub struct ObjBody<'a> {
 
 /// The files of an OBJ export: the mesh file and the material library that goes with it.
 pub struct ObjFiles {
+    /// Original embedded image assets, written next to the OBJ and MTL.
+    pub assets: Vec<(String, std::sync::Arc<[u8]>)>,
     /// The mesh file.
     pub obj: String,
     /// The material library; empty when no body has a colour.
@@ -591,7 +630,7 @@ pub fn obj_files(bodies: &[ObjBody<'_>], mtl_name: &str) -> ObjFiles {
         vbase = vb;
         nbase = nb;
     }
-    ObjFiles { obj, mtl }
+    ObjFiles { obj, mtl, assets: Vec::new() }
 }
 
 /// The mesh of a body, welded as STL and 3MF are ([`weld`]: vertices closer than
@@ -727,6 +766,9 @@ pub fn export_obj(state: &ModelState, bodies: &[String], mtl_name: &str, quality
 
 /// The OBJ export of the given bodies: the mesh file and the material library beside it.
 fn obj_export(sel: &[&solidcraft_doc::ModelBody], mtl_name: &str, quality: MeshQuality) -> Result<ObjFiles> {
+    if sel.iter().any(|b| b.mesh_appearance.is_some()) {
+        return obj_texture_export::export(sel, mtl_name, quality);
+    }
     let meshes: Vec<Mesh> = per_body(sel, |b| export_mesh_at(&b.body, quality))?;
     let bodies: Vec<ObjBody<'_>> = sel.iter().zip(&meshes).map(|(b, mesh)| ObjBody { name: b.name.as_str(), mesh, color: b.body.color() }).collect();
     Ok(obj_files(&bodies, mtl_name))
@@ -803,6 +845,11 @@ pub fn export_with_parts(
     thumbnail: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let sel = selected(state, bodies)?;
+    if sel.iter().any(|b| b.mesh_appearance.is_some()) {
+        return Err(IoError::Invalid(
+            "single-file mesh export cannot preserve authored scan appearance; use OBJ with image sidecars or save the design".into(),
+        ));
+    }
     Ok(match format {
         Format::StlBinary | Format::StlAscii => {
             // Each body welded on its own (as for 3MF), so shared vertices are written identically
@@ -825,6 +872,7 @@ pub fn export_with_parts(
                 sel.iter().map(|b| solidcraft_kernel::ExportBody { name: b.name.clone(), body: &b.body, color: b.body.color() }).collect();
             solidcraft_kernel::step_export_bodies(&bs, &step_header(format!("{name}.step"), meta))?.into_bytes()
         }
+        Format::ParasolidText => parasolid_out::export(&sel)?,
         Format::Iges => {
             let bs: Vec<solidcraft_kernel::ExportBody> =
                 sel.iter().map(|b| solidcraft_kernel::ExportBody { name: b.name.clone(), body: &b.body, color: b.body.color() }).collect();
@@ -888,6 +936,7 @@ fn mesh_object(b: &solidcraft_doc::ModelBody, tagged: bool, quality: MeshQuality
     };
     let transparency = 1.0 - paint.map(|p| p.opacity).unwrap_or(1.0);
     Ok(MeshObject {
+        appearance: None,
         name: b.name.clone(),
         positions,
         triangles,
@@ -936,6 +985,11 @@ pub fn step_assembly(doc: &Document, local: &ModelState, name: &str) -> Result<V
         }
     }
     Ok(solidcraft_kernel::step_export_products(&products, 0, &step_header(format!("{name}.step"), &doc.metadata))?.into_bytes())
+}
+
+/// Export all placed CAD bodies of an assembly as independent Parasolid text geometry.
+pub fn parasolid_assembly(doc: &Document, local: &ModelState, world: &ModelState, name: &str) -> Result<Vec<u8>> {
+    parasolid_out::assembly::export(doc, local, world, name)
 }
 
 /// Read a design file's bytes.

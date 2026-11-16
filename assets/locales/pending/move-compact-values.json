@@ -1,0 +1,8 @@
+{
+  "en": {
+    "move.manual_values": "Manual values",
+    "move.pose_angles": "Angles",
+    "move.pose_origin": "Origin",
+    "move.pose_title": "Handle coordinates"
+  }
+}

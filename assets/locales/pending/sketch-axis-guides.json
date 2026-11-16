@@ -1,0 +1,11 @@
+{
+  "en": {
+    "ui.sketch3d.toggle_axis": "Toggle Axis",
+    "ui.sketch3d.axis_placement": "{axis} axis locked \u2014 {planes} planes through start",
+    "ui.sketch3d.free_placement": "Free \u2014 view plane through start (Shift)",
+    "ui.sketch3d.auto_placement": "Automatic geometry / sketch plane",
+    "ui.sketch3d.axis_help": "Ctrl or Toggle Axis cycles X \u2192 Y \u2192 Z. Hold Shift for free placement in the view plane through the start. Release Shift to restore the lock.",
+    "ui.sketch3d.confirm_help": "Apply completes the current chain and keeps the tool active. OK completes it and exits the tool. Cancel discards pending input; completed segments remain. The sketch stays open. The highlighted button remembers this tool\u2019s last confirmation.",
+    "ui.sketch3d.incomplete": "Complete the required points before applying, or Cancel to discard pending input."
+  }
+}

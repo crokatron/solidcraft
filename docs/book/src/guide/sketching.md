@@ -352,6 +352,16 @@ preference off, drawing lines up only with the previous point, one axis at a tim
 
 Enable **3D Sketch** in the Sketch Palette to draw lines, fit splines and points off the plane.
 
+While placing a 3D point or drawing a line, arc or spline, tap **Ctrl** to cycle through world
+**X**, **Y** and **Z**. The axis passes through the last point placed, or through the sketch
+origin for the first point. Hold **Shift** to place freely in a plane facing the camera at
+that point's depth. Release Shift to return to the selected axis.
+
+To round a corner between two straight segments, choose **Sketch > Modify > 3D Sketch
+Fillet**, pick each line away from its endpoint, set **Radius**, and click **OK**. The
+tool trims the two lines and joins them with a tangent circular arc. Their common plane
+can have any orientation. Parallel or skew lines do not define a fillet corner.
+
 Enable **Select 3D sketch curve points** in **Preferences > Sketch** to show and select drawn
 3D curve points as construction references after finishing the sketch. This option is off by default.
 For example, choose **Offset Plane**, select its base plane, then select a spline point in

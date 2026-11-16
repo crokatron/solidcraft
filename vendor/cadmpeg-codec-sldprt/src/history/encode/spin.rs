@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Revolve, sweep, and loft write encoders.
+
+use super::super::literals::{format_angle_rad, valid_direction};
+use super::format::{format_point3_mm, format_vector3};
+use super::support::{
+    is_loft, is_revolve, is_sweep, path_source, planar_profile_source, profile_source,
+    resolved_boolean_op,
+};
+use super::{NeutralFeatureEncoder, NeutralFeatureEncoding};
+use cadmpeg_core::CodecError;
+use cadmpeg_ir::{
+    features::{
+        AngularTermination, BooleanOp, LoftSection, PathRef, PlanarProfileRef, RevolveConstruction,
+        RevolveExtent, SweepGuideRail, SweepMode, SweepOrientation, SweepPathExtent,
+        SweepTransformation, SweepTransition,
+    },
+    scalar::Angle,
+};
+
+/// The decoded fields of one `Sweep` operation, borrowed from the feature definition.
+#[derive(Clone, Copy)]
+pub(super) struct SweepDefinition<'a> {
+    pub(super) shape: &'a cadmpeg_ir::features::SweepShape,
+    pub(super) path: Option<&'a PathRef>,
+    pub(super) orientation: Option<&'a SweepOrientation>,
+    pub(super) transition: Option<&'a SweepTransition>,
+    pub(super) transformation: Option<&'a SweepTransformation>,
+    pub(super) path_tangent: bool,
+    pub(super) linearize: bool,
+    pub(super) twist: Option<&'a Angle>,
+    pub(super) path_extent: Option<&'a SweepPathExtent>,
+    pub(super) guide_rail: Option<&'a SweepGuideRail>,
+    pub(super) taper: Option<&'a Angle>,
+    pub(super) scale: Option<&'a cadmpeg_ir::scalar::PositiveReal>,
+    pub(super) allow_multi_profile_faces: Option<bool>,
+}
+
+/// The closed and solid flags of a loft.
+#[derive(Clone, Copy)]
+pub(super) struct LoftForm {
+    pub(super) closed: bool,
+    pub(super) solid: bool,
+}
+
+/// The ruled and linearize flags of a loft.
+#[derive(Clone, Copy)]
+pub(super) struct LoftInterpolation {
+    pub(super) ruled: bool,
+    pub(super) linearize: bool,
+}
+
+/// The decoded fields of one `Loft` operation, borrowed from the feature definition.
+#[derive(Clone, Copy)]
+pub(super) struct LoftDefinition<'a> {
+    pub(super) sections: &'a [LoftSection],
+    pub(super) guidance: &'a cadmpeg_ir::features::LoftGuidance,
+    pub(super) op: &'a BooleanOp,
+    pub(super) form: LoftForm,
+    pub(super) interpolation: LoftInterpolation,
+    pub(super) max_degree: Option<&'a std::num::NonZeroU32>,
+    pub(super) allow_multi_profile_faces: Option<bool>,
+}
+
+impl NeutralFeatureEncoder<'_, '_, '_> {
+    pub(super) fn encode_revolve(
+        &self,
+        construction: &RevolveConstruction,
+        op: BooleanOp,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        let record_sources = self.record_sources;
+        let feature_sources = self.feature_sources;
+        let sketch_sources = self.sketch_sources;
+        Ok({
+            if construction
+                .axis()
+                .is_some_and(|axis| axis.reference.is_some())
+                || construction.solid() == Some(false)
+                || construction.face_maker().is_some()
+                || construction.fuse_order().is_some()
+                || construction.allow_multi_profile_faces().is_some()
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} uses unsupported revolution construction controls",
+                    feature.id
+                )));
+            }
+            if existing.is_some_and(|record| !is_revolve(record)) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported revolution semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_none() && (!construction.is_resolved() || op == BooleanOp::Unresolved) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} has unresolved revolution construction",
+                    feature.id
+                )));
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            let mut properties = feature.source_properties.clone();
+            if let Some(extent) = construction.extent() {
+                parameters.remove("Angle");
+                parameters.remove("Angle2");
+                match extent {
+                    RevolveExtent::OneSided {
+                        termination: AngularTermination::Angle { angle },
+                    } => {
+                        properties.insert(
+                            cadmpeg_core::nonblank_literal!("EndCondition"),
+                            "OneSided".into(),
+                        );
+                        parameters.insert(
+                            cadmpeg_core::nonblank_literal!("Angle"),
+                            format_angle_rad((*angle).into()),
+                        );
+                    }
+                    RevolveExtent::Symmetric {
+                        termination: AngularTermination::Angle { angle },
+                    } => {
+                        properties.insert(
+                            cadmpeg_core::nonblank_literal!("EndCondition"),
+                            "Symmetric".into(),
+                        );
+                        parameters.insert(
+                            cadmpeg_core::nonblank_literal!("Angle"),
+                            format_angle_rad((*angle).into()),
+                        );
+                    }
+                    RevolveExtent::TwoSided {
+                        first: AngularTermination::Angle { angle: first },
+                        second: AngularTermination::Angle { angle: second },
+                    } => {
+                        properties.insert(
+                            cadmpeg_core::nonblank_literal!("EndCondition"),
+                            "TwoSided".into(),
+                        );
+                        parameters.insert(
+                            cadmpeg_core::nonblank_literal!("Angle"),
+                            format_angle_rad((*first).into()),
+                        );
+                        parameters.insert(
+                            cadmpeg_core::nonblank_literal!("Angle2"),
+                            format_angle_rad((*second).into()),
+                        );
+                    }
+                    _ => {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} uses a linear revolution extent",
+                            feature.id
+                        )));
+                    }
+                }
+            }
+            if let Some(axis) = construction.axis() {
+                if !valid_direction(axis.direction.get()) {
+                    return Err(CodecError::malformed(format_args!(
+                        "SLDPRT feature {} has a degenerate revolution axis",
+                        feature.id
+                    )));
+                }
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("AxisOrigin"),
+                    format_point3_mm(axis.origin),
+                );
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("AxisDirection"),
+                    format_vector3(axis.direction.into()),
+                );
+            }
+            if op != BooleanOp::Unresolved {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Operation"),
+                    resolved_boolean_op(op, &feature.id)?.into(),
+                );
+            }
+            if let Some(profile) = construction.profile() {
+                let profile_source =
+                    planar_profile_source(profile, record_sources, feature_sources, sketch_sources)
+                        .ok_or_else(|| {
+                            CodecError::malformed(format_args!(
+                                "SLDPRT feature {} references a missing revolution profile",
+                                feature.id
+                            ))
+                        })?;
+                properties.insert(cadmpeg_core::nonblank_literal!("Profile"), profile_source);
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Revolve".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_sweep(
+        &self,
+        definition: SweepDefinition<'_>,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let SweepDefinition {
+            shape,
+            path,
+            orientation,
+            transition,
+            transformation,
+            path_tangent,
+            linearize,
+            twist,
+            path_extent,
+            guide_rail,
+            taper,
+            scale,
+            allow_multi_profile_faces,
+        } = definition;
+        let feature = self.feature;
+        let existing = self.existing;
+        let record_sources = self.record_sources;
+        let feature_sources = self.feature_sources;
+        let sketch_sources = self.sketch_sources;
+        Ok({
+            if shape.additional_section_count() != 0
+                || orientation.is_some()
+                || transition.is_some()
+                || transformation.is_some()
+                || path_tangent
+                || linearize
+                || path_extent.is_some()
+                || guide_rail.is_some()
+                || taper.is_some()
+                || allow_multi_profile_faces.is_some()
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported sweep construction semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_some_and(|record| !is_sweep(record)) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes operation family",
+                    feature.id
+                )));
+            }
+            if shape.generated_section().is_some() {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} uses an unsupported generated sweep section",
+                    feature.id
+                )));
+            }
+            let profile_source = match shape.referenced_profile() {
+                Some(profile)
+                    if matches!(profile, PlanarProfileRef::Generated { .. })
+                        && existing.is_some() =>
+                {
+                    None
+                }
+                Some(profile)
+                    if matches!(profile, PlanarProfileRef::Feature(_))
+                        && existing
+                            .is_some_and(|record| !record.properties.contains_key("Profile")) =>
+                {
+                    None
+                }
+                Some(profile) => Some(
+                    planar_profile_source(profile, record_sources, feature_sources, sketch_sources)
+                        .ok_or_else(|| {
+                            CodecError::malformed(format_args!(
+                                "SLDPRT feature {} references a missing sweep profile",
+                                feature.id
+                            ))
+                        })?,
+                ),
+                None => None,
+            };
+            let path_source = match path {
+                Some(path) => Some(
+                    path_source(path, record_sources, sketch_sources).ok_or_else(|| {
+                        CodecError::malformed(format_args!(
+                            "SLDPRT feature {} references a missing sweep path",
+                            feature.id
+                        ))
+                    })?,
+                ),
+                None => None,
+            };
+            if existing.is_none() && (profile_source.is_none() || path_source.is_none()) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} has unresolved sweep operands",
+                    feature.id
+                )));
+            }
+            if existing.is_none() && matches!(shape.mode(), SweepMode::Unresolved { .. }) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} has unresolved sweep result semantics",
+                    feature.id
+                )));
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            match twist {
+                Some(twist) => {
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Twist"),
+                        format_angle_rad(*twist),
+                    );
+                }
+                None => {
+                    parameters.remove("Twist");
+                }
+            }
+            match scale {
+                Some(scale) => {
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Scale"),
+                        scale.get().to_string(),
+                    );
+                }
+                None => {
+                    parameters.remove("Scale");
+                }
+            }
+            let mut properties = feature.source_properties.clone();
+            if let Some(profile) = profile_source {
+                properties.insert(cadmpeg_core::nonblank_literal!("Profile"), profile);
+            }
+            if let Some(path_source) = path_source {
+                let retained_native_path = existing
+                    .is_some_and(|record| !record.properties.contains_key("Path"))
+                    && matches!(path, Some(cadmpeg_ir::features::PathRef::Native(reference))
+                        if reference.starts_with("sldprt:feature-input:component-reference-curve:"));
+                if !retained_native_path {
+                    properties.insert(cadmpeg_core::nonblank_literal!("Path"), path_source);
+                }
+            }
+            match shape.mode() {
+                SweepMode::Solid {
+                    op: cadmpeg_ir::features::SolidSweepOperation::NewBody,
+                } => {
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("Operation"),
+                        "NewBody".into(),
+                    );
+                }
+                SweepMode::Solid { op } => {
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("Operation"),
+                        resolved_boolean_op(op.into(), &feature.id)?.into(),
+                    );
+                }
+                SweepMode::Surface {} => {
+                    properties.remove("Operation");
+                }
+                SweepMode::Unresolved {} => {}
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(
+                    || {
+                        match shape.mode() {
+                            SweepMode::Surface {} => "Surface-Sweep",
+                            SweepMode::Solid {
+                                op: cadmpeg_ir::features::SolidSweepOperation::NewBody,
+                            }
+                            | SweepMode::Solid { .. }
+                            | SweepMode::Unresolved {} => "Sweep",
+                        }
+                        .into()
+                    },
+                    |record| record.kind.clone(),
+                ),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_loft(
+        &self,
+        definition: LoftDefinition<'_>,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let LoftDefinition {
+            sections,
+            guidance,
+            op,
+            form: LoftForm { closed, solid },
+            interpolation: LoftInterpolation { ruled, linearize },
+            max_degree,
+            allow_multi_profile_faces,
+        } = definition;
+        let feature = self.feature;
+        let existing = self.existing;
+        let record_sources = self.record_sources;
+        let feature_sources = self.feature_sources;
+        let sketch_sources = self.sketch_sources;
+        let cadmpeg_ir::features::LoftGuidance::Guides(guides) = guidance else {
+            return Err(CodecError::NotImplemented(format!(
+                "SLDPRT feature {} changes unsupported loft result semantics",
+                feature.id
+            )));
+        };
+        Ok({
+            if !solid
+                || ruled
+                || linearize
+                || max_degree.is_some()
+                || allow_multi_profile_faces.is_some()
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported loft result semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_some_and(|record| !is_loft(record)) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported loft semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_none() && (sections.len() < 2 || *op == BooleanOp::Unresolved) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} has unresolved loft construction semantics",
+                    feature.id
+                )));
+            }
+            if sections
+                .iter()
+                .any(|section| matches!(section, cadmpeg_ir::features::LoftSection::Point(_)))
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} uses a point loft section",
+                    feature.id
+                )));
+            }
+            let profile_sources = sections
+                .iter()
+                .filter_map(|section| match section {
+                    cadmpeg_ir::features::LoftSection::Profile(profile) => Some(profile),
+                    cadmpeg_ir::features::LoftSection::Point(_) => None,
+                })
+                .map(|profile| {
+                    profile_source(profile, record_sources, feature_sources, sketch_sources)
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CodecError::malformed(format_args!(
+                        "SLDPRT feature {} references a missing loft profile",
+                        feature.id
+                    ))
+                })?;
+            let guide_sources = guides
+                .iter()
+                .map(|path| path_source(path, record_sources, sketch_sources))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CodecError::malformed(format_args!(
+                        "SLDPRT feature {} references a missing loft guide",
+                        feature.id
+                    ))
+                })?;
+            let mut properties = feature.source_properties.clone();
+            if !profile_sources.is_empty() || existing.is_none() {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Profiles"),
+                    profile_sources.join(","),
+                );
+            }
+            if guide_sources.is_empty() && existing.is_none() {
+                properties.remove("Guides");
+            } else if !guide_sources.is_empty() {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Guides"),
+                    guide_sources.join(","),
+                );
+            }
+            if *op != BooleanOp::Unresolved {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Operation"),
+                    resolved_boolean_op(*op, &feature.id)?.into(),
+                );
+            }
+            if closed || existing.is_none() || properties.contains_key("Closed") {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Closed"),
+                    closed.to_string(),
+                );
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Loft".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+}

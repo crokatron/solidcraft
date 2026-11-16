@@ -218,6 +218,30 @@ pub static FORMATS: &[FormatSpec] = &[
         export: None,
     },
     FormatSpec {
+        id: "nx",
+        label: "NX part (experimental)",
+        extensions: &["prt"],
+        role: Role::Artifact,
+        import: Some(ImportSpec { target: ImportTarget::Brep, options: BREP_IMPORT, native_only: true }),
+        export: None,
+    },
+    FormatSpec {
+        id: "parasolid",
+        label: "Parasolid (experimental)",
+        extensions: &["x_t", "x_b"],
+        role: Role::Artifact,
+        import: Some(ImportSpec { target: ImportTarget::Brep, options: BREP_IMPORT, native_only: true }),
+        export: None,
+    },
+    FormatSpec {
+        id: "parasolid-text",
+        label: "Parasolid text (solids and assemblies)",
+        extensions: &["x_t"],
+        role: Role::Artifact,
+        import: None,
+        export: Some(ExportSpec { command: "file.export", format: None, options: &[], scope: ExportScope::Bodies, lossless: false }),
+    },
+    FormatSpec {
         id: "stl",
         label: "STL",
         extensions: &["stl"],
@@ -407,7 +431,7 @@ pub fn import_filters(native: bool) -> Vec<(&'static str, Vec<&'static str>)> {
         let Some(import) = f.import.as_ref() else { continue };
         match import.target {
             ImportTarget::Design => add("SolidCraft design (container or JSON)", f.extensions),
-            ImportTarget::Brep if import.native_only => add("FreeCAD and Rhino", f.extensions),
+            ImportTarget::Brep if matches!(f.id, "fcstd" | "3dm") => add("FreeCAD and Rhino", f.extensions),
             ImportTarget::Brep => add(f.label, f.extensions),
             ImportTarget::Mesh => add("Mesh (3MF, STL, OBJ, glTF)", f.extensions),
             ImportTarget::PointCloud => add("Point cloud (PLY, XYZ, PTS)", f.extensions),
@@ -447,7 +471,7 @@ mod tests {
         for e in with_target(ImportTarget::Brep) {
             assert!(crate::is_step_path(&format!("part.{e}")), "is_step_path misses .{e}");
         }
-        for e in ["step", "stp", "igs", "iges", "fcstd", "3dm"] {
+        for e in ["step", "stp", "igs", "iges", "fcstd", "3dm", "prt", "x_t", "x_b"] {
             assert!(with_target(ImportTarget::Brep).contains(&e), "registry misses B-rep .{e}");
         }
         for e in with_target(ImportTarget::Mesh) {
@@ -525,9 +549,18 @@ mod tests {
         assert_eq!(find("STEP"), vec!["step", "stp"]);
         assert_eq!(find("IGES"), vec!["igs", "iges"]);
         assert_eq!(find("FreeCAD and Rhino"), vec!["fcstd", "3dm"]);
+        assert_eq!(find("NX part (experimental)"), vec!["prt"]);
+        assert_eq!(find("Parasolid (experimental)"), vec!["x_t", "x_b"]);
         assert_eq!(find("Mesh (3MF, STL, OBJ, glTF)"), vec!["stl", "3mf", "obj", "glb", "gltf"]);
         assert_eq!(find("Point cloud (PLY, XYZ, PTS)"), vec!["ply", "xyz", "pts"]);
         assert_eq!(find("Sketch drawings (DXF, SVG)"), vec!["dxf", "svg"]);
         assert!(import_filters(false).iter().all(|(l, _)| *l != "FreeCAD and Rhino"));
+    }
+    #[test]
+    fn parasolid_text_export_has_a_separate_limited_row() {
+        let row = exportable().find(|row| row.id == "parasolid-text").unwrap();
+        assert_eq!(row.extensions, &["x_t"]);
+        assert_eq!(crate::Format::from_name("part.X_T").unwrap(), crate::Format::ParasolidText);
+        assert!(crate::Format::from_name("part.x_b").is_err());
     }
 }

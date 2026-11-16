@@ -52,6 +52,13 @@ pub struct ExportStepParams {
     pub bodies: Option<StringList>,
 }
 
+/// Export a complete native design as JSON, regardless of the file extension.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ExportDesignParams {
+    pub path: String,
+}
+
 /// Export bodies as a mesh file: binary STL for `file.export_stl`, OBJ for `file.export_obj`
 /// (the colours of the bodies go in a material library, `.mtl`, written next to it). The file
 /// has that format whatever the path's extension.
@@ -115,8 +122,9 @@ pub struct ExportParams {
     /// The file to write.
     #[serde(default)]
     pub path: Option<String>,
-    /// The format: stl, stla, obj, step, 3mf, 3mf-tagged, glb, urdf or json, or a file name whose
-    /// extension names it. Default: from the path's extension.
+    /// The format: stl, stla, obj, step, x_t, 3mf, 3mf-tagged, glb, urdf or json, or a file name whose
+    /// extension names it. x_t supports closed CAD solids and component assemblies.
+    /// Default: from the path's extension.
     #[serde(default)]
     pub format: Option<String>,
     /// The bodies to export, by name. Default: every body. Design JSON and URDF export the
@@ -300,7 +308,7 @@ impl JsonSchema for OpenPath {
     }
 }
 
-/// Which way is up in a STEP, IGES, FreeCAD, Rhino or glTF file.
+/// Which way is up in a STEP, IGES, FreeCAD, Rhino, NX, Parasolid or glTF file.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UpParam(pub bool);
 
@@ -323,7 +331,7 @@ impl JsonSchema for UpParam {
     }
 }
 
-/// What the bodies of a STEP, IGES, FreeCAD or Rhino file are named after.
+/// What the bodies of a STEP, IGES, FreeCAD, Rhino, NX or Parasolid file are named after.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NamesParam(pub solidcraft_io::StepNames);
 
@@ -405,7 +413,7 @@ impl JsonSchema for MaxPoints {
 /// Open a file as the design: a SolidCraft design (`.sc`, or a `.solidcraft` design from an
 /// earlier release), a `.dxf` or `.svg` drawing (a new, unsaved design with an XY sketch, with
 /// the units and defaults of `sketch.insert_dxf` and `sketch.insert_svg`), a STEP, IGES,
-/// FreeCAD, Rhino, 3MF, STL, OBJ or glTF file (a new design holding the file as a component
+/// FreeCAD, Rhino, NX, Parasolid, 3MF, STL, OBJ or glTF file (a new design holding the file as a component
 /// named after it, as `file.insert_step` and `file.insert_mesh` make), or a `.ply`, `.xyz` or
 /// `.pts` point cloud (a new design holding it, as `pointcloud.insert` makes). The open design
 /// is replaced.
@@ -414,15 +422,15 @@ impl JsonSchema for MaxPoints {
 pub struct OpenParams {
     /// The file to open; the kind of file is read from its extension.
     pub path: OpenPath,
-    /// For a STEP, IGES, FreeCAD, Rhino or glTF file only (refused for any other): which way is up
-    /// in the file. Default: z for STEP, IGES, FreeCAD and Rhino, y for glTF.
+    /// For a STEP, IGES, FreeCAD, Rhino, NX, Parasolid or glTF file only (refused for any other): which way is up
+    /// in the file. Default: z for STEP, IGES, FreeCAD, Rhino, NX and Parasolid, y for glTF.
     #[serde(default)]
     pub up: Option<UpParam>,
-    /// For a STEP, IGES, FreeCAD or Rhino file only (refused for any other): what the bodies are
+    /// For a STEP, IGES, FreeCAD, Rhino, NX or Parasolid file only (refused for any other): what the bodies are
     /// named after. Default: auto.
     #[serde(default)]
     pub names: Option<NamesParam>,
-    /// For a STEP, IGES, FreeCAD or Rhino file (ignored for other files): true puts an import that
+    /// For a STEP, IGES, FreeCAD, Rhino, NX or Parasolid file (ignored for other files): true puts an import that
     /// brings more than one item into the history (its Import feature and the rigid joints holding
     /// its parts) into a new history folder named `Group #N`. Default: false.
     #[serde(default)]
@@ -554,7 +562,7 @@ pub struct OpenedPointCloud {
     pub param_warnings: Vec<String>,
 }
 
-/// What `doc.open` returns for a STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF file.
+/// What `doc.open` returns for a STEP, IGES, FreeCAD, Rhino, NX, Parasolid, 3MF, STL, OBJ or glTF file.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct OpenedFile {
     /// The file opened.

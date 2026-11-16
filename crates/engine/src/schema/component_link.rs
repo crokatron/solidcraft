@@ -157,7 +157,7 @@ impl JsonSchema for Translation {
     }
 }
 
-/// Insert a design file as a new component linked to it: its solid bodies as placed in that
+/// Insert a design file as a new component linked to it: its solid and mesh bodies as placed in that
 /// design, and a copy of its design properties. The link remembers the file, so
 /// `component.update_links` can read it again. One undo step. With `reuse`, a design already
 /// linked gets another placement instead of another link.
@@ -222,7 +222,7 @@ pub enum DesignInserted {
         bodies: Vec<String>,
         /// The same bodies, as the commands that make bodies report them.
         created_bodies: Vec<String>,
-        /// What the design file gave that did not come in (such as mesh bodies).
+        /// What the design file gave that could not be imported.
         warnings: Vec<String>,
     },
 }

@@ -36,6 +36,7 @@ pub(crate) enum SketchState {
     /// Degrees of freedom remain.
     Under(usize),
     Full,
+    Spatial,
     /// The constraints conflict (the solve failed).
     Conflict,
 }
@@ -46,6 +47,12 @@ impl SketchState {
             SketchState::Conflict
         } else if !crate::sketch_palette::has_geometry(&ss.sketch) {
             SketchState::Empty
+        } else if crate::sketch_palette::has_spatial_geometry(&ss.sketch) {
+            match crate::spatial_freedom::remaining(&ss.sketch, ss.report.dof) {
+                Some(0) => SketchState::Full,
+                Some(n) => SketchState::Under(n),
+                None => SketchState::Spatial,
+            }
         } else if ss.report.dof == 0 {
             SketchState::Full
         } else {
@@ -58,6 +65,7 @@ impl SketchState {
             SketchState::Conflict => solidcraft_ui_text::tr("ui.constraints_conflict").to_string(),
             SketchState::Empty => solidcraft_ui_text::tr("ui.no_geometry_yet").to_string(),
             SketchState::Full => solidcraft_ui_text::tr("ui.fully_constrained").to_string(),
+            SketchState::Spatial => solidcraft_ui_text::tr("ui.spatial_dof_unknown").to_string(),
             SketchState::Under(dof) => solidcraft_ui_text::format(
                 if dof == 1 { "status.under_constrained_one" } else { "status.under_constrained" },
                 &[("count", &dof.to_string())],
@@ -72,7 +80,7 @@ impl SketchState {
             SketchState::Conflict => t.error,
             SketchState::Empty => t.text_dim,
             SketchState::Full => t.sketch_fixed,
-            SketchState::Under(_) => t.sketch,
+            SketchState::Under(_) | SketchState::Spatial => t.sketch,
         }
     }
 }
@@ -92,7 +100,7 @@ pub(crate) struct Contents {
 }
 
 pub(crate) fn contents(app: &SolveApp) -> Contents {
-    let st = crate::open_meshing::session_world(&app.session);
+    let st = app.session.model.state();
     let sketch = app.session.active_sketch.and_then(|id| st.sketch(id));
     let edited = app
         .dialog

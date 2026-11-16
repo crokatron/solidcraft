@@ -10,6 +10,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 mod drawing;
+mod mesh_appearance;
 mod native_cache;
 mod thumbnail;
 pub use drawing::{FileKind, file_kind, read_drawing, read_drawing_file, write_drawing_container};
@@ -99,7 +100,7 @@ const LIMITS: Limits = Limits {
 /// limit: level 1 of a large payload leaves more on disk, and that part exists only because
 /// compression is what makes it fit. Everything else is level 1.
 fn part_level(name: &str, length: usize) -> i64 {
-    if name.ends_with(".step") || (name.ends_with(".mesh") && length > max_part()) { STEP_LEVEL } else { 1 }
+    if name.ends_with(".step") || ((name.ends_with(".mesh") || name.ends_with(".mesh-appearance")) && length > max_part()) { STEP_LEVEL } else { 1 }
 }
 
 /// A design container being written, within [`LIMITS`].
@@ -123,7 +124,7 @@ impl std::ops::DerefMut for PackageWriter {
 fn part_limit(name: &str) -> usize {
     if name.ends_with(".step") {
         max_step_part()
-    } else if name.ends_with(".mesh") {
+    } else if name.ends_with(".mesh") || name.ends_with(".mesh-appearance") {
         max_mesh_part()
     } else {
         max_part()
@@ -204,30 +205,39 @@ fn write_container(
     let mut writer = PackageWriter::new();
     let mut features = Vec::with_capacity(doc.features.len());
     for feature in &doc.features {
-        let replacements = match &feature.kind {
+        let mut replacements = match &feature.kind {
             FeatureKind::Import { step, .. } => {
-                // STEP is text and shrinks several times: always compressed, so an import as large
-                // as MAX_STEP_BYTES still fits in a design file.
+                // STEP is always compressed, including an empty mesh-only linked source.
                 let blob = writer.blob(step.as_bytes(), "step", true)?;
                 fields([("step", Value::String(String::new())), ("step_blob", blob)])
             }
-            FeatureKind::MeshImport { meshes, .. } => {
-                let mut metadata = Vec::with_capacity(meshes.len());
-                for mesh in meshes {
-                    let bytes = encode_mesh(mesh)?;
-                    // Fast saves store a mesh that fits. One past the file limit is deflated,
-                    // or it could never be saved (#6600). Compact deflates every mesh.
-                    let compress = compression == DesignCompression::Compact || bytes.len() > max_part();
-                    let blob = writer.blob(&bytes, "mesh", compress)?;
-                    let mut value = replace(mesh, fields([("positions", json!([])), ("triangles", json!([])), ("corner_normals", json!([]))]))
-                        .map_err(invalid)?;
-                    value.as_object_mut().ok_or_else(|| invalid("mesh metadata"))?.insert("mesh_blob".into(), blob);
-                    metadata.push(value);
-                }
-                fields([("meshes", Value::Array(metadata))])
-            }
             _ => Map::new(),
         };
+        if let FeatureKind::MeshImport { meshes, .. } | FeatureKind::Import { meshes, .. } = &feature.kind {
+            let mut metadata = Vec::with_capacity(meshes.len());
+            for mesh in meshes {
+                let bytes = encode_mesh(mesh)?;
+                // Fast saves store a mesh that fits. One past the file limit is deflated,
+                // or it could never be saved (#6600). Compact deflates every mesh.
+                let compress = compression == DesignCompression::Compact || bytes.len() > max_part();
+                let blob = writer.blob(&bytes, "mesh", compress)?;
+                let mut value = replace(
+                    mesh,
+                    fields([("positions", json!([])), ("triangles", json!([])), ("corner_normals", json!([])), ("appearance", Value::Null)]),
+                )
+                .map_err(invalid)?;
+                value.as_object_mut().ok_or_else(|| invalid("mesh metadata"))?.insert("mesh_blob".into(), blob);
+                if let Some(a) = &mesh.appearance {
+                    let bytes = mesh_appearance::encode(a, mesh.triangles.len() / 3)?;
+                    let blob = writer.blob(&bytes, "mesh-appearance", compression == DesignCompression::Compact || bytes.len() > max_part())?;
+                    value.as_object_mut().ok_or_else(|| invalid("mesh metadata"))?.insert("appearance_blob".into(), blob);
+                }
+                metadata.push(value);
+            }
+            if !meshes.is_empty() || matches!(&feature.kind, FeatureKind::MeshImport { .. }) {
+                replacements.insert("meshes".into(), Value::Array(metadata));
+            }
+        }
         // Extra reference fields are added after serializing existing fields.
         let step_blob = replacements.get("step_blob").cloned();
         let mut value = replace(feature, replacements).map_err(invalid)?;
@@ -295,7 +305,11 @@ fn write_container(
     }
     // The model cache is optional: one that does not fit the container keeps fewer states, or is
     // left out, never a failed save.
-    let cache = geometry.and_then(|g| native_cache::encode_model(g, &metadata, writer.space(2, budget)).ok());
+    // The native geometry cache has no authored corner attributes; rebuild these documents
+    // from their authoritative mesh/appearance blobs rather than opening a colourless cache.
+    let authored_scan =
+        doc.features.iter().any(|f| matches!(&f.kind, FeatureKind::MeshImport { meshes, .. } | FeatureKind::Import { meshes, .. } if meshes.iter().any(|m| m.appearance.is_some())));
+    let cache = geometry.filter(|_| !authored_scan).and_then(|g| native_cache::encode_model(g, &metadata, writer.space(2, budget)).ok());
     if let Some((manifest, data)) = cache {
         let [manifest_entry, payload_entry] = native_cache::ENTRIES;
         // Deflated whatever the policy: the encoded bodies shrink about fourfold to tenfold, faster
@@ -336,6 +350,9 @@ fn validate_mesh(mesh: &MeshData) -> Result<()> {
         })
     {
         return Err(invalid("invalid mesh coordinates or indices"));
+    }
+    if let Some(a) = &mesh.appearance {
+        a.validate(mesh.triangles.len() / 3).map_err(invalid)?;
     }
     Ok(())
 }
@@ -576,6 +593,7 @@ fn read_preview<R: Read + Seek>(reader: &mut PackageReader<R>) -> Result<DesignP
         }
         end = end.checked_add(length).ok_or_else(|| invalid("preview overflow"))?;
         let mut mesh = MeshData {
+            appearance: None,
             name: String::new(),
             positions: Vec::new().into(),
             triangles: Vec::new().into(),
@@ -731,17 +749,15 @@ fn hydrate_newer<R: Read + Seek>(doc: &mut Document, metadata: &Value, container
     let file = Arc::make_mut(doc.newer_file.as_mut().ok_or_else(|| invalid("not a newer design"))?);
     for (index, feature) in doc.features.iter_mut().enumerate() {
         let Some(value) = metadata.get("features").and_then(|v| v.get(index)) else { continue };
-        let readable = match &mut feature.kind {
-            FeatureKind::Import { .. } => reader.blob(value, "step_blob", "step").map(|_| ()).map_err(IoError::from),
-            FeatureKind::MeshImport { meshes, .. } => {
-                let mut check = meshes.clone();
-                check.iter_mut().enumerate().try_for_each(|(i, mesh)| {
-                    let value = value.get("meshes").and_then(|v| v.get(i)).ok_or_else(|| invalid("missing mesh metadata"))?;
-                    decode_mesh(reader.blob(value, "mesh_blob", "mesh")?, mesh)
-                })
+        let readable = (|| -> Result<()> {
+            if matches!(&feature.kind, FeatureKind::Import { .. }) {
+                reader.blob(value, "step_blob", "step")?;
             }
-            _ => Ok(()),
-        };
+            if let FeatureKind::MeshImport { meshes, .. } | FeatureKind::Import { meshes, .. } = &feature.kind {
+                hydrate_meshes(&mut meshes.clone(), value, reader)?;
+            }
+            Ok(())
+        })();
         if let Err(why) = readable {
             file.not_understood.push(format!("feature `{}` ({why})", feature.name));
             feature.kind = FeatureKind::NewerFileFeature { raw: solidcraft_doc::newer_file::RawFeature(Box::new(value.clone())) };
@@ -876,23 +892,14 @@ fn read_document<R: Read + Seek>(reader: &mut PackageReader<R>) -> Result<Docume
     }
     for (index, feature) in doc.features.iter_mut().enumerate() {
         let value = metadata.get("features").and_then(|v| v.get(index)).ok_or_else(|| invalid("missing feature metadata"))?;
-        match &mut feature.kind {
-            FeatureKind::Import { step, .. } => {
-                if !step.is_empty() {
-                    return Err(invalid("ambiguous embedded STEP and blob"));
-                }
-                *step = std::str::from_utf8(reader.blob(value, "step_blob", "step")?).map_err(invalid)?.into();
+        if let FeatureKind::Import { step, .. } = &mut feature.kind {
+            if !step.is_empty() {
+                return Err(invalid("ambiguous embedded STEP and blob"));
             }
-            FeatureKind::MeshImport { meshes, .. } => {
-                for (index, mesh) in meshes.iter_mut().enumerate() {
-                    if !mesh.positions.is_empty() || !mesh.triangles.is_empty() {
-                        return Err(invalid("ambiguous embedded mesh and blob"));
-                    }
-                    let value = value.get("meshes").and_then(|v| v.get(index)).ok_or_else(|| invalid("missing mesh metadata"))?;
-                    decode_mesh(reader.blob(value, "mesh_blob", "mesh")?, mesh)?;
-                }
-            }
-            _ => {}
+            *step = std::str::from_utf8(reader.blob(value, "step_blob", "step")?).map_err(invalid)?.into();
+        }
+        if let FeatureKind::MeshImport { meshes, .. } | FeatureKind::Import { meshes, .. } = &mut feature.kind {
+            hydrate_meshes(meshes, value, reader)?;
         }
     }
     for (index, canvas) in doc.canvases.iter_mut().enumerate() {
@@ -914,6 +921,24 @@ fn read_document<R: Read + Seek>(reader: &mut PackageReader<R>) -> Result<Docume
         decode_cloud(reader.blob(value, "points_blob", "points")?, cloud)?;
     }
     Ok(doc)
+}
+
+/// Hydrate embedded scan geometry and authored corner attributes for either import kind.
+fn hydrate_meshes<R: Read + Seek>(meshes: &mut [MeshData], value: &Value, reader: &mut PackageReader<R>) -> Result<()> {
+    for (index, mesh) in meshes.iter_mut().enumerate() {
+        if !mesh.positions.is_empty() || !mesh.triangles.is_empty() || !mesh.corner_normals.is_empty() {
+            return Err(invalid("ambiguous embedded mesh and blob"));
+        }
+        let value = value.get("meshes").and_then(|v| v.get(index)).ok_or_else(|| invalid("missing mesh metadata"))?;
+        decode_mesh(reader.blob(value, "mesh_blob", "mesh")?, mesh)?;
+        if value.get("appearance_blob").is_some() {
+            if mesh.appearance.is_some() {
+                return Err(invalid("ambiguous mesh appearance and blob"));
+            }
+            mesh.appearance = Some(mesh_appearance::decode(reader.blob(value, "appearance_blob", "mesh-appearance")?, mesh.triangles.len() / 3)?);
+        }
+    }
+    Ok(())
 }
 
 /// Admit the resource map before Value allocation or duplicate-key coalescing. Encoded
@@ -1204,8 +1229,17 @@ mod tests {
     fn seekable_preview_defers_large_source_blob_until_document_read() {
         let mut doc = Document::new("Deferred source");
         let step = noise(2_600_000);
-        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new(), skip: Vec::new() }, None)
-            .unwrap();
+        doc.add_feature(
+            FeatureKind::Import {
+                file: "large.step".into(),
+                step: step.clone().into(),
+                components: Vec::new(),
+                skip: Vec::new(),
+                meshes: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
         let preview = DesignPreview { meshes: vec![mesh()] };
         let bytes = write_design_container_with_preview(&doc, DesignCompression::Fast, Some(&preview)).unwrap();
         let count = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -1322,8 +1356,17 @@ mod tests {
     fn native_cache_round_trip_and_preview_defer_original_sources() {
         let mut doc = Document::new("Native cache");
         let step = noise(2_600_000);
-        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new(), skip: Vec::new() }, None)
-            .unwrap();
+        doc.add_feature(
+            FeatureKind::Import {
+                file: "large.step".into(),
+                step: step.clone().into(),
+                components: Vec::new(),
+                skip: Vec::new(),
+                meshes: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
         let bodies = native_geometry();
         let bytes = write_design_container_with_cache(&doc, DesignCompression::Fast, None, Some(&bodies)).unwrap();
         let entries = parts(&bytes);
@@ -1400,8 +1443,11 @@ mod tests {
             part.with_color(Some([0.5, 0.5, 0.5])).with_paint(Some(solidcraft_kernel::Paint { opacity: 1., faces, name: Some("Body grey".into()) }));
         let step = solidcraft_kernel::step_export(&[&named], "named").unwrap();
         let mut doc = Document::new("Named colours");
-        doc.add_feature(FeatureKind::Import { file: "named.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new() }, None)
-            .unwrap();
+        doc.add_feature(
+            FeatureKind::Import { file: "named.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new(), meshes: Vec::new() },
+            None,
+        )
+        .unwrap();
         let mut model = solidcraft_doc::Model::new();
         model.evaluate(&doc);
         let names = |model: &solidcraft_doc::Model| {
@@ -1853,13 +1899,98 @@ mod tests {
         assert!(decode_mesh(&bytes[..bytes.len() - 1], &mut restored).is_err());
     }
 
+    #[test]
+    fn authored_scan_appearance_blob_roundtrip_and_truncation() {
+        use solidcraft_geom::mesh_appearance::{MeshAppearance, MeshMaterial, MeshTexture};
+        let appearance = MeshAppearance {
+            corner_uvs: vec![[[0., 0.], [1., 0.], [0., 1.]]].into(),
+            corner_colors: vec![[[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]]].into(),
+            triangle_materials: vec![0].into(),
+            materials: vec![MeshMaterial {
+                name: "Photo".into(),
+                base_color: [1.; 4],
+                texture: Some(MeshTexture { name: "source.png".into(), mime_type: "image/png".into(), bytes: vec![1, 2, 3, 4].into() }),
+            }]
+            .into(),
+        };
+        let bytes = mesh_appearance::encode(&appearance, 1).unwrap();
+        assert_eq!(mesh_appearance::decode(&bytes, 1).unwrap().as_ref(), &appearance);
+        assert!(mesh_appearance::decode(&bytes[..bytes.len() - 1], 1).is_err());
+        assert!(mesh_appearance::decode(&bytes, 2).is_err());
+        let mut source = mesh();
+        source.appearance = Some(Arc::new(appearance.clone()));
+        let mut doc = Document::new("Textured scan");
+        doc.add_feature(FeatureKind::MeshImport { file: "scan.obj".into(), meshes: vec![source] }, Some("Scan")).unwrap();
+        let bytes = write_design_container(&doc).unwrap();
+        let reopened = crate::read_design(&bytes).unwrap();
+        let FeatureKind::MeshImport { meshes, .. } = &reopened.features[0].kind else { panic!("mesh import") };
+        assert_eq!(meshes[0].appearance.as_deref(), Some(&appearance));
+    }
+
     fn mesh() -> MeshData {
         MeshData {
+            appearance: None,
             name: "Precise mesh".into(),
             positions: vec![0.123456789012345, -0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0].into(),
             triangles: vec![0, 1, 2].into(),
             color: Some([0.25, 0.5, 0.75]),
             corner_normals: Default::default(),
+        }
+    }
+
+    #[test]
+    fn linked_scan_imports_keep_embedded_textures_in_json_and_containers() {
+        use solidcore_record::Vec3;
+        use solidcraft_geom::mesh_appearance::{MeshAppearance, MeshMaterial, MeshTexture};
+        let mut scan = mesh();
+        scan.appearance = Some(Arc::new(MeshAppearance {
+            corner_uvs: vec![[[0., 0.], [1., 0.], [0., 1.]]].into(),
+            corner_colors: vec![[[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]]].into(),
+            triangle_materials: vec![0].into(),
+            materials: vec![MeshMaterial {
+                name: "Scan photo".into(),
+                base_color: [1.; 4],
+                texture: Some(MeshTexture { name: "scan.png".into(), mime_type: "image/png".into(), bytes: vec![1, 2, 3, 4].into() }),
+            }]
+            .into(),
+        }));
+        let cube = solidcraft_kernel::box_solid(Vec3::ZERO, Vec3::new(10., 20., 30.)).unwrap();
+        let solid_step = solidcraft_kernel::step_export(&[&cube], "Solid").unwrap();
+        for step in [String::new(), solid_step] {
+            let expected_bodies = if step.is_empty() { 1 } else { 2 };
+            let mut doc = Document::new("Linked scan");
+            doc.add_feature(
+                FeatureKind::Import {
+                    file: "scan.sc".into(),
+                    step: step.into(),
+                    components: Vec::new(),
+                    skip: Vec::new(),
+                    meshes: vec![scan.clone()],
+                },
+                None,
+            )
+            .unwrap();
+            for bytes in [
+                crate::write_design(&doc),
+                write_design_container(&doc).unwrap(),
+                write_design_container_with_cache(&doc, DesignCompression::Compact, None, Some(&native_geometry())).unwrap(),
+            ] {
+                let reopened = crate::read_design(&bytes).unwrap();
+                assert_eq!(reopened, doc);
+                let mut model = solidcraft_doc::Model::new();
+                model.evaluate(&reopened);
+                assert!(model.results.iter().all(|result| result.error.is_none()));
+                let state = model.state();
+                assert_eq!(state.bodies.len(), expected_bodies);
+                let mesh_body = state.bodies.iter().find(|body| body.body.is_mesh()).unwrap();
+                assert_eq!(mesh_body.mesh_appearance.as_deref(), scan.appearance.as_deref());
+                if is_design_container(&bytes) {
+                    let entries = parts(&bytes);
+                    assert!(!entries.contains_key("cache/bodies.bin"), "native cache cannot discard authored mesh attributes");
+                    let metadata: Value = serde_json::from_slice(&entries["document.json"]).unwrap();
+                    assert!(metadata["features"][0]["meshes"][0]["appearance_blob"].is_string());
+                }
+            }
         }
     }
 
@@ -1872,6 +2003,7 @@ mod tests {
                     step: "ISO-10303-21;\nEND-ISO-10303-21;".into(),
                     components: Vec::new(),
                     skip: Vec::new(),
+                    meshes: Vec::new(),
                 },
                 None,
             )
@@ -2321,6 +2453,7 @@ mod tests {
         let encoded = overhead + indices * 4;
         assert!(encoded > crate::MAX_DESIGN_BYTES && encoded <= max_mesh_part(), "encoded {encoded}");
         let mesh = MeshData {
+            appearance: None,
             name: "Large".into(),
             positions: Arc::clone(&positions),
             triangles: (0..indices).map(|i| (i % 3) as u32).collect(),
@@ -2433,8 +2566,11 @@ mod tests {
     fn step_that_cannot_be_saved_even_compressed_is_refused_when_the_design_is_saved() {
         let step = padded_step(crate::MAX_DESIGN_BYTES + (80 << 20), true);
         let mut doc = Document::new("Noisy import");
-        doc.add_feature(FeatureKind::Import { file: "noisy.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new() }, None)
-            .unwrap();
+        doc.add_feature(
+            FeatureKind::Import { file: "noisy.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new(), meshes: Vec::new() },
+            None,
+        )
+        .unwrap();
         let message = write_design_container(&doc).err().unwrap().to_string();
         assert!(message.contains("the design would be") && message.contains("a design file may hold"), "{message}");
     }
@@ -2460,7 +2596,11 @@ mod tests {
         // 64 MiB that deflate to a few hundred kilobytes, declared as a 1 KiB STEP source.
         let mut doc = Document::new("Bomb");
         let step = format!("ISO-10303-21;{}", " ".repeat(64 << 20));
-        doc.add_feature(FeatureKind::Import { file: "bomb.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new() }, None).unwrap();
+        doc.add_feature(
+            FeatureKind::Import { file: "bomb.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new(), meshes: Vec::new() },
+            None,
+        )
+        .unwrap();
         let honest = write_design_container(&doc).unwrap();
         assert!(honest.len() < 1 << 20);
         let central = honest.windows(4).position(|v| v == b"PK\x01\x02").unwrap();
@@ -2776,8 +2916,11 @@ mod tests {
             .collect();
         let step = solidcraft_kernel::step_export(&bodies.iter().collect::<Vec<_>>(), "SolidCraft storage benchmark").unwrap();
         let mut doc = Document::new("Generated STEP benchmark");
-        doc.add_feature(FeatureKind::Import { file: "generated.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new() }, None)
-            .unwrap();
+        doc.add_feature(
+            FeatureKind::Import { file: "generated.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new(), meshes: Vec::new() },
+            None,
+        )
+        .unwrap();
         measure_storage(&doc, "step");
     }
 

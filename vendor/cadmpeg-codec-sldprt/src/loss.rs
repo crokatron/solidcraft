@@ -1,0 +1,1202 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Stable loss vocabulary for `.sldprt` decoding.
+//!
+//! Every fallback, approximation, and drop the decoder reports carries a
+//! stable machine-readable code from [`SldprtLossCode`]. Codes are the gating
+//! surface: harness oracles and downstream tooling key on them, never on the
+//! human-readable message text, so a reworded message is not a contract change
+//! and a new drop path without a code does not compile.
+//!
+//! [`SldprtLossCode::note`] is the single practical construction path for a
+//! decode-time [`LossNote`] in this crate: it fixes the loss category and
+//! severity from the code so the two cannot drift apart across sites, and it
+//! leaves only the per-instance message to the caller.
+//!
+use cadmpeg_ir::report::{
+    loss::{LossKind, LossNote, LossTaxonomy},
+    Severity,
+};
+
+/// A stable, machine-readable identifier for one `.sldprt` transfer loss.
+///
+/// Variants are grouped by the record family whose transfer degraded. The
+/// string form (via [`SldprtLossCode::code`]) is the stable contract.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum SldprtLossCode {
+    /// Part root scalar prefix has no supported class-specific reading.
+    MetadataPartRootUnsupported,
+    /// Configuration-manager class has no proven scalar roles or serializer.
+    MetadataConfigurationManagerOpaque,
+    /// Default-property carrier has no complete supported reading.
+    MetadataDefaultCarrierUnsupported,
+    /// Default properties have multiple physical namespace owners.
+    MetadataDefaultOwnerAmbiguous,
+    /// Saved alias or value identifiers are not unique.
+    MetadataDefaultAliasAmbiguous,
+    /// Saved property has no represented usable scalar value.
+    MetadataDefaultValueUnsupported,
+    /// Saved configuration mass properties cannot be compared to active geometry.
+    MetadataMassPropertiesNotCompared,
+    /// Configuration-property namespace has multiple physical owners.
+    MetadataConfigurationPropertyOwnerAmbiguous,
+    /// Configuration-property XML has no complete unambiguous reading.
+    MetadataConfigurationPropertyCarrierUnsupported,
+    /// Configuration-property record has no supported literal scalar fact.
+    MetadataConfigurationPropertyValueUnsupported,
+
+    /// Active configuration identity does not resolve to exactly one record.
+    ConfigActiveIdentityUnresolved,
+    /// Active configuration does not resolve to the active geometry partition.
+    ConfigActivePartitionMismatch,
+    /// Configuration state inferred from geometry without a native definition.
+    ConfigInferredWithoutNative,
+    /// Configuration-scoped feature-input lane has unresolved configuration id.
+    ConfigLaneIdentityUnresolved,
+    /// Configuration records share non-unique geometry partition identities.
+    ConfigAmbiguousPartition,
+    /// Configuration records have empty, duplicate, or colliding names/ordinals.
+    ConfigAmbiguousNaming,
+    /// Configuration record references missing or repeated bodies.
+    ConfigIncoherentBodyRefs,
+    /// Configuration lacks a complete evaluated feature/parameter snapshot.
+    ConfigIncompleteSnapshot,
+    /// The configuration pass reached its work cap; later configurations
+    /// keep empty projected states.
+    ConfigProjectionWorkCapped,
+    /// Parameter lacks an evaluated scalar or a regenerable finite value.
+    ParameterUnevaluated,
+    /// Parameter records have empty, duplicate, or colliding names/ordinals.
+    ParameterAmbiguousIdentity,
+    /// Semantic dimension record is unbound or retains a native subtype.
+    PmiDimensionUnbound,
+    /// `PMISemanticDataDB` `MessagePack` map failed to parse into a dimension.
+    PmiSemanticRecordMalformed,
+    /// A `PMISemanticDataDB` section reached its parse work cap; later
+    /// candidate maps were not read.
+    PmiSemanticParseCapped,
+    /// SWIFT annotation class has no format-neutral PMI representation.
+    PmiSwiftAnnotationUnsupported,
+    /// A SWIFT feature walk met a feature only past its depth or work bound;
+    /// the targets or nominal values it feeds stay unresolved.
+    PmiSwiftFeatureWalkCapped,
+    /// A SWIFT diameter has an omitted nominal and no resolved implicit value.
+    PmiSwiftImplicitNominalUnresolved,
+    /// A SWIFT position retains a source `ShapeAspect` when its target is unresolved.
+    PmiSwiftPositionTargetUnresolved,
+    /// Counted spherical-diameter text selects a second sphere by equal radius.
+    PmiSwiftSphericalDiameterTargetCountTextEqualRadiusAssumed,
+    /// A counted spherical-diameter display has no unique resolved sphere target set.
+    PmiSwiftSphericalDiameterTargetUnresolved,
+    /// A SWIFT geometric-tolerance display has no established semantic annotation.
+    PmiSwiftPresentationUnresolved,
+    /// Internal flatness rows use an inferred characteristic convention.
+    PmiSwiftInternalFlatnessSymbolAssumed,
+    /// A SWIFT presentation archive declares displays that its framing discards.
+    PmiSwiftPresentationUnframed,
+    /// A SWIFT display selects faces through a one- or two-string in-place document.
+    PmiSwiftFaceDocumentLayoutAssumed,
+    /// A SWIFT display selects faces through an in-place document whose tail length the file's `swVersion` does not establish.
+    PmiSwiftFaceDocumentTailAssumed,
+    /// Feature history record has duplicate identity or unresolved references.
+    HistoryIncompleteReferences,
+    /// Feature record has missing, repeated, or non-preceding tree edges.
+    FeatureIncoherentEdges,
+    /// Feature record has inconsistent source-content references.
+    FeatureIncoherentContent,
+    /// Feature retains a native output scope that does not resolve to a body.
+    FeatureUnresolvedOutputScope,
+    /// Feature record has missing or repeated output body references.
+    FeatureIncoherentOutputs,
+    /// Sketch constraint retains a native relation kind without neutral semantics.
+    SketchNativeConstraint,
+    /// Sketch geometry record retains a native kind without solved geometry.
+    SketchNativeGeometry,
+    /// A compact sketch profile failed neutral profile admission.
+    SketchProfileRejected,
+    /// Native sketch relation has no projected neutral constraint.
+    SketchRelationUnprojected,
+    /// Native sketch relation is claimed by multiple neutral objects.
+    SketchRelationMultiplyProjected,
+    /// Feature retains its native kind without a complete neutral operation.
+    FeatureNativeKindRetained,
+    /// Native feature-input operation object does not bind uniquely to a feature.
+    FeatureInputObjectUnbound,
+    /// A solid-body transmit remains in its native feature-input or stock-body section.
+    FeatureInputSolidBodyRetained,
+    /// The archive walk of a feature-input lane stopped before the stream's
+    /// end, so the lane scalars keep no archive parameter class.
+    FeatureInputArchiveWalkStopped,
+    /// Typed feature retains native or unresolved required operation operands.
+    FeatureTypedOperandIncomplete,
+    /// Extrusion profile curve data remains unresolved.
+    FeatureProfileCurvesUnavailable,
+    /// Extrusion travel sense remains in its native feature-input lane.
+    FeatureExtrudeDirectionUnresolved,
+    /// Thin extrusion retains an ambiguous inline Boolean operation.
+    FeatureThinOperationAmbiguous,
+    /// Native edge selection has a refused terminal feature owner.
+    FeatureEdgeTerminalUnresolved,
+    /// A compact body-path boundary has competing local-ID and tagged-entry spellings.
+    FeatureBodyPathAmbiguous,
+    /// Body delete/keep feature retains native selection without a decoded mode.
+    FeatureBodyRetentionUnresolved,
+    /// Face or procedural construction references an untyped support surface.
+    GeometryFaceSupportSurfaceUntyped,
+    /// Different surface carrier categories claim one node index.
+    GeometrySurfaceCarrierAmbiguous,
+    /// Offset validity does not establish an exact construction.
+    GeometryOffsetValidityUnresolved,
+    /// Stored spun-profile bounds are ignored and the whole profile is revolved.
+    GeometrySpunProfileIntervalIgnored,
+    /// Edge references an untyped support curve carried opaque.
+    GeometryEdgeSupportCurveUntyped,
+    /// Tolerant edge has no curve because its fin geometry is not read.
+    GeometryTolerantEdgeCurveUnread,
+    /// Referenced POINT records have conflicting complete frames.
+    GeometryPointRecordAmbiguous,
+    /// Compact curve records of one attribute disagree on orientation, so an
+    /// edge on that curve has no range.
+    GeometryCurveMarkerConflict,
+    /// A derived pcurve parameter has multiple geometric candidates.
+    GeometryPcurveAmbiguous,
+    /// A NURBS surface solver exhausted its local work cap; the derived pcurve is skipped.
+    GeometrySurfaceSolverWorkCapped,
+    /// A spline carrier's pole and weight lanes do not pair.
+    GeometrySplineLanesUnpaired,
+    /// A spline carrier stores a control-point weight that is zero or
+    /// negative.
+    GeometrySplineWeightNonpositive,
+    /// A spline carrier's dimension, counts, or multiplicities contradict
+    /// each other or its arrays.
+    GeometrySplineFieldsInconsistent,
+    /// A CONE node stores a negative sine or cosine of its half-angle, whose
+    /// surface is unresolved (`GC-49`).
+    GeometryConeHalfAngleSignUnresolved,
+    /// A CONE node's stored sine and cosine break the unit identity.
+    GeometryConeHalfAngleIdentityRefused,
+    /// The stream's INTERSECTION declaration states no node layout that
+    /// frames, so its intersection curves are not read.
+    GeometryIntersectionLayoutUnknown,
+    /// A neutral carrier uses an approximate intersection or fitted cache.
+    GeometryCarrierApproximated,
+    /// Current face records carry conflicting or incoherent color bindings.
+    AppearanceFaceColorUnresolved,
+    /// Appearance assignments have no unambiguous `DisplayLists` target.
+    AppearanceAssignmentUnresolved,
+    /// Native appearance ownership, state, or precedence has no unique scope.
+    NativeAppearanceScopeUnresolved,
+    /// `DisplayLists` tessellation does not resolve to its B-rep face owners.
+    TessellationFaceOwnershipUnresolved,
+    /// Surface-owner assignment ran out of its local work cap.
+    TessellationOwnerWorkCapped,
+    /// Display-face tables carry conflicting reused class tags, so the
+    /// persistent join is withheld.
+    TessellationReusedTagAmbiguous,
+    /// `DisplayLists` meshes transferred without B-rep geometry ownership.
+    TessellationDisplayWithoutGeometry,
+    /// No body record was available; a body hierarchy was derived.
+    TopologyBodyHierarchyDerived,
+    /// A canonical face has no explicit body relation.
+    TopologyFaceUnclaimed,
+    /// A face has no decoded loop, so the face and its surface are withheld.
+    TopologyFaceWithheld,
+    /// Current typed ownership nodes are absent from the decoded topology.
+    TopologyOwnershipWithheld,
+    /// Referenced FIN records have conflicting complete frames.
+    TopologyFinRecordAmbiguous,
+    /// A canonical edge whose FIN record is an unwalked boundary dummy lacks
+    /// reciprocal partner corroboration of both ring-order endpoints, or a
+    /// mutual twin FIN contradicts the ring-order endpoint.
+    TopologyFinPartnerUnresolved,
+    /// A FIN forward link names no reciprocal same-loop backward link, so
+    /// its ring is withheld instead of walked on doubt.
+    TopologyFinLinkUnresolved,
+    /// Vertexless ring FINs fail reciprocal closed-carrier single-loop
+    /// admission, so no vertex is invented for them.
+    TopologyRingEdgeWithheld,
+    /// A vertex loop names no resolved vertex, so its face and surface are
+    /// withheld.
+    TopologyVertexLoopWithheld,
+    /// A loop of a face holds an ambiguous FIN, so the face and its surface
+    /// are withheld.
+    TopologyAmbiguousFinFaceWithheld,
+    /// Referenced LOOP records have conflicting complete frames.
+    TopologyLoopRecordAmbiguous,
+    /// Referenced VERTEX records lack a complete owner-verified frame or IR-supported tolerance.
+    TopologyVertexRecordUnresolved,
+    /// A NURBS edge's vertex range is off its bound surface; no pcurve is derived.
+    TopologyPcurveCarrierOffSurface,
+    /// Parasolid B-rep geometry was not transferred (no resolved stream).
+    GeometryParasolidNotTransferred,
+    /// Mesh bodies whose facet geometry remains unresolved.
+    GeometryMeshBodyNotTransferred,
+    /// Imported-feature body streams that do not decode.
+    GeometryImportedBodiesNotTransferred,
+    /// B-rep topology graph was not built for this file.
+    TopologyGraphNotTransferred,
+    /// Materials, tessellation, and metadata were not transferred.
+    MaterialMetadataNotTransferred,
+    /// No Parasolid partition/deltas stream was located in the container.
+    ContainerNoParasolidStream,
+    /// The legacy Parasolid zlib probe stopped at its work limit in a section.
+    ContainerParasolidProbeCapped,
+    /// An optional weldment owner was retained after a malformed extraction refusal.
+    ContainerAuxiliaryParasolidRefused,
+    /// Preserved source image required for a byte-exact write was unavailable.
+    SourcePreservedImageUnavailable,
+    /// The document carries no usable `swVersion`, so no declared identity was
+    /// verified.
+    ///
+    /// Charged exactly when the primary-layer [`crate::dialect`] match is
+    /// `Admission::Residual`, from the same predicate that decides the
+    /// admission. A residual `unknown` row is the absence of a declared
+    /// identity, and admission verifies a declared identity, so the pair
+    /// (`sldprt:unknown`, `Admitted`) is unreachable: a part that declares
+    /// nothing must be distinguishable from one whose declaration was
+    /// verified.
+    SourceDialectUnverified,
+    /// An embedded Parasolid schema has no declared grammar and was recovered as residual.
+    KernelDialectUnverified,
+    /// Two embedded kernel carriers resolved to one dialect-layer identity.
+    DialectLayerCollision,
+    /// The selected write target differs from the same-format source dialect.
+    /// Export omits records named by the counted loss message.
+    WriterShellWireTopologyOmitted,
+    /// Export omits records named by the counted loss message.
+    WriterCoedgePcurveUsesOmitted,
+    /// Export omits records named by the counted loss message.
+    WriterSphereSeamCurvesOmitted,
+    /// Export omits records named by the counted loss message.
+    WriterAppearanceBindingsOmitted,
+    /// Export omits records named by the counted loss message.
+    WriterAttributesOmitted,
+    /// Export omits records named by the counted loss message.
+    WriterUnboundAppearancesOmitted,
+    /// Export omits records named by the counted loss message.
+    WriterTessellationMetadataOmitted,
+    /// Semantic regeneration omits native cache or directory-padding bytes.
+    WriterNativeEnvelopeAuxiliaryOmitted,
+    SourceDialectDisplaced,
+    /// A source record states a property whose key holds no non-whitespace
+    /// character, so the property cannot be keyed and is not transferred.
+    SourcePropertyKeyBlank,
+    /// An assembly document carries no readable component tree, so no
+    /// occurrence, placement, or component reference is transferred.
+    AssemblyStructureNotTransferred,
+    /// Assembly mate records are not transferred.
+    AssemblyMatesNotTransferred,
+    /// Assembly occurrences reference component documents that the decoder
+    /// does not open.
+    AssemblyComponentsExternal,
+    /// Virtual components stored inside the assembly document whose bodies are
+    /// not transferred: the document is absent, its section gives no decoded
+    /// body, or its section shares a name with another.
+    AssemblyVirtualComponentsNotTransferred,
+    /// Suppressed component instances, and the instances below them, are
+    /// omitted from the occurrence tree.
+    AssemblySuppressedComponentsOmitted,
+    /// A component instance has no valid placement or names no component
+    /// model; the instance and the instances below it are omitted.
+    AssemblyPlacementUnresolved,
+    /// Assembly configurations other than the active one are not transferred.
+    AssemblyConfigurationsNotTransferred,
+    /// Component documents embedded in the assembly document are not decoded.
+    AssemblyEmbeddedDocumentsNotTransferred,
+    /// An occurrence's exclusion from the bill of materials is not transferred.
+    AssemblyBomExclusionNotTransferred,
+}
+
+impl SldprtLossCode {
+    /// Every code, in declaration order.
+    #[cfg(test)]
+    const ALL: &'static [SldprtLossCode] = &[
+        Self::MetadataPartRootUnsupported,
+        Self::MetadataConfigurationManagerOpaque,
+        Self::MetadataDefaultCarrierUnsupported,
+        Self::MetadataDefaultOwnerAmbiguous,
+        Self::MetadataDefaultAliasAmbiguous,
+        Self::MetadataDefaultValueUnsupported,
+        Self::MetadataMassPropertiesNotCompared,
+        Self::MetadataConfigurationPropertyOwnerAmbiguous,
+        Self::MetadataConfigurationPropertyCarrierUnsupported,
+        Self::MetadataConfigurationPropertyValueUnsupported,
+        Self::ConfigActiveIdentityUnresolved,
+        Self::ConfigActivePartitionMismatch,
+        Self::ConfigInferredWithoutNative,
+        Self::ConfigLaneIdentityUnresolved,
+        Self::ConfigAmbiguousPartition,
+        Self::ConfigAmbiguousNaming,
+        Self::ConfigIncoherentBodyRefs,
+        Self::ConfigIncompleteSnapshot,
+        Self::ConfigProjectionWorkCapped,
+        Self::ParameterUnevaluated,
+        Self::ParameterAmbiguousIdentity,
+        Self::PmiDimensionUnbound,
+        Self::PmiSemanticRecordMalformed,
+        Self::PmiSemanticParseCapped,
+        Self::PmiSwiftAnnotationUnsupported,
+        Self::PmiSwiftFeatureWalkCapped,
+        Self::PmiSwiftImplicitNominalUnresolved,
+        Self::PmiSwiftPositionTargetUnresolved,
+        Self::PmiSwiftSphericalDiameterTargetCountTextEqualRadiusAssumed,
+        Self::PmiSwiftSphericalDiameterTargetUnresolved,
+        Self::PmiSwiftPresentationUnresolved,
+        Self::PmiSwiftInternalFlatnessSymbolAssumed,
+        Self::PmiSwiftPresentationUnframed,
+        Self::PmiSwiftFaceDocumentLayoutAssumed,
+        Self::PmiSwiftFaceDocumentTailAssumed,
+        Self::HistoryIncompleteReferences,
+        Self::FeatureIncoherentEdges,
+        Self::FeatureIncoherentContent,
+        Self::FeatureUnresolvedOutputScope,
+        Self::FeatureIncoherentOutputs,
+        Self::SketchNativeConstraint,
+        Self::SketchNativeGeometry,
+        Self::SketchProfileRejected,
+        Self::SketchRelationUnprojected,
+        Self::SketchRelationMultiplyProjected,
+        Self::FeatureNativeKindRetained,
+        Self::FeatureInputObjectUnbound,
+        Self::FeatureInputSolidBodyRetained,
+        Self::FeatureInputArchiveWalkStopped,
+        Self::FeatureTypedOperandIncomplete,
+        Self::FeatureProfileCurvesUnavailable,
+        Self::FeatureExtrudeDirectionUnresolved,
+        Self::FeatureThinOperationAmbiguous,
+        Self::FeatureEdgeTerminalUnresolved,
+        Self::FeatureBodyPathAmbiguous,
+        Self::FeatureBodyRetentionUnresolved,
+        Self::GeometryFaceSupportSurfaceUntyped,
+        Self::GeometrySurfaceCarrierAmbiguous,
+        Self::GeometryOffsetValidityUnresolved,
+        Self::GeometrySpunProfileIntervalIgnored,
+        Self::GeometryEdgeSupportCurveUntyped,
+        Self::GeometryTolerantEdgeCurveUnread,
+        Self::GeometryPointRecordAmbiguous,
+        Self::GeometryCurveMarkerConflict,
+        Self::GeometryPcurveAmbiguous,
+        Self::GeometrySurfaceSolverWorkCapped,
+        Self::GeometrySplineLanesUnpaired,
+        Self::GeometrySplineWeightNonpositive,
+        Self::GeometrySplineFieldsInconsistent,
+        Self::GeometryConeHalfAngleSignUnresolved,
+        Self::GeometryConeHalfAngleIdentityRefused,
+        Self::GeometryIntersectionLayoutUnknown,
+        Self::GeometryCarrierApproximated,
+        Self::AppearanceFaceColorUnresolved,
+        Self::AppearanceAssignmentUnresolved,
+        Self::NativeAppearanceScopeUnresolved,
+        Self::TessellationFaceOwnershipUnresolved,
+        Self::TessellationOwnerWorkCapped,
+        Self::TessellationReusedTagAmbiguous,
+        Self::TessellationDisplayWithoutGeometry,
+        Self::TopologyBodyHierarchyDerived,
+        Self::TopologyFaceUnclaimed,
+        Self::TopologyFaceWithheld,
+        Self::TopologyOwnershipWithheld,
+        Self::TopologyFinRecordAmbiguous,
+        Self::TopologyFinPartnerUnresolved,
+        Self::TopologyFinLinkUnresolved,
+        Self::TopologyRingEdgeWithheld,
+        Self::TopologyVertexLoopWithheld,
+        Self::TopologyAmbiguousFinFaceWithheld,
+        Self::TopologyLoopRecordAmbiguous,
+        Self::TopologyVertexRecordUnresolved,
+        Self::TopologyPcurveCarrierOffSurface,
+        Self::GeometryParasolidNotTransferred,
+        Self::GeometryMeshBodyNotTransferred,
+        Self::GeometryImportedBodiesNotTransferred,
+        Self::TopologyGraphNotTransferred,
+        Self::MaterialMetadataNotTransferred,
+        Self::ContainerNoParasolidStream,
+        Self::ContainerParasolidProbeCapped,
+        Self::ContainerAuxiliaryParasolidRefused,
+        Self::SourcePreservedImageUnavailable,
+        Self::SourceDialectUnverified,
+        Self::KernelDialectUnverified,
+        Self::DialectLayerCollision,
+        Self::WriterShellWireTopologyOmitted,
+        Self::WriterCoedgePcurveUsesOmitted,
+        Self::WriterSphereSeamCurvesOmitted,
+        Self::WriterAppearanceBindingsOmitted,
+        Self::WriterAttributesOmitted,
+        Self::WriterUnboundAppearancesOmitted,
+        Self::WriterTessellationMetadataOmitted,
+        Self::WriterNativeEnvelopeAuxiliaryOmitted,
+        Self::SourceDialectDisplaced,
+        Self::SourcePropertyKeyBlank,
+        Self::AssemblyStructureNotTransferred,
+        Self::AssemblyMatesNotTransferred,
+        Self::AssemblyComponentsExternal,
+        Self::AssemblyVirtualComponentsNotTransferred,
+        Self::AssemblySuppressedComponentsOmitted,
+        Self::AssemblyPlacementUnresolved,
+        Self::AssemblyConfigurationsNotTransferred,
+        Self::AssemblyEmbeddedDocumentsNotTransferred,
+        Self::AssemblyBomExclusionNotTransferred,
+    ];
+
+    /// The stable string identifier. This is the gating contract.
+    #[must_use]
+    const fn code(self) -> &'static str {
+        match self {
+            Self::ConfigActiveIdentityUnresolved => "config.active-identity-unresolved",
+            Self::ConfigActivePartitionMismatch => "config.active-partition-mismatch",
+            Self::ConfigInferredWithoutNative => "config.inferred-without-native",
+            Self::ConfigLaneIdentityUnresolved => "config.lane-identity-unresolved",
+            Self::ConfigAmbiguousPartition => "config.ambiguous-partition",
+            Self::ConfigAmbiguousNaming => "config.ambiguous-naming",
+            Self::ConfigIncoherentBodyRefs => "config.incoherent-body-refs",
+            Self::ConfigIncompleteSnapshot => "config.incomplete-snapshot",
+            Self::ConfigProjectionWorkCapped => "config.projection-work-capped",
+            Self::ParameterUnevaluated => "parameter.unevaluated",
+            Self::ParameterAmbiguousIdentity => "parameter.ambiguous-identity",
+            Self::PmiDimensionUnbound => "pmi.dimension-unbound",
+            Self::PmiSemanticRecordMalformed => "pmi.semantic-record-malformed",
+            Self::PmiSemanticParseCapped => "pmi.semantic-parse-capped",
+            Self::PmiSwiftAnnotationUnsupported => "pmi.swift-annotation-unsupported",
+            Self::PmiSwiftFeatureWalkCapped => "pmi.swift-feature-walk-capped",
+            Self::PmiSwiftImplicitNominalUnresolved => "pmi.swift-implicit-nominal-unresolved",
+            Self::PmiSwiftPositionTargetUnresolved => "pmi.swift-position-target-unresolved",
+            Self::PmiSwiftSphericalDiameterTargetCountTextEqualRadiusAssumed => {
+                "pmi.swift-spherical-diameter-count-text-equal-radius-assumed"
+            }
+            Self::PmiSwiftSphericalDiameterTargetUnresolved => {
+                "pmi.swift-spherical-diameter-target-unresolved"
+            }
+            Self::PmiSwiftPresentationUnresolved => "pmi.swift-presentation-unresolved",
+            Self::PmiSwiftInternalFlatnessSymbolAssumed => {
+                "pmi.swift-internal-flatness-symbol-assumed"
+            }
+            Self::PmiSwiftPresentationUnframed => "pmi.swift-presentation-unframed",
+            Self::PmiSwiftFaceDocumentLayoutAssumed => "pmi.swift-face-document-layout-assumed",
+            Self::PmiSwiftFaceDocumentTailAssumed => "pmi.swift-face-document-tail-assumed",
+            Self::HistoryIncompleteReferences => "history.incomplete-references",
+            Self::FeatureIncoherentEdges => "feature.incoherent-edges",
+            Self::FeatureIncoherentContent => "feature.incoherent-content",
+            Self::FeatureUnresolvedOutputScope => "feature.unresolved-output-scope",
+            Self::FeatureIncoherentOutputs => "feature.incoherent-outputs",
+            Self::SketchNativeConstraint => "sketch.native-constraint",
+            Self::SketchNativeGeometry => "sketch.native-geometry",
+            Self::SketchProfileRejected => "sketch.profile-rejected",
+            Self::SketchRelationUnprojected => "sketch.relation-unprojected",
+            Self::SketchRelationMultiplyProjected => "sketch.relation-multiply-projected",
+            Self::FeatureNativeKindRetained => "feature.native-kind-retained",
+            Self::FeatureInputObjectUnbound => "feature.input-object-unbound",
+            Self::FeatureInputSolidBodyRetained => "feature.input-solid-body-retained",
+            Self::FeatureInputArchiveWalkStopped => "feature.input-archive-walk-stopped",
+            Self::FeatureTypedOperandIncomplete => "feature.typed-operand-incomplete",
+            Self::FeatureProfileCurvesUnavailable => "feature.profile-curves-unavailable",
+            Self::FeatureExtrudeDirectionUnresolved => "feature.extrude-direction-unresolved",
+            Self::FeatureThinOperationAmbiguous => "feature.thin-operation-ambiguous",
+            Self::FeatureEdgeTerminalUnresolved => "feature.edge-terminal-unresolved",
+            Self::FeatureBodyPathAmbiguous => "feature.body-path-ambiguous",
+            Self::FeatureBodyRetentionUnresolved => "feature.body-retention-unresolved",
+            Self::GeometryFaceSupportSurfaceUntyped => "geometry.face-support-surface-untyped",
+            Self::GeometrySurfaceCarrierAmbiguous => "geometry.surface-carrier-ambiguous",
+            Self::GeometryOffsetValidityUnresolved => "geometry.offset-validity-unresolved",
+            Self::GeometrySpunProfileIntervalIgnored => "geometry.spun-profile-interval-ignored",
+            Self::GeometryEdgeSupportCurveUntyped => "geometry.edge-support-curve-untyped",
+            Self::GeometryTolerantEdgeCurveUnread => "geometry.tolerant-edge-curve-unread",
+            Self::GeometryPointRecordAmbiguous => "geometry.point-record-ambiguous",
+            Self::GeometryCurveMarkerConflict => "geometry.curve-marker-conflict",
+            Self::GeometryPcurveAmbiguous => "geometry.pcurve-ambiguous",
+            Self::GeometrySurfaceSolverWorkCapped => "geometry.surface-solver-work-capped",
+            Self::GeometrySplineLanesUnpaired => "geometry.spline-lanes-unpaired",
+            Self::GeometrySplineWeightNonpositive => "geometry.spline-weight-nonpositive",
+            Self::GeometrySplineFieldsInconsistent => "geometry.spline-fields-inconsistent",
+            Self::GeometryConeHalfAngleSignUnresolved => "geometry.cone-half-angle-sign-unresolved",
+            Self::GeometryConeHalfAngleIdentityRefused => {
+                "geometry.cone-half-angle-identity-refused"
+            }
+            Self::GeometryIntersectionLayoutUnknown => "geometry.intersection-layout-unknown",
+            Self::GeometryCarrierApproximated => "geometry.carrier-approximated",
+            Self::AppearanceFaceColorUnresolved => "appearance.face-color-unresolved",
+            Self::AppearanceAssignmentUnresolved => "appearance.assignment-unresolved",
+            Self::NativeAppearanceScopeUnresolved => "appearance.native-scope-unresolved",
+            Self::TessellationFaceOwnershipUnresolved => "tessellation.face-ownership-unresolved",
+            Self::TessellationOwnerWorkCapped => "tessellation.owner-work-capped",
+            Self::TessellationReusedTagAmbiguous => "tessellation.reused-tag-ambiguous",
+            Self::TessellationDisplayWithoutGeometry => "tessellation.display-without-geometry",
+            Self::TopologyBodyHierarchyDerived => "topology.body-hierarchy-derived",
+            Self::TopologyFaceUnclaimed => "topology.face-unclaimed",
+            Self::TopologyOwnershipWithheld => "topology.ownership-withheld",
+            Self::TopologyFaceWithheld => "topology.face-withheld",
+            Self::TopologyFinRecordAmbiguous => "topology.fin-record-ambiguous",
+            Self::TopologyFinPartnerUnresolved => "topology.fin-partner-unresolved",
+            Self::TopologyFinLinkUnresolved => "topology.fin-link-unresolved",
+            Self::TopologyRingEdgeWithheld => "topology.ring-edge-withheld",
+            Self::TopologyVertexLoopWithheld => "topology.vertex-loop-withheld",
+            Self::TopologyAmbiguousFinFaceWithheld => "topology.ambiguous-fin-face-withheld",
+            Self::TopologyLoopRecordAmbiguous => "topology.loop-record-ambiguous",
+            Self::TopologyVertexRecordUnresolved => "topology.vertex-record-unresolved",
+            Self::TopologyPcurveCarrierOffSurface => "topology.pcurve-carrier-off-surface",
+            Self::GeometryParasolidNotTransferred => "geometry.parasolid-not-transferred",
+            Self::GeometryMeshBodyNotTransferred => "geometry.mesh-body-not-transferred",
+            Self::GeometryImportedBodiesNotTransferred => {
+                "geometry.imported-bodies-not-transferred"
+            }
+            Self::TopologyGraphNotTransferred => "topology.graph-not-transferred",
+            Self::MaterialMetadataNotTransferred => "material.metadata-not-transferred",
+            Self::ContainerNoParasolidStream => "container.no-parasolid-stream",
+            Self::ContainerParasolidProbeCapped => "container.parasolid-probe-capped",
+            Self::ContainerAuxiliaryParasolidRefused => "container.auxiliary-parasolid-refused",
+            Self::SourcePreservedImageUnavailable => "source.preserved-image-unavailable",
+            Self::SourceDialectUnverified => "source.dialect-unverified",
+            Self::KernelDialectUnverified => "source.kernel-dialect-unverified",
+            Self::DialectLayerCollision => "source.dialect-layer-collision",
+            Self::WriterShellWireTopologyOmitted => "writer.shell-wire-topology-omitted",
+            Self::WriterCoedgePcurveUsesOmitted => "writer.coedge-pcurve-uses-omitted",
+            Self::WriterSphereSeamCurvesOmitted => "writer.sphere-seam-curves-omitted",
+            Self::WriterAppearanceBindingsOmitted => "writer.appearance-bindings-omitted",
+            Self::WriterAttributesOmitted => "writer.attributes-omitted",
+            Self::WriterUnboundAppearancesOmitted => "writer.unbound-appearances-omitted",
+            Self::WriterTessellationMetadataOmitted => "writer.tessellation-metadata-omitted",
+            Self::WriterNativeEnvelopeAuxiliaryOmitted => {
+                "writer.native-envelope-auxiliary-omitted"
+            }
+            Self::SourceDialectDisplaced => "target.source-dialect-displaced",
+            Self::SourcePropertyKeyBlank => "source.property-key-blank",
+            Self::MetadataPartRootUnsupported => "metadata.part-root-unsupported",
+            Self::MetadataConfigurationManagerOpaque => "metadata.configuration-manager-opaque",
+            Self::MetadataDefaultCarrierUnsupported => "metadata.default-carrier-unsupported",
+            Self::MetadataDefaultOwnerAmbiguous => "metadata.default-owner-ambiguous",
+            Self::MetadataDefaultAliasAmbiguous => "metadata.default-alias-ambiguous",
+            Self::MetadataDefaultValueUnsupported => "metadata.default-value-unsupported",
+            Self::MetadataMassPropertiesNotCompared => "metadata.mass-properties-not-compared",
+            Self::MetadataConfigurationPropertyOwnerAmbiguous => {
+                "metadata.configuration-property-owner-ambiguous"
+            }
+            Self::MetadataConfigurationPropertyCarrierUnsupported => {
+                "metadata.configuration-property-carrier-unsupported"
+            }
+            Self::MetadataConfigurationPropertyValueUnsupported => {
+                "metadata.configuration-property-value-unsupported"
+            }
+            Self::AssemblyStructureNotTransferred => "assembly.structure-not-transferred",
+            Self::AssemblyMatesNotTransferred => "assembly.mates-not-transferred",
+            Self::AssemblyComponentsExternal => "assembly.components-external",
+            Self::AssemblyVirtualComponentsNotTransferred => {
+                "assembly.virtual-components-not-transferred"
+            }
+            Self::AssemblySuppressedComponentsOmitted => "assembly.suppressed-components-omitted",
+            Self::AssemblyPlacementUnresolved => "assembly.placement-unresolved",
+            Self::AssemblyConfigurationsNotTransferred => "assembly.configurations-not-transferred",
+            Self::AssemblyEmbeddedDocumentsNotTransferred => {
+                "assembly.embedded-documents-not-transferred"
+            }
+            Self::AssemblyBomExclusionNotTransferred => "assembly.bom-exclusion-not-transferred",
+        }
+    }
+
+    /// The severity of this loss.
+    #[must_use]
+    const fn severity(self) -> Severity {
+        match self {
+            Self::WriterTessellationMetadataOmitted => Severity::Warning,
+            Self::WriterNativeEnvelopeAuxiliaryOmitted => Severity::Warning,
+            Self::WriterUnboundAppearancesOmitted => Severity::Warning,
+            Self::WriterAttributesOmitted => Severity::Warning,
+            Self::WriterAppearanceBindingsOmitted => Severity::Warning,
+            Self::WriterSphereSeamCurvesOmitted => Severity::Warning,
+            Self::WriterCoedgePcurveUsesOmitted => Severity::Warning,
+            Self::WriterShellWireTopologyOmitted => Severity::Warning,
+            Self::GeometryParasolidNotTransferred
+            | Self::TopologyGraphNotTransferred
+            | Self::SourcePreservedImageUnavailable => Severity::Blocking,
+            Self::ContainerNoParasolidStream
+            | Self::GeometryMeshBodyNotTransferred
+            | Self::GeometryImportedBodiesNotTransferred => Severity::Error,
+            Self::ConfigActiveIdentityUnresolved
+            | Self::ConfigActivePartitionMismatch
+            | Self::ConfigInferredWithoutNative
+            | Self::ConfigLaneIdentityUnresolved
+            | Self::ConfigAmbiguousPartition
+            | Self::ConfigAmbiguousNaming
+            | Self::ConfigIncoherentBodyRefs
+            | Self::ConfigIncompleteSnapshot
+            | Self::ConfigProjectionWorkCapped
+            | Self::ParameterUnevaluated
+            | Self::ParameterAmbiguousIdentity
+            | Self::PmiDimensionUnbound
+            | Self::PmiSemanticRecordMalformed
+            | Self::PmiSemanticParseCapped
+            | Self::PmiSwiftAnnotationUnsupported
+            | Self::PmiSwiftFeatureWalkCapped
+            | Self::PmiSwiftImplicitNominalUnresolved
+            | Self::PmiSwiftPositionTargetUnresolved
+            | Self::PmiSwiftSphericalDiameterTargetCountTextEqualRadiusAssumed
+            | Self::PmiSwiftSphericalDiameterTargetUnresolved
+            | Self::PmiSwiftPresentationUnresolved
+            | Self::PmiSwiftInternalFlatnessSymbolAssumed
+            | Self::PmiSwiftPresentationUnframed
+            | Self::PmiSwiftFaceDocumentLayoutAssumed
+            | Self::PmiSwiftFaceDocumentTailAssumed
+            | Self::HistoryIncompleteReferences
+            | Self::FeatureIncoherentEdges
+            | Self::FeatureIncoherentContent
+            | Self::FeatureUnresolvedOutputScope
+            | Self::FeatureIncoherentOutputs
+            | Self::SketchNativeConstraint
+            | Self::SketchNativeGeometry
+            | Self::SketchProfileRejected
+            | Self::SketchRelationUnprojected
+            | Self::SketchRelationMultiplyProjected
+            | Self::FeatureNativeKindRetained
+            | Self::FeatureInputSolidBodyRetained
+            | Self::FeatureInputObjectUnbound
+            | Self::FeatureInputArchiveWalkStopped
+            | Self::FeatureTypedOperandIncomplete
+            | Self::FeatureProfileCurvesUnavailable
+            | Self::FeatureExtrudeDirectionUnresolved
+            | Self::FeatureThinOperationAmbiguous
+            | Self::FeatureEdgeTerminalUnresolved
+            | Self::FeatureBodyPathAmbiguous
+            | Self::FeatureBodyRetentionUnresolved
+            | Self::GeometryFaceSupportSurfaceUntyped
+            | Self::GeometrySurfaceCarrierAmbiguous
+            | Self::GeometrySpunProfileIntervalIgnored
+            | Self::GeometryOffsetValidityUnresolved
+            | Self::GeometryEdgeSupportCurveUntyped
+            | Self::GeometryTolerantEdgeCurveUnread
+            | Self::GeometryPointRecordAmbiguous
+            | Self::GeometryCurveMarkerConflict
+            | Self::GeometryPcurveAmbiguous
+            | Self::GeometrySurfaceSolverWorkCapped
+            | Self::GeometrySplineLanesUnpaired
+            | Self::GeometrySplineWeightNonpositive
+            | Self::GeometrySplineFieldsInconsistent
+            | Self::GeometryConeHalfAngleSignUnresolved
+            | Self::GeometryConeHalfAngleIdentityRefused
+            | Self::GeometryIntersectionLayoutUnknown
+            | Self::GeometryCarrierApproximated
+            | Self::AppearanceFaceColorUnresolved
+            | Self::AppearanceAssignmentUnresolved
+            | Self::NativeAppearanceScopeUnresolved
+            | Self::TessellationFaceOwnershipUnresolved
+            | Self::TessellationOwnerWorkCapped
+            | Self::TessellationReusedTagAmbiguous
+            | Self::TessellationDisplayWithoutGeometry
+            | Self::TopologyBodyHierarchyDerived
+            | Self::TopologyFaceUnclaimed
+            | Self::TopologyOwnershipWithheld
+            | Self::TopologyFaceWithheld
+            | Self::TopologyFinRecordAmbiguous
+            | Self::TopologyFinPartnerUnresolved
+            | Self::TopologyFinLinkUnresolved
+            | Self::TopologyRingEdgeWithheld
+            | Self::TopologyVertexLoopWithheld
+            | Self::TopologyAmbiguousFinFaceWithheld
+            | Self::TopologyLoopRecordAmbiguous
+            | Self::TopologyVertexRecordUnresolved
+            | Self::TopologyPcurveCarrierOffSurface
+            | Self::MaterialMetadataNotTransferred
+            | Self::ContainerAuxiliaryParasolidRefused
+            | Self::ContainerParasolidProbeCapped
+            | Self::SourceDialectUnverified
+            | Self::KernelDialectUnverified
+            | Self::DialectLayerCollision
+            | Self::SourceDialectDisplaced
+            | Self::SourcePropertyKeyBlank
+            | Self::MetadataPartRootUnsupported
+            | Self::MetadataConfigurationManagerOpaque
+            | Self::MetadataDefaultCarrierUnsupported
+            | Self::MetadataDefaultOwnerAmbiguous
+            | Self::MetadataDefaultAliasAmbiguous
+            | Self::MetadataConfigurationPropertyOwnerAmbiguous
+            | Self::MetadataConfigurationPropertyCarrierUnsupported
+            | Self::MetadataConfigurationPropertyValueUnsupported
+            | Self::MetadataDefaultValueUnsupported => Severity::Warning,
+            Self::MetadataMassPropertiesNotCompared => Severity::Warning,
+            Self::AssemblyMatesNotTransferred
+            | Self::AssemblyVirtualComponentsNotTransferred
+            | Self::AssemblyEmbeddedDocumentsNotTransferred => Severity::Warning,
+            Self::AssemblyStructureNotTransferred => Severity::Blocking,
+            Self::AssemblyPlacementUnresolved => Severity::Error,
+            Self::AssemblyComponentsExternal
+            | Self::AssemblySuppressedComponentsOmitted
+            | Self::AssemblyConfigurationsNotTransferred
+            | Self::AssemblyBomExclusionNotTransferred => Severity::Info,
+        }
+    }
+
+    const fn shared_taxonomy(self) -> LossTaxonomy {
+        match self {
+            Self::WriterTessellationMetadataOmitted => LossTaxonomy::AttributesNotTransferred,
+            Self::WriterNativeEnvelopeAuxiliaryOmitted => LossTaxonomy::MetadataNotTransferred,
+            Self::WriterUnboundAppearancesOmitted => LossTaxonomy::AppearanceReduced,
+            Self::WriterAttributesOmitted => LossTaxonomy::AttributesNotTransferred,
+            Self::WriterAppearanceBindingsOmitted => LossTaxonomy::AppearanceReduced,
+            Self::WriterSphereSeamCurvesOmitted => LossTaxonomy::GeometryNotTransferred,
+            Self::WriterCoedgePcurveUsesOmitted => LossTaxonomy::TopologyNotTransferred,
+            Self::WriterShellWireTopologyOmitted => LossTaxonomy::TopologyNotTransferred,
+            Self::ContainerNoParasolidStream => LossTaxonomy::MissingGeometryStream,
+            Self::SourcePreservedImageUnavailable => LossTaxonomy::PreservedSourceUnavailable,
+            Self::SourceDialectUnverified | Self::KernelDialectUnverified => {
+                LossTaxonomy::SourceDialectUnverified
+            }
+            Self::DialectLayerCollision => LossTaxonomy::DecodeDiagnostic,
+            Self::SourceDialectDisplaced => LossTaxonomy::SourceDialectDisplaced,
+            Self::SourcePropertyKeyBlank
+            | Self::MetadataPartRootUnsupported
+            | Self::MetadataConfigurationManagerOpaque
+            | Self::MetadataDefaultCarrierUnsupported
+            | Self::MetadataDefaultOwnerAmbiguous
+            | Self::MetadataDefaultAliasAmbiguous
+            | Self::MetadataConfigurationPropertyOwnerAmbiguous
+            | Self::MetadataConfigurationPropertyCarrierUnsupported
+            | Self::MetadataConfigurationPropertyValueUnsupported
+            | Self::MetadataDefaultValueUnsupported => LossTaxonomy::AttributesNotTransferred,
+            Self::MetadataMassPropertiesNotCompared => LossTaxonomy::AttributesNotTransferred,
+            Self::AssemblyComponentsExternal
+            | Self::AssemblyVirtualComponentsNotTransferred
+            | Self::AssemblyEmbeddedDocumentsNotTransferred => {
+                LossTaxonomy::AssemblyComponentsExternal
+            }
+            Self::AssemblyStructureNotTransferred
+            | Self::AssemblyMatesNotTransferred
+            | Self::AssemblySuppressedComponentsOmitted
+            | Self::AssemblyPlacementUnresolved
+            | Self::AssemblyConfigurationsNotTransferred
+            | Self::AssemblyBomExclusionNotTransferred => {
+                LossTaxonomy::AssemblyPlacementsNotTransferred
+            }
+            Self::TopologyBodyHierarchyDerived => LossTaxonomy::TopologyGaugeSubstituted,
+            Self::TopologyFaceUnclaimed
+            | Self::TopologyOwnershipWithheld
+            | Self::TopologyFaceWithheld
+            | Self::TopologyFinRecordAmbiguous
+            | Self::TopologyFinPartnerUnresolved
+            | Self::TopologyFinLinkUnresolved
+            | Self::TopologyRingEdgeWithheld
+            | Self::TopologyVertexLoopWithheld
+            | Self::TopologyAmbiguousFinFaceWithheld
+            | Self::TopologyLoopRecordAmbiguous
+            | Self::TopologyVertexRecordUnresolved => LossTaxonomy::TopologyNotTransferred,
+            Self::TopologyPcurveCarrierOffSurface => LossTaxonomy::PcurveOmitted,
+            Self::GeometryCarrierApproximated => LossTaxonomy::ProceduralReduced,
+            Self::TopologyGraphNotTransferred => LossTaxonomy::TopologyNotTransferred,
+            Self::GeometryFaceSupportSurfaceUntyped
+            | Self::GeometrySurfaceCarrierAmbiguous
+            | Self::GeometrySpunProfileIntervalIgnored
+            | Self::GeometryOffsetValidityUnresolved
+            | Self::GeometryEdgeSupportCurveUntyped
+            | Self::GeometryTolerantEdgeCurveUnread
+            | Self::GeometryPointRecordAmbiguous
+            | Self::GeometryCurveMarkerConflict
+            | Self::GeometrySplineLanesUnpaired
+            | Self::GeometrySplineWeightNonpositive
+            | Self::GeometrySplineFieldsInconsistent
+            | Self::GeometryConeHalfAngleSignUnresolved
+            | Self::GeometryConeHalfAngleIdentityRefused
+            | Self::GeometryIntersectionLayoutUnknown
+            | Self::GeometryParasolidNotTransferred
+            | Self::GeometryMeshBodyNotTransferred
+            | Self::ContainerAuxiliaryParasolidRefused
+            | Self::GeometryImportedBodiesNotTransferred
+            | Self::ContainerParasolidProbeCapped => LossTaxonomy::GeometryNotTransferred,
+            Self::GeometryPcurveAmbiguous | Self::GeometrySurfaceSolverWorkCapped => {
+                LossTaxonomy::PcurveOmitted
+            }
+            Self::AppearanceFaceColorUnresolved
+            | Self::AppearanceAssignmentUnresolved
+            | Self::NativeAppearanceScopeUnresolved => LossTaxonomy::MaterialNotTransferred,
+            Self::TessellationFaceOwnershipUnresolved
+            | Self::TessellationOwnerWorkCapped
+            | Self::TessellationReusedTagAmbiguous
+            | Self::TessellationDisplayWithoutGeometry => LossTaxonomy::ReferenceGraphNotClosed,
+            Self::MaterialMetadataNotTransferred => LossTaxonomy::MaterialNotTransferred,
+            Self::PmiSwiftImplicitNominalUnresolved
+            | Self::PmiSwiftPositionTargetUnresolved
+            | Self::PmiSwiftSphericalDiameterTargetCountTextEqualRadiusAssumed
+            | Self::PmiSwiftSphericalDiameterTargetUnresolved
+            | Self::PmiSwiftPresentationUnresolved
+            | Self::PmiSwiftInternalFlatnessSymbolAssumed
+            | Self::PmiSwiftPresentationUnframed
+            | Self::PmiSwiftFaceDocumentLayoutAssumed
+            | Self::PmiSwiftFaceDocumentTailAssumed => LossTaxonomy::DecodeDiagnostic,
+            Self::ConfigActiveIdentityUnresolved
+            | Self::ConfigActivePartitionMismatch
+            | Self::ConfigInferredWithoutNative
+            | Self::ConfigLaneIdentityUnresolved
+            | Self::ConfigAmbiguousPartition
+            | Self::ConfigAmbiguousNaming
+            | Self::ConfigIncoherentBodyRefs
+            | Self::ConfigIncompleteSnapshot
+            | Self::ConfigProjectionWorkCapped
+            | Self::ParameterUnevaluated
+            | Self::ParameterAmbiguousIdentity
+            | Self::PmiDimensionUnbound
+            | Self::PmiSemanticRecordMalformed
+            | Self::PmiSemanticParseCapped
+            | Self::PmiSwiftAnnotationUnsupported
+            | Self::PmiSwiftFeatureWalkCapped
+            | Self::HistoryIncompleteReferences
+            | Self::FeatureIncoherentEdges
+            | Self::FeatureIncoherentContent
+            | Self::FeatureUnresolvedOutputScope
+            | Self::FeatureIncoherentOutputs
+            | Self::SketchNativeConstraint
+            | Self::SketchNativeGeometry
+            | Self::SketchProfileRejected
+            | Self::SketchRelationUnprojected
+            | Self::SketchRelationMultiplyProjected
+            | Self::FeatureNativeKindRetained
+            | Self::FeatureInputSolidBodyRetained
+            | Self::FeatureInputObjectUnbound
+            | Self::FeatureInputArchiveWalkStopped
+            | Self::FeatureTypedOperandIncomplete
+            | Self::FeatureProfileCurvesUnavailable
+            | Self::FeatureExtrudeDirectionUnresolved
+            | Self::FeatureThinOperationAmbiguous
+            | Self::FeatureEdgeTerminalUnresolved
+            | Self::FeatureBodyPathAmbiguous
+            | Self::FeatureBodyRetentionUnresolved => LossTaxonomy::FeatureHistoryRetained,
+        }
+    }
+
+    /// Namespaced [`LossKind`] for this local code, classified by taxonomy.
+    #[must_use]
+    pub(crate) fn kind(self) -> LossKind {
+        LossKind::namespaced(
+            const {
+                match cadmpeg_ir::report::loss::LossNamespace::new("sldprt") {
+                    Ok(namespace) => namespace,
+                    Err(_) => panic!("reserved codec namespace"),
+                }
+            },
+            self.code(),
+            self.shared_taxonomy(),
+        )
+    }
+
+    /// Build a [`LossNote`] for this code with the given per-instance message.
+    ///
+    /// The structured code is `sldprt/<local>`. Severity comes from the local
+    /// code; the strict floor comes from the taxonomy.
+    #[must_use]
+    pub(crate) fn note(self, message: impl Into<String>) -> LossNote {
+        LossNote::new(self.kind(), message).with_severity(self.severity())
+    }
+}
+
+/// Instances an aggregated loss note names before it only counts the rest.
+pub(crate) const NAMED_INSTANCES_PER_NOTE: usize = 8;
+
+/// A count of affected instances that keeps the first
+/// [`NAMED_INSTANCES_PER_NOTE`] names for one aggregated loss note.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct NamedCount {
+    count: usize,
+    named: Vec<String>,
+}
+
+impl NamedCount {
+    pub(crate) fn push(&mut self, name: &str) {
+        self.count += 1;
+        if self.named.len() < NAMED_INSTANCES_PER_NOTE {
+            self.named.push(name.to_owned());
+        }
+    }
+
+    pub(crate) fn append(&mut self, other: &mut Self) {
+        self.count += other.count;
+        let room = NAMED_INSTANCES_PER_NOTE - self.named.len().min(NAMED_INSTANCES_PER_NOTE);
+        self.named.extend(other.named.drain(..).take(room));
+        other.count = 0;
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+impl std::fmt::Display for NamedCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.named.join(", "))?;
+        if self.count > self.named.len() {
+            f.write_str(", ...")?;
+        }
+        Ok(())
+    }
+}
+
+/// One refused spline lane, named by the record that stated it.
+///
+/// `record` names the instance: the attribute id, coedge id, edge id or face
+/// attribute of the record whose lanes do not pair, followed by the pairing's
+/// own refusal. The B-rep model carries the absence of one carrier, so the
+/// refusal is a loss and the decode continues.
+pub(crate) fn spline_lane_refusal(record: impl std::fmt::Display) -> LossNote {
+    let message = format!(
+        "{record}; the carrier is not emitted and the entities that reference it fall back \
+     to an untyped support."
+    );
+    SldprtLossCode::GeometrySplineLanesUnpaired.note(message)
+}
+
+/// One refused spline carrier, named by `record`, with the loss code and
+/// message of its refusal.
+pub(crate) fn spline_refusal(
+    record: impl std::fmt::Display,
+    refusal: &cadmpeg_parasolid::geometry::nurbs::Refusal,
+) -> LossNote {
+    use cadmpeg_parasolid::geometry::nurbs::Refusal;
+    let (code, cause) = match refusal {
+        Refusal::Lanes(error) => return spline_lane_refusal(format_args!("{record}: {error}")),
+        Refusal::NonpositiveWeight => (
+            SldprtLossCode::GeometrySplineWeightNonpositive,
+            "stores a control-point weight that is zero or negative",
+        ),
+        Refusal::Fields => (
+            SldprtLossCode::GeometrySplineFieldsInconsistent,
+            "stores a dimension, count, or multiplicity that contradicts its fields or arrays",
+        ),
+    };
+    code.note(format!(
+        "{record} {cause}; the carrier is not emitted and the entities that reference it fall \
+         back to an untyped support."
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use cadmpeg_ir::report::loss::{LossTaxonomy, StrictConsequence};
+    use cadmpeg_ir::report::Severity;
+
+    use super::SldprtLossCode;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn named_count_names_the_first_instances_and_counts_the_rest() {
+        let mut first = super::NamedCount::default();
+        for index in 0..super::NAMED_INSTANCES_PER_NOTE - 1 {
+            first.push(&format!("a{index}"));
+        }
+        let mut second = super::NamedCount::default();
+        second.push("b0");
+        second.push("b1");
+        first.append(&mut second);
+        assert_eq!(first.count(), super::NAMED_INSTANCES_PER_NOTE + 1);
+        assert!(second.is_empty());
+        assert_eq!(first.to_string(), "a0, a1, a2, a3, a4, a5, a6, b0, ...");
+    }
+
+    #[test]
+    fn spline_lane_loss_names_the_record() {
+        let note = super::spline_lane_refusal("carrier attribute 9");
+        assert_eq!(
+            note.message,
+            "carrier attribute 9; the carrier is not emitted and the entities that reference it fall back to an untyped support."
+        );
+    }
+
+    #[test]
+    fn all_covers_every_declared_variant() {
+        let source = include_str!("loss.rs");
+        let declaration = source
+            .split_once("pub(crate) enum SldprtLossCode {")
+            .unwrap()
+            .1;
+        let body = declaration.split_once("\n}").unwrap().0;
+        let variant_count = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && line.ends_with(','))
+            .count();
+        assert_eq!(SldprtLossCode::ALL.len(), variant_count);
+    }
+
+    /// Value-level golden: the stable string form of every code, pinned.
+    #[test]
+    fn code_strings_are_pinned() {
+        let codes: Vec<&str> = SldprtLossCode::ALL.iter().map(|c| c.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "metadata.part-root-unsupported",
+                "metadata.configuration-manager-opaque",
+                "metadata.default-carrier-unsupported",
+                "metadata.default-owner-ambiguous",
+                "metadata.default-alias-ambiguous",
+                "metadata.default-value-unsupported",
+                "metadata.mass-properties-not-compared",
+                "metadata.configuration-property-owner-ambiguous",
+                "metadata.configuration-property-carrier-unsupported",
+                "metadata.configuration-property-value-unsupported",
+                "config.active-identity-unresolved",
+                "config.active-partition-mismatch",
+                "config.inferred-without-native",
+                "config.lane-identity-unresolved",
+                "config.ambiguous-partition",
+                "config.ambiguous-naming",
+                "config.incoherent-body-refs",
+                "config.incomplete-snapshot",
+                "config.projection-work-capped",
+                "parameter.unevaluated",
+                "parameter.ambiguous-identity",
+                "pmi.dimension-unbound",
+                "pmi.semantic-record-malformed",
+                "pmi.semantic-parse-capped",
+                "pmi.swift-annotation-unsupported",
+                "pmi.swift-feature-walk-capped",
+                "pmi.swift-implicit-nominal-unresolved",
+                "pmi.swift-position-target-unresolved",
+                "pmi.swift-spherical-diameter-count-text-equal-radius-assumed",
+                "pmi.swift-spherical-diameter-target-unresolved",
+                "pmi.swift-presentation-unresolved",
+                "pmi.swift-internal-flatness-symbol-assumed",
+                "pmi.swift-presentation-unframed",
+                "pmi.swift-face-document-layout-assumed",
+                "pmi.swift-face-document-tail-assumed",
+                "history.incomplete-references",
+                "feature.incoherent-edges",
+                "feature.incoherent-content",
+                "feature.unresolved-output-scope",
+                "feature.incoherent-outputs",
+                "sketch.native-constraint",
+                "sketch.native-geometry",
+                "sketch.profile-rejected",
+                "sketch.relation-unprojected",
+                "sketch.relation-multiply-projected",
+                "feature.native-kind-retained",
+                "feature.input-object-unbound",
+                "feature.input-solid-body-retained",
+                "feature.input-archive-walk-stopped",
+                "feature.typed-operand-incomplete",
+                "feature.profile-curves-unavailable",
+                "feature.extrude-direction-unresolved",
+                "feature.thin-operation-ambiguous",
+                "feature.edge-terminal-unresolved",
+                "feature.body-path-ambiguous",
+                "feature.body-retention-unresolved",
+                "geometry.face-support-surface-untyped",
+                "geometry.surface-carrier-ambiguous",
+                "geometry.offset-validity-unresolved",
+                "geometry.spun-profile-interval-ignored",
+                "geometry.edge-support-curve-untyped",
+                "geometry.tolerant-edge-curve-unread",
+                "geometry.point-record-ambiguous",
+                "geometry.curve-marker-conflict",
+                "geometry.pcurve-ambiguous",
+                "geometry.surface-solver-work-capped",
+                "geometry.spline-lanes-unpaired",
+                "geometry.spline-weight-nonpositive",
+                "geometry.spline-fields-inconsistent",
+                "geometry.cone-half-angle-sign-unresolved",
+                "geometry.cone-half-angle-identity-refused",
+                "geometry.intersection-layout-unknown",
+                "geometry.carrier-approximated",
+                "appearance.face-color-unresolved",
+                "appearance.assignment-unresolved",
+                "appearance.native-scope-unresolved",
+                "tessellation.face-ownership-unresolved",
+                "tessellation.owner-work-capped",
+                "tessellation.reused-tag-ambiguous",
+                "tessellation.display-without-geometry",
+                "topology.body-hierarchy-derived",
+                "topology.face-unclaimed",
+                "topology.face-withheld",
+                "topology.ownership-withheld",
+                "topology.fin-record-ambiguous",
+                "topology.fin-partner-unresolved",
+                "topology.fin-link-unresolved",
+                "topology.ring-edge-withheld",
+                "topology.vertex-loop-withheld",
+                "topology.ambiguous-fin-face-withheld",
+                "topology.loop-record-ambiguous",
+                "topology.vertex-record-unresolved",
+                "topology.pcurve-carrier-off-surface",
+                "geometry.parasolid-not-transferred",
+                "geometry.mesh-body-not-transferred",
+                "geometry.imported-bodies-not-transferred",
+                "topology.graph-not-transferred",
+                "material.metadata-not-transferred",
+                "container.no-parasolid-stream",
+                "container.parasolid-probe-capped",
+                "container.auxiliary-parasolid-refused",
+                "source.preserved-image-unavailable",
+                "source.dialect-unverified",
+                "source.kernel-dialect-unverified",
+                "source.dialect-layer-collision",
+                "writer.shell-wire-topology-omitted",
+                "writer.coedge-pcurve-uses-omitted",
+                "writer.sphere-seam-curves-omitted",
+                "writer.appearance-bindings-omitted",
+                "writer.attributes-omitted",
+                "writer.unbound-appearances-omitted",
+                "writer.tessellation-metadata-omitted",
+                "writer.native-envelope-auxiliary-omitted",
+                "target.source-dialect-displaced",
+                "source.property-key-blank",
+                "assembly.structure-not-transferred",
+                "assembly.mates-not-transferred",
+                "assembly.components-external",
+                "assembly.virtual-components-not-transferred",
+                "assembly.suppressed-components-omitted",
+                "assembly.placement-unresolved",
+                "assembly.configurations-not-transferred",
+                "assembly.embedded-documents-not-transferred",
+                "assembly.bom-exclusion-not-transferred",
+            ]
+        );
+    }
+
+    /// Codes are unique and use the stable `family.detail` kebab shape.
+    #[test]
+    fn codes_are_unique_and_well_formed() {
+        let mut seen = BTreeSet::new();
+        for code in SldprtLossCode::ALL {
+            let text = code.code();
+            assert!(seen.insert(text), "duplicate code {text}");
+            let (family, detail) = text.split_once('.').expect("family.detail shape");
+            assert!(!family.is_empty() && !detail.is_empty());
+            assert!(
+                text.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'.' || b == b'-'),
+                "code {text} is not lowercase kebab"
+            );
+        }
+    }
+
+    /// The note builder fixes severity from the codec-specific code.
+    #[test]
+    fn note_takes_severity_from_the_code() {
+        for code in SldprtLossCode::ALL {
+            let note = code.note("x");
+            assert_eq!(note.severity, code.severity());
+            assert_eq!(note.message, "x");
+            assert!(note.provenance.is_none());
+        }
+    }
+
+    #[test]
+    fn implicit_swift_nominal_is_a_tolerable_decode_diagnostic() {
+        let note = SldprtLossCode::PmiSwiftImplicitNominalUnresolved.note("unresolved");
+        assert_eq!(note.severity, Severity::Warning);
+        assert_eq!(note.code.taxonomy(), LossTaxonomy::DecodeDiagnostic);
+        assert_eq!(note.strict_consequence(), StrictConsequence::Tolerate);
+    }
+
+    #[test]
+    fn unresolved_position_target_is_a_tolerable_decode_diagnostic() {
+        let note = SldprtLossCode::PmiSwiftPositionTargetUnresolved.note("unresolved");
+        assert_eq!(note.severity, Severity::Warning);
+        assert_eq!(note.code.taxonomy(), LossTaxonomy::DecodeDiagnostic);
+        assert_eq!(note.strict_consequence(), StrictConsequence::Tolerate);
+    }
+
+    #[test]
+    fn ambiguous_pcurve_is_a_tolerable_pcurve_omission() {
+        let note = SldprtLossCode::GeometryPcurveAmbiguous.note("ambiguous");
+        assert_eq!(note.code.namespace(), "sldprt");
+        assert_eq!(note.code.local_code(), "geometry.pcurve-ambiguous");
+        assert_eq!(note.code.taxonomy(), LossTaxonomy::PcurveOmitted);
+        assert_eq!(note.strict_consequence(), StrictConsequence::Tolerate);
+    }
+}

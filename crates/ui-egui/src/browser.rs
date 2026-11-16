@@ -377,11 +377,32 @@ pub struct OccMove {
     pub pivot: Option<solidcore_record::Vec3>,
     /// The values when the current triad drag began.
     drag0: Option<([f64; 3], [f64; 3])>,
+    pub handles_only: bool,
+    pub handle_frame: Option<solidcraft_engine::doc::Mat>,
+    pub handle_reference: String,
+    pub target_frame: String,
+    pub cancel_baseline: Option<solidcraft_engine::doc::Mat>,
+    drag_frame: Option<solidcraft_engine::doc::Mat>,
 }
 
 impl OccMove {
     pub fn new(occurrence: u64) -> Self {
-        OccMove { occurrence, path: Vec::new(), baseline: None, had_pending: false, translate: [0.0; 3], angles: [0.0; 3], pivot: None, drag0: None }
+        OccMove {
+            occurrence,
+            path: Vec::new(),
+            baseline: None,
+            had_pending: false,
+            translate: [0.0; 3],
+            angles: [0.0; 3],
+            pivot: None,
+            drag0: None,
+            handles_only: false,
+            handle_frame: None,
+            handle_reference: "world".into(),
+            target_frame: "world".into(),
+            cancel_baseline: None,
+            drag_frame: None,
+        }
     }
 }
 
@@ -3898,64 +3919,142 @@ fn apply_drop(app: &mut SolveApp, d: DropAction) {
 
 pub(crate) fn revert_occurrence_dialog(app: &mut SolveApp, m: &OccMove) {
     if m.had_pending {
-        let _ = app.run("occurrence.move", json!({"occurrence":m.occurrence,"base_transform":m.baseline,"capture":false}));
+        let mut params = json!({"occurrence":m.occurrence,"base_transform":m.cancel_baseline.or(m.baseline),"capture":false});
+        if !m.path.is_empty() {
+            params["path"] = json!(m.path);
+        }
+        let _ = app.run("occurrence.move", params);
     } else {
         let _ = app.run("component.revert_position", json!({"occurrences":[m.occurrence]}));
     }
 }
 
-/// The pending move: turned about X, then Y, then Z through the starting origin, then moved.
-pub fn apply_occurrence_move(app: &mut SolveApp, m: &OccMove) {
-    use crate::gizmo;
+/// Full world frame of the handles after the current numeric move.
+pub fn occurrence_handle_frame(m: &OccMove) -> solidcraft_engine::doc::Mat {
     use solidcore_record::Vec3;
+    use solidcraft_engine::doc::{mat_mul, rigid};
+    let frame = m.handle_frame.unwrap_or_else(|| crate::move_handles::at(m.pivot.unwrap_or(Vec3::ZERO)));
+    if m.handles_only {
+        return frame;
+    }
+    let axes = crate::move_handles::axes(&frame);
     let a = m.angles.map(f64::to_radians);
-    let r = gizmo::mul(&gizmo::mul(&gizmo::rotation(Vec3::Z, a[2]), &gizmo::rotation(Vec3::Y, a[1])), &gizmo::rotation(Vec3::X, a[0]));
-    let (axis, angle) = gizmo::axis_angle(&r);
-    let o = m.pivot.unwrap_or(Vec3::ZERO);
-    let baseline = m.baseline.or_else(|| app.session.doc.occurrences.iter().find(|o| o.id == m.occurrence).map(|o| o.transform));
-    let _ = app.run(
-        "occurrence.move",
-        if m.path.is_empty() {
-            json!({ "occurrence": m.occurrence, "base_transform": baseline, "translate": m.translate, "axis": [axis.x, axis.y, axis.z], "angle": angle, "origin": [o.x, o.y, o.z], "capture": false })
-        } else {
-            json!({ "occurrence": m.occurrence, "path": m.path, "space": "world", "base_transform": baseline, "translate": m.translate, "axis": [axis.x, axis.y, axis.z], "angle": angle, "origin": [o.x, o.y, o.z], "capture": false })
-        },
+    let r = crate::gizmo::mul(
+        &crate::gizmo::mul(&crate::gizmo::rotation(axes[2], a[2]), &crate::gizmo::rotation(axes[1], a[1])),
+        &crate::gizmo::rotation(axes[0], a[0]),
     );
+    let (axis, angle) = crate::gizmo::axis_angle(&r);
+    let t = crate::move_handles::vector(&frame, Vec3::new(m.translate[0], m.translate[1], m.translate[2]));
+    mat_mul(&rigid(t, crate::move_handles::origin(&frame), axis, angle), &frame)
 }
 
-/// The shared move triad at the occurrence's origin: arrows and squares move it, rings turn it.
+/// Keep the effective placement while starting a fresh manipulation at the shown frame.
+pub fn rebase_occurrence_move(app: &SolveApp, m: &mut OccMove) {
+    let frame = occurrence_handle_frame(m);
+    m.baseline = app
+        .session
+        .pending_moves
+        .get(&m.occurrence)
+        .copied()
+        .or_else(|| app.session.doc.occurrences.iter().find(|o| o.id == m.occurrence).map(|o| o.transform));
+    m.handle_frame = Some(frame);
+    m.pivot = Some(crate::move_handles::origin(&frame));
+    m.translate = [0.; 3];
+    m.angles = [0.; 3];
+    m.drag0 = None;
+    m.drag_frame = None;
+}
+
+/// Move the selected occurrence about the user-positioned handle frame.
+pub fn apply_occurrence_move(app: &mut SolveApp, m: &OccMove) {
+    if m.handles_only {
+        return;
+    }
+    let base = m.handle_frame.unwrap_or_else(|| crate::move_handles::at(m.pivot.unwrap_or(solidcore_record::Vec3::ZERO)));
+    let shown = occurrence_handle_frame(m);
+    let Ok(delta) = solidcraft_engine::origins::frame_delta(&base, &shown) else {
+        return;
+    };
+    let matrix: [[f64; 4]; 4] = std::array::from_fn(|r| std::array::from_fn(|c| delta[c][r]));
+    let mut p = json!({"occurrence":m.occurrence,"space":"world","base_transform":m.baseline,"matrix":matrix,"capture":false});
+    if !m.path.is_empty() {
+        p["path"] = json!(m.path);
+    }
+    let _ = app.run("occurrence.move", p);
+}
+
+/// The move triad uses the editable frame, not the fixed world axes.
 pub(crate) fn occurrence_triad_model(app: &SolveApp) -> Option<crate::gizmo::Triad> {
-    let movement = app.tree.occurrence_move.as_ref()?;
-    let center = movement.pivot? + solidcore_record::Vec3::new(movement.translate[0], movement.translate[1], movement.translate[2]);
-    Some(crate::gizmo::Triad { center, translate: true, rotate: true })
+    let m = app.tree.occurrence_move.as_ref()?;
+    let frame = m.handle_frame.unwrap_or_else(|| crate::move_handles::at(m.pivot.unwrap_or(solidcore_record::Vec3::ZERO)));
+    let shown = occurrence_handle_frame(m);
+    Some(crate::gizmo::Triad { center: crate::move_handles::origin(&shown), axes: crate::move_handles::axes(&frame), translate: true, rotate: true })
 }
 
 /// Occurrence handles belong to the viewport, not the clipped Move panel's child UI.
 pub(crate) fn occurrence_triad(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &crate::viewport::Proj) {
     use crate::gizmo::{self, Change};
-    let Some(mut m) = app.tree.occurrence_move.clone() else { return };
-    let before = (m.translate, m.angles);
-    let Some(t) = occurrence_triad_model(app) else { return };
+    let Some(mut m) = app.tree.occurrence_move.clone() else {
+        return;
+    };
+    let Some(t) = occurrence_triad_model(app) else {
+        return;
+    };
     let step = crate::canvas::snap_step(app.cam.half_height());
-    let Some(g) = gizmo::show(ui, painter, proj, egui::Id::unique("sc_occ_triad"), &t, step) else { return };
-    if g.started || m.drag0.is_none() {
-        m.drag0 = Some((m.translate, m.angles));
+    let triad_id = egui::Id::unique("sc_occ_triad");
+    let Some(g) = gizmo::show(ui, painter, proj, triad_id, &t, step) else {
+        if let Some(handle) = gizmo::take_click(ui, triad_id) {
+            crate::move_handle_snap::handle_click(ui.ctx(), handle);
+            crate::occurrence_move_value::select(app, ui.ctx(), &m, handle, true);
+        }
+        crate::occurrence_move_value::show(app, ui, proj, &mut m);
+        app.tree.occurrence_move = Some(m);
+        return;
+    };
+    if g.started && g.handle == gizmo::Handle::Ball && crate::move_handle_snap::begin_drag(ui.ctx()) {
+        return;
     }
-    let (t0, a0) = m.drag0.unwrap_or((m.translate, m.angles));
-    match g.change {
-        Change::Translate(v) => m.translate = [t0[0] + v.x, t0[1] + v.y, t0[2] + v.z],
-        Change::Rotate { axis, angle } => {
-            if let Some(slot) = m.angles.get_mut(axis) {
-                *slot = a0.get(axis).copied().unwrap_or(0.0) + angle.to_degrees();
+    let frame = m.handle_frame.unwrap_or_else(|| crate::move_handles::at(t.center));
+    if g.started || m.drag0.is_none() {
+        crate::occurrence_move_value::select(app, ui.ctx(), &m, g.handle, false);
+        m.drag0 = Some((m.translate, m.angles));
+        m.drag_frame = Some(frame);
+    }
+    let start = m.drag_frame.unwrap_or(frame);
+    if m.handles_only {
+        let next = match g.change {
+            Change::Translate(v) => {
+                let mut next = start;
+                next[3][0] += v.x;
+                next[3][1] += v.y;
+                next[3][2] += v.z;
+                next
+            }
+            Change::Rotate { axis, angle } => crate::move_handles::turn(&start, axis, angle),
+        };
+        m.handle_frame = Some(next);
+        m.pivot = Some(crate::move_handles::origin(&next));
+    } else {
+        let (t0, a0) = m.drag0.unwrap_or((m.translate, m.angles));
+        match g.change {
+            Change::Translate(v) => {
+                let v = crate::move_handles::local(&start, v);
+                m.translate = [t0[0] + v.x, t0[1] + v.y, t0[2] + v.z];
+            }
+            Change::Rotate { axis, angle } => {
+                if let Some(slot) = m.angles.get_mut(axis) {
+                    *slot = a0.get(axis).copied().unwrap_or(0.) + angle.to_degrees();
+                }
             }
         }
+        apply_occurrence_move(app, &m);
     }
     if g.done {
         m.drag0 = None;
+        m.drag_frame = None;
     }
-    if (m.translate, m.angles) != before {
-        apply_occurrence_move(app, &m);
-    }
+    crate::occurrence_move_value::dragged(app, ui.ctx(), &m, g.change);
+    crate::occurrence_move_value::show(app, ui, proj, &mut m);
     app.tree.occurrence_move = Some(m);
 }
 

@@ -1,0 +1,23 @@
+{
+  "en": {
+    "cmd.mesh.copy_point_cloud": "Copy to Point Cloud",
+    "help.mesh.copy_point_cloud": "Copy the selected mesh into a separate point cloud that has its own visibility control in the Browser.",
+    "cmd.mesh.copy_facet_cloud": "Copy Lasso Patch",
+    "help.mesh.copy_facet_cloud": "Draw a loop on the scan, add or subtract patches, then copy the selected vertices into a new point cloud.",
+    "cmd.pointcloud.copy_snippet": "Copy Cloud Snippet",
+    "help.pointcloud.copy_snippet": "Choose a visible point cloud and draw one or more loops to copy those points into an independent cloud.",
+    "cmd.mesh.auto_sections": "Auto Sections",
+    "help.mesh.auto_sections": "Create editable section sketches through the source mesh at evenly spaced or explicit station offsets. Hide the scan after applying to trace the profiles.",
+    "scan_ui.clouds": "Clouds",
+    "scan_ui.copy_to_point_cloud": "Copy to Point Cloud",
+    "scan_ui.copy_lasso_patch": "Copy Lasso Patch",
+    "scan_ui.copy_cloud_snippet": "Copy Cloud Snippet",
+    "scan_ui.auto_sections": "Auto Sections",
+    "scan_ui.source_cloud": "Source cloud",
+    "scan_ui.section_axis": "Section axis",
+    "scan_ui.sections": "Sections",
+    "scan_ui.station_offsets": "Station offsets",
+    "scan_ui.profile_tolerance": "Profile tolerance",
+    "scan_ui.hide_source_scan_for_tracing": "Hide source scan for tracing"
+  }
+}

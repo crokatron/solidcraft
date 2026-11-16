@@ -102,13 +102,13 @@ gltf = { version = "1.4", default-features = false, features = ["names"] }
 # tree through x11rb).
 gethostname = "1"
 
-# FreeCAD and Rhino import (Apache-2.0, pure Rust; native and browser builds).
-# Pinned: its IR and codec APIs change between minor versions. Open formats only: no default
-# features, so cadmpeg's codecs for commercial formats (f3d, sldprt, inventor, catia, creo, nx)
-# and its ShapeManager/ACIS `sat` codec are not compiled in. `step` is the writer we restate through.
-cadmpeg-core = "=0.6.7"
-cadmpeg-ir = "=0.6.7"
-cadmpeg-registry = { version = "=0.6.7", default-features = false, features = ["fcstd", "rhino", "step"] }
+# Independent CAD import (Apache-2.0, pure Rust; native and browser builds).
+# Pinned: its IR and codec APIs change between minor versions. Enable only the readers we use;
+# `step` is the writer we restate through. NX decoding does not use an NX installation.
+cadmpeg-core = "=0.6.12"
+cadmpeg-ir = "=0.6.12"
+cadmpeg-registry = { version = "=0.6.12", default-features = false, features = ["fcstd", "nx", "rhino", "step"] }
+cadmpeg-codec-sldprt = "=0.6.12"
 
 # fonts (sketch text outlines; MIT OR Apache-2.0, pure Rust)
 ttf-parser = { version = "0.25", default-features = false, features = ["std", "variable-fonts"] }
@@ -183,6 +183,9 @@ debug = "line-tables-only"
 
 # Vendored crates with SolidCraft fixes (see vendor/README.md and ATTRIBUTION.md).
 [patch.crates-io]
+cadmpeg-codec-nx = { path = "vendor/cadmpeg-codec-nx" }
+cadmpeg-codec-sldprt = { path = "vendor/cadmpeg-codec-sldprt" }
+cadmpeg-parasolid = { path = "vendor/cadmpeg-parasolid" }
 # Keep OpenGL pipelines, resolve textures and CAD callbacks at the same safe sample count.
 egui-wgpu = { path = "vendor/egui-wgpu" }
 

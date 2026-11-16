@@ -541,3 +541,54 @@ fn a_changed_display_quality_warms_the_result_without_replaying_commands() {
     assert!(h.app.dialog.is_none());
     h.step(&json!({"expect":{"bodies":1,"volume":13000}})).unwrap();
 }
+
+#[test]
+fn shared_apply_commits_keeps_open_and_cancel_keeps_the_commit() {
+    let mut h = square_on_a_block();
+    let before = h.app.session.doc.features.len();
+    h.step(&json!({"click":{"handle":"dialog:Apply"}})).unwrap();
+    until_applied(&mut h);
+    assert_eq!(h.app.session.doc.features.len(), before + 1);
+    assert!(h.app.dialog.is_some(), "Apply keeps the feature dialog open");
+    assert_eq!(h.app.dialog.as_ref().unwrap().facet_lasso.options(), (true, 0), "non-lasso Apply preserves select-through default");
+    assert!(h.app.dialog.as_ref().unwrap().inputs.iter().all(|i| i.items.is_empty()), "repeat must repick topology");
+    let committed = h.app.session.doc.features.len();
+    h.step(&json!({"click":{"handle":"dialog:Cancel"}})).unwrap();
+    h.frames(2);
+    assert!(h.app.dialog.is_none());
+    assert_eq!(h.app.session.doc.features.len(), committed);
+    assert_eq!(h.app.preferences.command_dialog_values["solid.extrude"]["confirmation"], "cancel");
+}
+
+#[test]
+fn editing_apply_reopens_same_feature_and_cancel_keeps_committed_change() {
+    let mut h = square_on_a_block();
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    until_applied(&mut h);
+    let id = h.app.session.doc.features.last().unwrap().id;
+    let count = h.app.session.doc.features.len();
+    h.app.edit_feature(id);
+    h.frames(3);
+    h.step(&json!({"click":{"handle":"dialog:Apply"}})).unwrap();
+    until_applied(&mut h);
+    h.frames(3);
+    assert_eq!(h.app.session.doc.features.len(), count);
+    assert_eq!(h.app.dialog.as_ref().unwrap().editing.unwrap().0, id);
+    h.step(&json!({"click":{"handle":"dialog:Cancel"}})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.session.doc.features.len(), count);
+    assert!(h.app.session.doc.feature(id).is_some());
+}
+
+#[test]
+fn apply_preserves_lasso_selection_options_while_resetting_pending_mask() {
+    for mode in [1, 2] {
+        let mut h = square_on_a_block();
+        h.app.dialog.as_mut().unwrap().facet_lasso.restore_options(false, mode);
+        h.step(&json!({"click":{"handle":"dialog:Apply"}})).unwrap();
+        until_applied(&mut h);
+        let state = &h.app.dialog.as_ref().unwrap().facet_lasso;
+        assert_eq!(state.options(), (false, mode));
+        assert!(state.selection().is_none());
+    }
+}

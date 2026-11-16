@@ -239,3 +239,10 @@ fn the_check_names_what_is_wrong_with_a_key() {
     assert_eq!(issues("sketch.move3d", json!({"wire": "w", "by": 1})), ["`by` must be [x,y,z]"]);
     assert_eq!(issues("sketch.line3d", json!({"points": [[0, 0, 0], [1, 1, 1]], "sketch": true})), ["`sketch` must be an id or a name"]);
 }
+
+#[test]
+fn spatial_dimension_contracts_cover_every_parameter() {
+    assert_keys(input_schema_for::<super::Dimension3dParams>(), &["a", "b", "kind", "sketch", "value"]);
+    assert_keys(input_schema_for::<super::EditDimension3dParams>(), &["id", "sketch", "value"]);
+    assert_keys(input_schema_for::<super::Freedom3dParams>(), &["sketch"]);
+}

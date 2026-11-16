@@ -26,6 +26,9 @@ impl TriMesh {
     pub(crate) fn to_mesh(&self) -> Mesh {
         let mut out = Mesh::default();
         out.positions.reserve(self.triangles.len() * 3);
+        out.normals.reserve(self.triangles.len() * 3);
+        out.triangles.reserve(self.triangles.len());
+        out.tri_face.reserve(self.triangles.len());
         for (index, t) in self.triangles.iter().enumerate() {
             let (Some(a), Some(b), Some(c)) =
                 (self.positions.get(t[0] as usize), self.positions.get(t[1] as usize), self.positions.get(t[2] as usize))
@@ -35,13 +38,15 @@ impl TriMesh {
             let n = (*b - *a).cross(*c - *a).normalized().unwrap_or(Vec3::Z);
             let base = u32::try_from(out.positions.len()).unwrap_or(u32::MAX);
             out.positions.extend([*a, *b, *c]);
-            out.normals.extend(self.corner_normals.get(index).copied().unwrap_or([n; 3]).map(|v| {
-                let v = v.normalized().unwrap_or(n);
-                match v.dot(n).partial_cmp(&0.0) {
-                    Some(std::cmp::Ordering::Greater) => v,
-                    Some(std::cmp::Ordering::Less) => -v,
-                    _ => n,
-                }
+            out.normals.extend(self.corner_normals.get(index).map_or([n; 3], |normals| {
+                normals.map(|v| {
+                    let v = v.normalized().unwrap_or(n);
+                    match v.dot(n).partial_cmp(&0.0) {
+                        Some(std::cmp::Ordering::Greater) => v,
+                        Some(std::cmp::Ordering::Less) => -v,
+                        _ => n,
+                    }
+                })
             }));
             out.triangles.push([base, base.saturating_add(1), base.saturating_add(2)]);
             out.tri_face.push(0);
@@ -90,7 +95,7 @@ pub fn mesh_body_with_normals(positions: &[Vec3], triangles: &[[u32; 3]], normal
         return Err(KernelError::Invalid("mesh with non-finite or huge coordinates".into()));
     }
     // Merge vertices that are exactly equal (bit pattern of the coordinates).
-    let mut map: HashMap<[u64; 3], u32> = HashMap::new();
+    let mut map: HashMap<[u64; 3], u32> = HashMap::with_capacity(positions.len());
     let mut remap: Vec<u32> = Vec::with_capacity(positions.len());
     let mut out = TriMesh::default();
     for p in positions {
@@ -117,8 +122,13 @@ pub fn mesh_body_with_normals(positions: &[Vec3], triangles: &[[u32; 3]], normal
     if out.triangles.is_empty() {
         return Err(KernelError::Invalid("mesh has no triangles".into()));
     }
-    unify_winding(&mut out);
-    if out.volume6() < 0.0 && is_closed(&out) {
+    let closed = if out.triangles.len() >= 65_536 {
+        Some(unify_dense_winding(&mut out))
+    } else {
+        unify_winding(&mut out);
+        None
+    };
+    if closed != Some(false) && out.volume6() < 0.0 && closed.unwrap_or_else(|| is_closed(&out)) {
         for (i, t) in out.triangles.iter_mut().enumerate() {
             t.swap(1, 2);
             if let Some(n) = out.corner_normals.get_mut(i) {
@@ -127,6 +137,86 @@ pub fn mesh_body_with_normals(positions: &[Vec3], triangles: &[[u32; 3]], normal
         }
     }
     Ok(Body::of_mesh(out))
+}
+
+/// One packed record per side. Sorting groups incident faces without allocating a
+/// vector per edge. The slot includes the original direction for winding repair.
+fn unify_dense_winding(mesh: &mut TriMesh) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    use rayon::prelude::*;
+    let records = |(i, t): (usize, &[u32; 3])| {
+        std::array::from_fn::<_, 3, _>(|k| {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            ((u64::from(a.min(b)) << 32) | u64::from(a.max(b)), ((3 * i + k) as u32) << 1 | u32::from(a > b))
+        })
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut sides: Vec<_> = mesh.triangles.par_iter().enumerate().flat_map_iter(records).collect();
+    #[cfg(target_arch = "wasm32")]
+    let mut sides: Vec<_> = mesh.triangles.iter().enumerate().flat_map(records).collect();
+    #[cfg(not(target_arch = "wasm32"))]
+    sides.par_sort_unstable();
+    #[cfg(target_arch = "wasm32")]
+    sides.sort_unstable();
+    let mut manifold = true;
+    let mut consistent = true;
+    for group in sides.chunk_by(|a, b| a.0 == b.0) {
+        if let [a, b] = group {
+            consistent &= (a.1 ^ b.1) & 1 != 0;
+        } else {
+            manifold = false;
+        }
+    }
+    if consistent {
+        return manifold;
+    }
+
+    // Each entry gives the adjacent face and whether the two original sides
+    // pointed the same way. Non-manifold edges stay disconnected.
+    let mut neighbors = vec![[u32::MAX; 3]; mesh.triangles.len()];
+    for group in sides.chunk_by(|a, b| a.0 == b.0) {
+        if let [a, b] = group {
+            let same = 1 ^ ((a.1 ^ b.1) & 1);
+            let [a, b] = [a, b].map(|s| (s.1 >> 1) as usize);
+            neighbors[a / 3][a % 3] = ((b / 3) as u32) << 1 | same;
+            neighbors[b / 3][b % 3] = ((a / 3) as u32) << 1 | same;
+        }
+    }
+    drop(sides);
+    let mut flip = vec![2u8; neighbors.len()];
+    let mut stack = Vec::new();
+    for start in 0..neighbors.len() {
+        if flip[start] != 2 {
+            continue;
+        }
+        flip[start] = 0;
+        stack.push(start);
+        while let Some(i) = stack.pop() {
+            for k in 0..3 {
+                let side = neighbors[i][if flip[i] == 0 { k } else { 2 - k }];
+                if side == u32::MAX {
+                    continue;
+                }
+                let j = (side >> 1) as usize;
+                let needed = flip[i] ^ ((side & 1) as u8);
+                if flip[j] == 2 {
+                    flip[j] = needed;
+                    stack.push(j);
+                } else if flip[j] != needed {
+                    manifold = false;
+                }
+            }
+        }
+    }
+    for (i, t) in mesh.triangles.iter_mut().enumerate() {
+        if flip[i] == 1 {
+            t.swap(1, 2);
+            if let Some(n) = mesh.corner_normals.get_mut(i) {
+                n.swap(1, 2);
+            }
+        }
+    }
+    manifold
 }
 
 /// Wind every connected piece one way: a triangle that runs a side in the same direction as
@@ -243,5 +333,23 @@ impl Body {
         placed.splits = self.splits.clone();
         placed.regularization_protected = self.regularization_protected;
         Some(placed)
+    }
+}
+
+#[cfg(test)]
+mod dense_winding_tests {
+    use super::*;
+
+    #[test]
+    fn dense_and_reference_match_at_seams_boundaries_and_nonmanifold_edges() {
+        for faces in [vec![[0, 1, 2], [0, 1, 3], [1, 2, 3], [2, 0, 3]], vec![[0, 1, 2], [0, 1, 3]], vec![[0, 1, 2], [0, 1, 3], [0, 1, 4], [6, 7, 8]]]
+        {
+            let mut reference = TriMesh { corner_normals: vec![[Vec3::X, Vec3::Y, Vec3::Z]; faces.len()], triangles: faces, ..TriMesh::default() };
+            let mut dense = reference.clone();
+            unify_winding(&mut reference);
+            assert_eq!(unify_dense_winding(&mut dense), is_closed(&reference));
+            assert_eq!(reference.triangles, dense.triangles);
+            assert_eq!(reference.corner_normals, dense.corner_normals);
+        }
     }
 }

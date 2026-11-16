@@ -1,0 +1,1245 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::default_trait_access)]
+
+use crate::framing::node_kind::NodeKind;
+use crate::test_support::test_bytes::put_f64;
+use crate::test_support::test_bytes::put_ref;
+use crate::test_support::test_bytes::put_vec3;
+use crate::test_support::test_bytes::record;
+use crate::test_support::test_deltas::partnered_trimmed_topology_partition_stream;
+use crate::test_support::test_deltas::variable_status_framed_deltas_stream;
+use crate::test_support::test_prt::prt_with_partition;
+use crate::test_support::test_streams::charted_intersection_with_edge_endpoint_witnesses_stream;
+use crate::test_support::test_streams::deltas_intersection_curve_stream;
+use crate::test_support::test_streams::offset_surface_topology_partition_stream;
+use crate::test_support::test_streams::topology_partition_stream;
+use std::io::Cursor;
+
+use cadmpeg_ir::codec::{Codec, DecodeOptions};
+
+use crate::loss::NxLossCode;
+use crate::topology::{
+    declared_composite_curves, FaceLoopFailure, Graph, Node, NodeCandidate, TYPE_38_SCHEMA_HEADER,
+};
+use crate::NxCodec;
+use cadmpeg_core::decode::View;
+
+mod primary_edges;
+
+#[test]
+fn unique_candidate_filter_reuses_input_storage() {
+    let candidates = [9, 7, 2, 7, 4, 7]
+        .into_iter()
+        .enumerate()
+        .map(|(index, xmt)| NodeCandidate {
+            kind: NodeKind::Point,
+            xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(xmt).unwrap(),
+            pos: 40 * index,
+            end: 40 * (index + 1),
+            shift: index % 2,
+        })
+        .collect::<Vec<_>>();
+    let storage = candidates.as_ptr();
+    let capacity = candidates.capacity();
+    let selected = Graph::select_unique_candidates(candidates);
+    assert_eq!(selected.as_ptr(), storage);
+    assert_eq!(selected.capacity(), capacity);
+    assert_eq!(
+        selected
+            .iter()
+            .map(|node| (node.xmt(), node.pos, node.end, node.shift))
+            .collect::<Vec<_>>(),
+        [(2, 80, 120, 0), (4, 160, 200, 0), (9, 0, 40, 0)]
+    );
+}
+
+#[test]
+fn unique_candidate_identity_includes_the_record_kind() {
+    let point = NodeCandidate {
+        kind: NodeKind::Point,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(9).unwrap(),
+        pos: 0,
+        end: 40,
+        shift: 0,
+    };
+    let line = NodeCandidate {
+        kind: NodeKind::Line,
+        pos: 40,
+        end: 80,
+        ..point
+    };
+    let selected = Graph::select_unique_candidates(vec![point, line]);
+    assert_eq!(selected.len(), 2);
+    assert!(selected
+        .iter()
+        .any(|node| node.kind == point.kind && node.pos == point.pos));
+    assert!(selected
+        .iter()
+        .any(|node| node.kind == line.kind && node.pos == line.pos));
+}
+
+#[test]
+fn topology_rejects_shell_with_broken_face_ownership_chain() {
+    let valid = topology_partition_stream();
+    let graph = crate::topology::Graph::parse(&valid);
+    assert_eq!(graph.body_shape_shells().count(), 1);
+
+    let mut broken = valid;
+    let face = broken
+        .windows(2)
+        .position(|window| window == [0, 14])
+        .expect("face record");
+    put_ref(&mut broken, face + 24, 99);
+    assert!(crate::topology::Graph::parse(&broken)
+        .body_shape_shells()
+        .next()
+        .is_none());
+
+    let mut independent_previous = topology_partition_stream();
+    let face = independent_previous
+        .windows(2)
+        .position(|window| window == [0, 14])
+        .expect("face record");
+    put_ref(&mut independent_previous, face + 20, 99);
+    assert_eq!(
+        crate::topology::Graph::parse(&independent_previous)
+            .body_shape_shells()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn topology_retains_shell_body_identity_without_body_record() {
+    let mut stream = topology_partition_stream();
+    let body = stream
+        .windows(4)
+        .position(|window| window == [0, 12, 0, 2])
+        .expect("body record");
+    stream[body..body + 24].fill(0xff);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    assert!(graph.get(NodeKind::Body, 2).is_none());
+    assert_eq!(graph.body_shape_shells().count(), 1);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(result.ir().model.bodies.len(), 1);
+    assert_eq!(result.ir().model.bodies[0].id.as_str(), "nx:s0:body#2");
+    assert_eq!(result.ir().model.faces.len(), 1);
+    let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(validation.is_ok(), "findings: {:?}", validation.findings);
+}
+
+#[test]
+fn topology_accepts_complete_fixed_nodes_across_the_u32_identifier_domain() {
+    let mut stream = topology_partition_stream();
+    let fixed_nodes = crate::topology::Graph::parse(&stream)
+        .nodes
+        .values()
+        .filter(|node| node.kind != NodeKind::Fin)
+        .map(|node| (node.pos(), node.shift))
+        .collect::<Vec<_>>();
+    for (ordinal, (pos, shift)) in fixed_nodes.into_iter().enumerate() {
+        let node_id = u32::MAX - u32::try_from(ordinal).unwrap();
+        stream[pos + 4 + shift..pos + 8 + shift].copy_from_slice(&node_id.to_be_bytes());
+    }
+
+    let graph = crate::topology::Graph::parse(&stream);
+
+    assert_eq!(graph.body_shape_shells().count(), 1);
+    assert_eq!(graph.body_shape_face_count(), 1);
+    assert!(graph.has_complete_body_topology());
+    assert!(graph
+        .nodes
+        .values()
+        .filter(|node| node.kind != NodeKind::Fin)
+        .all(|node| View::u32_be_at(&node.bytes, 4).is_some_and(|id| id > 1_000_000)));
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(result.ir().model.bodies.len(), 1);
+    assert_eq!(result.ir().model.faces.len(), 1);
+    let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(validation.is_ok(), "findings: {:?}", validation.findings);
+}
+
+#[test]
+fn topology_accepts_high_node_identity_among_low_identity_neighbors() {
+    let mut stream = topology_partition_stream();
+    let initial_graph = crate::topology::Graph::parse(&stream);
+    let face = initial_graph.get(NodeKind::Face, 4).unwrap();
+    let node_id_offset = face.pos() + 4 + face.shift;
+    stream[node_id_offset..node_id_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+
+    let graph = crate::topology::Graph::parse(&stream);
+
+    assert_eq!(
+        graph
+            .get(NodeKind::Face, 4)
+            .and_then(crate::topology::Node::node_id),
+        Some(u32::MAX)
+    );
+    assert_eq!(graph.body_shape_face_count(), 1);
+    assert!(graph.has_complete_body_topology());
+}
+
+#[test]
+fn topology_admits_high_identity_carriers_from_typed_topology_slots() {
+    let mut stream = topology_partition_stream();
+    let initial_graph = Graph::parse(&stream);
+    for (kind, xmt) in [(50, 6), (30, 9), (29, 11)] {
+        let node = initial_graph
+            .get(NodeKind::try_from(kind).unwrap(), xmt)
+            .unwrap();
+        let node_id_offset = node.pos() + 4 + node.shift;
+        stream[node_id_offset..node_id_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    }
+
+    let graph = Graph::parse(&stream);
+
+    for (kind, xmt) in [(50, 6), (30, 9), (29, 11)] {
+        assert_eq!(
+            graph
+                .get(NodeKind::try_from(kind).unwrap(), xmt)
+                .and_then(|node| node.u32_at(4)),
+            Some(u32::MAX)
+        );
+    }
+    assert!(graph.has_complete_body_topology());
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(result.ir().model.surfaces.len(), 1);
+    assert_eq!(result.ir().model.curves.len(), 1);
+    assert_eq!(result.ir().model.points.len(), 1);
+}
+
+#[test]
+fn topology_rejects_unreferenced_high_identity_carrier() {
+    let mut stream = topology_partition_stream();
+    let plane_pos = stream
+        .windows(4)
+        .position(|window| window == [0, 50, 0, 6])
+        .unwrap();
+    let mut unreferenced = stream[plane_pos..plane_pos + 91].to_vec();
+    put_ref(&mut unreferenced, 2, 99);
+    unreferenced[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+    stream.extend(unreferenced);
+    let line_pos = stream
+        .windows(4)
+        .position(|window| window == [0, 30, 0, 9])
+        .unwrap();
+    let mut successor = stream[line_pos..line_pos + 67].to_vec();
+    put_ref(&mut successor, 2, 100);
+    stream.extend(successor);
+
+    let graph = Graph::parse(&stream);
+
+    assert!(graph.get(NodeKind::Plane, 99).is_none());
+    assert!(graph.get(NodeKind::Line, 100).is_some());
+    assert!(graph.has_complete_body_topology());
+}
+
+#[test]
+fn topology_admits_high_identity_region_from_shell_ownership() {
+    let mut stream = topology_partition_stream();
+    let initial_graph = Graph::parse(&stream);
+    let region = initial_graph.get(NodeKind::Region, 12).unwrap();
+    let node_id_offset = region.pos + 4 + region.shift;
+    stream[node_id_offset..node_id_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+
+    let graph = Graph::parse(&stream);
+
+    assert_eq!(
+        graph.get(NodeKind::Region, 12).and_then(Node::node_id),
+        Some(u32::MAX)
+    );
+    assert!(graph.has_complete_body_topology());
+}
+
+#[test]
+fn topology_closes_high_identity_procedural_surface_dependencies() {
+    let mut stream = offset_surface_topology_partition_stream();
+    let initial_graph = Graph::parse(&stream);
+    let offset = initial_graph.get(NodeKind::OffsetSurface, 12).unwrap();
+    let node_id_offset = offset.pos + 4 + offset.shift;
+    stream[node_id_offset..node_id_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+
+    let graph = Graph::parse(&stream);
+
+    assert_eq!(
+        graph
+            .get(NodeKind::OffsetSurface, 12)
+            .and_then(|node| node.u32_at(4)),
+        Some(u32::MAX)
+    );
+    assert_eq!(graph.offset_surfaces().len(), 1);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(result.ir().model.procedural_surfaces.len(), 1);
+}
+
+#[test]
+fn topology_resolves_kernel_node_identity_only_within_one_unique_family() {
+    let mut stream = topology_partition_stream();
+    let graph = crate::topology::Graph::parse(&stream);
+    let face = graph.get(NodeKind::Face, 4).unwrap();
+    let node_id = face.node_id().unwrap();
+    assert_eq!(
+        graph.unique_xmt_by_node_id(NodeKind::Face, node_id),
+        Some(4)
+    );
+    assert_eq!(
+        graph.unique_xmt_by_node_id(NodeKind::Edge, node_id),
+        Some(8)
+    );
+
+    let mut duplicate = face.bytes.clone();
+    duplicate[3] = 39;
+    stream.extend(duplicate);
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(
+        graph.get(NodeKind::Face, 39).and_then(Node::node_id),
+        Some(node_id)
+    );
+    assert_eq!(graph.unique_xmt_by_node_id(NodeKind::Face, node_id), None);
+}
+
+#[test]
+fn topology_accepts_cached_last_face_and_implicit_region_identity() {
+    let mut stream = topology_partition_stream();
+    let shell = stream
+        .windows(4)
+        .position(|window| window == [0, 13, 0, 3])
+        .expect("shell record");
+    put_ref(&mut stream, shell + 22, 4);
+    let region = stream
+        .windows(4)
+        .position(|window| window == [0, 19, 0, 12])
+        .expect("region record");
+    stream[region..region + 16].fill(0xff);
+    let mut second_face = record(14, 39);
+    put_ref(&mut second_face, 2, 20);
+    put_f64(&mut second_face, 10, 0.000_2);
+    put_ref(&mut second_face, 18, 1);
+    put_ref(&mut second_face, 20, 1);
+    put_ref(&mut second_face, 22, 1);
+    put_ref(&mut second_face, 24, 3);
+    put_ref(&mut second_face, 26, 6);
+    second_face[28] = b'+';
+    stream.extend(second_face);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    assert!(graph.get(NodeKind::Region, 12).is_none());
+    assert_eq!(graph.body_shape_shells().count(), 1);
+    assert_eq!(graph.body_shape_face_count(), 2);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(result.ir().model.regions.len(), 1);
+    assert_eq!(result.ir().model.regions[0].id.as_str(), "nx:s0:region#12");
+    assert_eq!(result.ir().model.faces.len(), 2);
+    let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(validation.is_ok(), "findings: {:?}", validation.findings);
+}
+
+#[test]
+fn topology_rejects_nonreciprocal_fin_ring() {
+    let mut stream = topology_partition_stream();
+    let fin = stream
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("fin record");
+    put_ref(&mut stream, fin + 8, 99);
+    let graph = crate::topology::Graph::parse(&stream);
+    assert!(graph.face_loop_rings(4).is_err());
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert!(result.ir().model.loops.is_empty());
+    assert!(result.ir().model.coedges.is_empty());
+    assert!(result.ir().model.edges.is_empty());
+
+    let mut broken_partner = topology_partition_stream();
+    let fin = broken_partner
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("fin record");
+    put_ref(&mut broken_partner, fin + 14, 99);
+    let graph = Graph::parse(&broken_partner);
+    assert!(graph.face_loop_rings(4).is_err());
+}
+
+#[test]
+fn unresolved_fin_edge_records_face_boundary_loss() {
+    let mut stream = topology_partition_stream();
+    let fin = stream
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("FIN");
+    put_ref(&mut stream, fin + 16, 99);
+    let graph = Graph::parse(&stream);
+    assert!(matches!(
+        graph.face_loop_rings(4),
+        Err(FaceLoopFailure::UnresolvedFinEdge {
+            loop_xmt: 5,
+            fin_xmt: 7,
+            edge_xmt: Some(99),
+        })
+    ));
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .expect("decode");
+    assert_eq!(result.ir().model.faces.len(), 1);
+    assert!(result.ir().model.loops.is_empty());
+    assert!(result.report().losses.iter().any(|loss| {
+        loss.code == NxLossCode::TopologyFaceLoopUnresolved.kind()
+            && loss.message.contains("FIN 7")
+            && loss.message.contains("EDGE 99")
+    }));
+}
+
+#[test]
+fn admitted_loop_records_loss_when_its_edge_cannot_emit() {
+    let mut stream = topology_partition_stream();
+    let graph = Graph::parse(&stream);
+    let vertex = graph.get(NodeKind::Vertex, 10).expect("vertex");
+    put_ref(&mut stream, vertex.pos() + 16, 99);
+    let graph = Graph::parse(&stream);
+    assert!(graph.face_loop_rings(4).is_ok());
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .expect("decode");
+    assert_eq!(result.ir().model.faces.len(), 1);
+    assert!(result.ir().model.loops.is_empty());
+    assert!(result.report().losses.iter().any(|loss| {
+        loss.code == NxLossCode::TopologyLoopRingUnresolved.kind()
+            && loss.message.contains("LOOP 5")
+    }));
+}
+
+#[test]
+fn linked_fin_ring_order_is_emitted() {
+    let mut stream = charted_intersection_with_edge_endpoint_witnesses_stream();
+    let graph = Graph::parse(&stream);
+    let loop_node = graph.get(NodeKind::Loop, 5).expect("loop node");
+    put_ref(&mut stream, loop_node.pos() + 10, 13);
+    let first_fin = graph.get(NodeKind::Fin, 7).expect("first FIN");
+    put_ref(&mut stream, first_fin.pos + 8, 6);
+    let second_fin = graph.get(NodeKind::Fin, 13).expect("second FIN");
+    put_ref(&mut stream, second_fin.pos + 10, 6);
+    let mut third_fin = record(17, 23);
+    put_ref(&mut third_fin, 2, 6);
+    put_ref(&mut third_fin, 6, 5);
+    put_ref(&mut third_fin, 8, 13);
+    put_ref(&mut third_fin, 10, 7);
+    put_ref(&mut third_fin, 12, 14);
+    put_ref(&mut third_fin, 14, 1);
+    put_ref(&mut third_fin, 16, 8);
+    put_ref(&mut third_fin, 18, 12);
+    third_fin[22] = b'+';
+    stream.extend(third_fin);
+    let graph = Graph::parse(&stream);
+    assert_eq!(
+        graph.face_loop_rings(4).expect("source ring")[0].1,
+        vec![13, 7, 6]
+    );
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .expect("decode");
+    let ids = result.ir().model.loops[0]
+        .coedges()
+        .iter()
+        .map(cadmpeg_ir::ids::CoedgeId::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        ids[0].ends_with("#13") && ids[1].ends_with("#7") && ids[2].ends_with("#6"),
+        "{ids:?}"
+    );
+}
+
+#[test]
+fn face_loop_chain_order_is_emitted() {
+    let mut stream = partnered_trimmed_topology_partition_stream();
+    let graph = Graph::parse(&stream);
+    let face = graph.get(NodeKind::Face, 4).expect("first face");
+    let first_loop = graph.get(NodeKind::Loop, 5).expect("first loop");
+    let second_loop = graph.get(NodeKind::Loop, 21).expect("second loop");
+    put_ref(&mut stream, face.pos() + 22, 21);
+    put_ref(&mut stream, second_loop.pos + 12, 4);
+    put_ref(&mut stream, second_loop.pos + 14, 5);
+    put_ref(&mut stream, first_loop.pos + 14, 1);
+    let graph = Graph::parse(&stream);
+    let source = graph.face_loop_rings(4).expect("linked loop chain");
+    assert_eq!(
+        source.iter().map(|(xmt, _)| *xmt).collect::<Vec<_>>(),
+        vec![21, 5]
+    );
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .expect("decode");
+    let face = result
+        .ir()
+        .model
+        .faces
+        .iter()
+        .find(|face| face.id.as_str().ends_with("#4"))
+        .expect("face");
+    let ids = face
+        .loops
+        .iter()
+        .map(cadmpeg_ir::ids::LoopId::as_str)
+        .collect::<Vec<_>>();
+    assert!(ids[0].ends_with("#21") && ids[1].ends_with("#5"), "{ids:?}");
+}
+
+#[test]
+fn topology_accepts_fixed_record_envelope_escape() {
+    let mut stream = topology_partition_stream();
+    let fin = stream
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("fin record");
+    stream.insert(fin + 2, 0xff);
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(
+        graph
+            .get(NodeKind::Fin, 7)
+            .unwrap()
+            .attribute_field_offset(),
+        Some(fin + 5)
+    );
+    assert_eq!(graph.face_loop_rings(4).unwrap().len(), 1);
+}
+
+#[test]
+fn topology_prefers_escaped_body_shape_over_direct_extended_xmt() {
+    let mut stream = topology_partition_stream();
+    let shell = stream
+        .windows(4)
+        .position(|window| window == [0, 13, 0, 3])
+        .expect("shell record");
+    stream.insert(shell + 2, 0xff);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(
+        graph.get(NodeKind::Shell, 3).map(super::Node::pos),
+        Some(shell)
+    );
+    assert_eq!(graph.body_shape_shells().count(), 1);
+    assert_eq!(graph.body_shape_face_count(), 1);
+}
+
+#[test]
+fn topology_iterates_each_record_family_in_physical_order() {
+    let mut stream = Vec::new();
+    for (xmt, x) in [(77, 0.01), (3, 0.02)] {
+        let mut point = record(29, 40);
+        put_ref(&mut point, 2, xmt);
+        put_vec3(&mut point, 16, [x, 0.0, 0.0]);
+        stream.extend(point);
+    }
+
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(
+        graph
+            .of_kind(NodeKind::Point)
+            .map(super::Node::xmt)
+            .collect::<Vec<_>>(),
+        vec![77, 3]
+    );
+}
+
+#[test]
+fn topology_invalid_candidate_cannot_shadow_later_valid_record() {
+    let mut stream = record(14, 39);
+    put_ref(&mut stream, 2, 4);
+    stream.extend(topology_partition_stream());
+
+    let graph = crate::topology::Graph::parse(&stream);
+    let face = graph.get(NodeKind::Face, 4).expect("valid later FACE");
+    assert!(face.pos() >= 39);
+    assert!(face.face_fields().is_some());
+}
+
+#[test]
+fn topology_selects_one_candidate_at_an_ambiguous_record_offset() {
+    let mut stream = vec![0; 26];
+    stream[..7].copy_from_slice(&[0, 12, 0xff, 0xfe, 0x00, 0x02, 0x01]);
+    let mut successor = record(12, 24);
+    put_ref(&mut successor, 2, 3);
+    stream.extend_from_slice(&successor);
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(graph.of_kind(NodeKind::Body).count(), 2);
+    assert_eq!(graph.at_pos(0).map(super::Node::xmt), Some(65_536));
+    assert_eq!(graph.at_pos(26).map(super::Node::xmt), Some(3));
+}
+
+#[test]
+fn topology_disambiguates_direct_large_index_from_escaped_compact_record() {
+    let mut stream = vec![0; 25];
+    stream[..6].copy_from_slice(&[0, 17, 0xff, 0x7f, 0x00, 0x01]);
+    for index in 0..8 {
+        put_ref(&mut stream, 6 + index * 2, 2);
+    }
+    stream[22..24].copy_from_slice(b"++");
+    stream[24] = b'+';
+
+    let mut successor = record(17, 23);
+    put_ref(&mut successor, 2, 7);
+    for index in 0..9 {
+        put_ref(&mut successor, 4 + index * 2, 2);
+    }
+    successor[22] = b'+';
+    stream.extend_from_slice(&successor);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(graph.at_pos(0).map(super::Node::xmt), Some(32_896));
+    assert_eq!(graph.at_pos(0).map(crate::topology::Node::end), Some(25));
+    assert_eq!(graph.at_pos(25).map(super::Node::xmt), Some(7));
+
+    let mut ambiguous = stream[..25].to_vec();
+    ambiguous.extend_from_slice(&[0; 5]);
+    assert!(crate::topology::Graph::parse(&ambiguous)
+        .at_pos(0)
+        .is_none());
+}
+
+#[test]
+fn topology_rejects_duplicate_fixed_record_identity() {
+    let mut first = record(29, 40);
+    put_ref(&mut first, 2, 11);
+    put_vec3(&mut first, 16, [0.01, 0.02, 0.03]);
+    let mut duplicate = record(29, 40);
+    put_ref(&mut duplicate, 2, 11);
+    put_vec3(&mut duplicate, 16, [0.04, 0.05, 0.06]);
+    first.extend(duplicate);
+
+    let graph = crate::topology::Graph::parse(&first);
+    assert!(graph.get(NodeKind::Point, 11).is_none());
+    assert!(graph.of_kind(NodeKind::Point).next().is_none());
+}
+
+#[test]
+fn topology_rejects_duplicate_identity_instead_of_preferring_body_shape() {
+    let mut stream = topology_partition_stream();
+    let mut duplicate = record(13, 24);
+    put_ref(&mut duplicate, 2, 3);
+    put_ref(&mut duplicate, 8, 2);
+    put_ref(&mut duplicate, 10, 2);
+    put_ref(&mut duplicate, 12, 2);
+    put_ref(&mut duplicate, 14, 4);
+    put_ref(&mut duplicate, 16, 0);
+    put_ref(&mut duplicate, 18, 0);
+    put_ref(&mut duplicate, 20, 12);
+    put_ref(&mut duplicate, 22, 0);
+    stream.extend(duplicate);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    assert!(graph.get(NodeKind::Shell, 3).is_none());
+}
+
+#[test]
+fn topology_rejects_overlapping_candidates_without_ranking() {
+    let first = NodeCandidate {
+        kind: NodeKind::Point,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(11).unwrap(),
+        pos: 0,
+        shift: 0,
+        end: 24,
+    };
+    let second = NodeCandidate {
+        kind: NodeKind::Point,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(12).unwrap(),
+        pos: 8,
+        shift: 0,
+        end: 32,
+    };
+
+    assert!(Graph::select_non_overlapping_candidates(&[], vec![first, second]).is_empty());
+}
+
+#[test]
+fn topology_admits_disjoint_bounded_records_in_one_overlap_cluster() {
+    let mut member = record(91, 20);
+    put_ref(&mut member, 2, 30);
+    put_ref(&mut member, 8, 31);
+    put_ref(&mut member, 10, 4);
+    for at in [12, 14, 16, 18] {
+        put_ref(&mut member, at, 1);
+    }
+    let mut stream = vec![0xaa; 39];
+    stream.extend(member);
+    stream.extend([0xaa; 39]);
+    let face = |xmt, pos| NodeCandidate {
+        kind: NodeKind::Face,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(xmt).unwrap(),
+        pos,
+        shift: 0,
+        end: pos + 39,
+    };
+    let spanning = NodeCandidate {
+        kind: NodeKind::Edge,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(40).unwrap(),
+        pos: 20,
+        shift: 0,
+        end: 70,
+    };
+
+    let selected =
+        Graph::select_non_overlapping_candidates(&stream, vec![face(4, 0), spanning, face(5, 59)]);
+    assert_eq!(
+        selected.iter().map(|node| node.xmt()).collect::<Vec<_>>(),
+        [4, 5]
+    );
+}
+
+#[test]
+fn topology_bounds_a_record_at_the_type_38_schema_header() {
+    let mut stream = vec![0xaa; 91];
+    stream.extend_from_slice(TYPE_38_SCHEMA_HEADER);
+    stream.extend([0xaa; 8]);
+    let plane = NodeCandidate {
+        kind: NodeKind::Plane,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(6).unwrap(),
+        pos: 0,
+        shift: 0,
+        end: 91,
+    };
+    let embedded = NodeCandidate {
+        kind: NodeKind::Vertex,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(19).unwrap(),
+        pos: 11,
+        shift: 0,
+        end: 39,
+    };
+
+    let selected = Graph::select_non_overlapping_candidates(&stream, vec![plane, embedded]);
+    assert_eq!(
+        selected.iter().map(|node| node.xmt()).collect::<Vec<_>>(),
+        [6]
+    );
+}
+
+#[test]
+fn topology_ownership_candidate_cannot_suppress_typed_candidate() {
+    let mut face = record(14, 39);
+    put_ref(&mut face, 2, 4);
+    put_f64(&mut face, 10, 0.000_2);
+    put_ref(&mut face, 18, 1);
+    put_ref(&mut face, 20, 1);
+    put_ref(&mut face, 22, 1);
+    put_ref(&mut face, 24, 3);
+    put_ref(&mut face, 26, 6);
+    face[28] = b'+';
+
+    let mut stream = vec![0, 12];
+    stream.extend(face);
+
+    let graph = Graph::parse(&stream);
+    assert!(graph.get(NodeKind::Face, 4).is_some());
+    assert!(graph.get(NodeKind::Body, 14).is_none());
+}
+
+#[test]
+fn topology_resolves_ownership_overlap_before_duplicate_identity() {
+    let mut outer = record(12, 24);
+    put_ref(&mut outer, 2, 7);
+    outer[8..10].copy_from_slice(&[0, 12]);
+    put_ref(&mut outer, 10, 7);
+    let mut successor = record(12, 24);
+    put_ref(&mut successor, 2, 8);
+
+    let mut stream = outer;
+    stream.extend(successor);
+
+    let graph = Graph::parse(&stream);
+    assert_eq!(graph.get(NodeKind::Body, 7).map(super::Node::pos), Some(0));
+    assert_eq!(graph.get(NodeKind::Body, 8).map(super::Node::pos), Some(24));
+}
+
+#[test]
+fn topology_retains_non_overlapping_ownership_records() {
+    let graph = Graph::parse(&topology_partition_stream());
+
+    assert!(graph.get(NodeKind::Body, 2).is_some());
+    assert!(graph.get(NodeKind::Region, 12).is_some());
+}
+
+#[test]
+fn topology_rejects_ownership_records_inside_counted_lanes() {
+    // The 12-value surface lane count ends in `00 0c`, and the lane's node
+    // identity 22 follows it.
+    let mut stream = crate::test_support::test_deltas::bspline_partition_stream();
+    assert_eq!(Graph::parse(&stream).kind_count(NodeKind::Body), 0);
+
+    let mut body = record(12, 24);
+    put_ref(&mut body, 2, 22);
+    stream.extend(body);
+    let graph = Graph::parse(&stream);
+    assert_eq!(graph.kind_count(NodeKind::Body), 1);
+    assert_eq!(
+        graph.get(NodeKind::Body, 22).map(super::Node::pos),
+        Some(stream.len() - 24)
+    );
+}
+
+#[test]
+fn topology_resolves_overlap_before_duplicate_identity() {
+    let stream = vec![0; 40];
+    let outer = NodeCandidate {
+        kind: NodeKind::Point,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(11).unwrap(),
+        pos: 0,
+        shift: 0,
+        end: 40,
+    };
+    let embedded = NodeCandidate {
+        kind: NodeKind::Point,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(11).unwrap(),
+        pos: 8,
+        shift: 0,
+        end: 32,
+    };
+
+    assert!(Graph::select_unique_candidates(vec![outer, embedded]).is_empty());
+    let selected = Graph::select_unique_candidates(Graph::select_non_overlapping_candidates(
+        &stream,
+        vec![outer, embedded],
+    ));
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].pos, outer.pos);
+    assert_eq!(selected[0].end(), outer.end());
+}
+
+#[test]
+fn topology_rejects_status_framed_delta_as_fixed_record() {
+    let graph = Graph::parse(&variable_status_framed_deltas_stream());
+
+    assert!(graph.of_kind(NodeKind::Loop).next().is_none());
+}
+
+#[test]
+fn declared_intersection_requires_its_own_complete_schema() {
+    // Compact first instance: XMT12, node7, five common references, sense,
+    // then six construction references. Z terminates the declaration.
+    let mut instance = Vec::new();
+    instance.extend_from_slice(&12u16.to_be_bytes());
+    instance.extend_from_slice(&7u32.to_be_bytes());
+    for reference in [1u16; 5] {
+        instance.extend_from_slice(&reference.to_be_bytes());
+    }
+    instance.push(b'+');
+    for reference in [6u16, 7, 20, 21, 22, 23] {
+        instance.extend_from_slice(&reference.to_be_bytes());
+    }
+    let mut source = TYPE_38_SCHEMA_HEADER.to_vec();
+    source.extend_from_slice(&instance);
+    // A later compact-shaped Z is not a second record.
+    source.extend_from_slice(&[0xa5; 100]);
+    source.push(b'Z');
+    source.extend_from_slice(&instance);
+    let curves =
+        crate::test_support::with_decode_context(|_ctx| declared_composite_curves(&source));
+    assert_eq!(curves.len(), 1);
+    assert_eq!(curves[0].pos, 0);
+    assert_eq!(curves[0].xmt, 12);
+    assert_eq!(
+        curves[0]
+            .references
+            .map(cadmpeg_parasolid::xmt::XmtTarget::to_wire),
+        [6, 7, 20, 21, 22, 23]
+    );
+    for at in [16, TYPE_38_SCHEMA_HEADER.len() - 1] {
+        let mut mutated = source.clone();
+        mutated[at] = 0xfe;
+        assert!(crate::test_support::with_decode_context(|_ctx| {
+            declared_composite_curves(&mutated)
+        })
+        .is_empty());
+    }
+    assert!(crate::test_support::with_decode_context(|_ctx| {
+        declared_composite_curves(&deltas_intersection_curve_stream())
+    })
+    .is_empty());
+}
+
+#[test]
+fn topology_reference_views_reserve_only_one_as_null() {
+    for raw in [0_u16, 1, 2, 32_767] {
+        for (kind, len, offsets, sense) in [
+            (NodeKind::Face, 39, &[8, 18, 20, 22, 24, 26][..], Some(28)),
+            (
+                NodeKind::Edge,
+                32,
+                &[8, 18, 20, 22, 24, 26, 28, 30][..],
+                None,
+            ),
+            (
+                NodeKind::Shell,
+                24,
+                &[8, 10, 12, 14, 16, 18, 20, 22][..],
+                None,
+            ),
+            (NodeKind::Loop, 16, &[8, 10, 12, 14][..], None),
+            (
+                NodeKind::Fin,
+                23,
+                &[4, 6, 8, 10, 12, 14, 16, 18, 20][..],
+                Some(22),
+            ),
+            (NodeKind::Vertex, 28, &[8, 10, 12, 14, 16][..], None),
+        ] {
+            let mut bytes = vec![0; len];
+            for &offset in offsets {
+                put_ref(&mut bytes, offset, raw);
+            }
+            if let Some(offset) = sense {
+                bytes[offset] = b'+';
+            }
+            let node = Node {
+                kind,
+                xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(2).unwrap(),
+                pos: 0,
+                end: bytes.len(),
+                shift: 0,
+                bytes,
+            };
+            let references = match kind {
+                NodeKind::Face => {
+                    let f = node.face_fields().unwrap();
+                    vec![f.attributes, f.next_face, f.loop_xmt, f.shell, f.surface]
+                }
+                NodeKind::Edge => {
+                    let f = node.edge_fields().unwrap();
+                    vec![f.attributes, f.fin, f.curve]
+                }
+                NodeKind::Shell => {
+                    let f = node.shell_fields().unwrap();
+                    vec![
+                        f.attributes,
+                        f.body,
+                        f.next_shell,
+                        f.first_face,
+                        f.sentinel_0,
+                        f.sentinel_1,
+                        f.region,
+                        f.last_face,
+                    ]
+                }
+                NodeKind::Loop => {
+                    let f = node.loop_fields().unwrap();
+                    vec![f.attributes, f.fin, f.face, f.next_loop]
+                }
+                NodeKind::Fin => {
+                    let f = node.fin_fields().unwrap();
+                    vec![
+                        f.attributes,
+                        f.loop_xmt,
+                        f.forward,
+                        f.backward,
+                        f.vertex,
+                        f.edge,
+                        f.other,
+                        f.curve_xmt,
+                    ]
+                }
+                NodeKind::Vertex => {
+                    let f = node.vertex_fields().unwrap();
+                    vec![f.attributes, f.point]
+                }
+                _ => panic!("topology reference family"),
+            };
+            for reference in references {
+                assert_eq!(
+                    reference.map(u32::from),
+                    (raw != 1).then_some(u32::from(raw))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn shell_census_work_does_not_scan_unrelated_record_kinds() {
+    let mut stream = topology_partition_stream();
+    for xmt in 100..1100 {
+        let mut point = record(29, 40);
+        put_ref(&mut point, 2, xmt);
+        put_vec3(&mut point, 16, [0.01, 0.02, 0.03]);
+        stream.extend(point);
+    }
+    let graph = Graph::parse(&stream);
+    assert_eq!(graph.kind_count(NodeKind::Face), 1);
+    assert_eq!(graph.kind_count(NodeKind::Point), 1001);
+
+    let shells: Vec<_> = graph.body_shape_shells().collect();
+    assert_eq!(shells.len(), 1);
+    assert_eq!(graph.body_shape_face_count(), 1);
+    assert_eq!(graph.shell_face_xmts(shells[0]), Some(vec![4]));
+    assert_eq!(graph.of_kind(NodeKind::Face).count(), 1);
+}
+
+#[test]
+fn topology_nodes_retain_the_admitted_header_identity_and_source_span() {
+    let bytes = topology_partition_stream();
+    let graph = Graph::parse(&bytes);
+    for node in graph.nodes.values() {
+        let cloned = node.clone();
+        let (identity, _) =
+            crate::framing::read_xmt(&cloned.bytes, 2 + usize::from(cloned.bytes[2] == 0xff))
+                .unwrap();
+        assert_eq!(cloned.xmt(), identity);
+        assert!(cloned.xmt() > 1);
+        assert_eq!(cloned.end(), cloned.pos() + cloned.bytes.len());
+        assert_eq!(&bytes[cloned.pos()..cloned.end()], cloned.bytes.as_slice());
+        if let Some(offset) = cloned.attribute_field_offset() {
+            assert!((cloned.pos()..cloned.end()).contains(&offset));
+        }
+    }
+}
+
+#[test]
+fn topology_field_tolerances_require_finite_native_values() {
+    let bytes = topology_partition_stream();
+    let graph = Graph::parse(&bytes);
+    for (kind, identity, offset) in [
+        (NodeKind::Face, 4, 10),
+        (NodeKind::Edge, 8, 10),
+        (NodeKind::Vertex, 10, 18),
+    ] {
+        let mut node = graph.get(kind, identity).unwrap().clone();
+        for value in [
+            -1.0,
+            0.0,
+            f64::MAX,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            put_f64(&mut node.bytes, offset, value);
+            let tolerance = match kind {
+                NodeKind::Face => node.face_fields().map(super::FaceFields::tolerance),
+                NodeKind::Edge => node.edge_fields().map(super::EdgeFields::tolerance),
+                NodeKind::Vertex => node.vertex_fields().map(super::VertexFields::tolerance),
+                _ => panic!("test family"),
+            };
+            if value.is_finite() {
+                assert_eq!(tolerance, Some(value));
+            } else {
+                assert_eq!(tolerance, None);
+            }
+        }
+    }
+    assert!(graph
+        .unique_curve_edge_witness(9)
+        .unwrap()
+        .tolerance()
+        .is_finite());
+}
+
+#[test]
+fn ownership_admission_matches_pairwise_overlap() {
+    let span = |kind, xmt: u32, pos: usize, len: usize| NodeCandidate {
+        kind,
+        xmt: cadmpeg_parasolid::xmt::NonNullXmt::try_from(xmt).unwrap(),
+        pos,
+        end: pos + len,
+        shift: 0,
+    };
+    // Typed spans in key order, with one long span that reaches past later
+    // starts, so the admission cannot rely on sorted or disjoint input.
+    let mut selected = Vec::new();
+    for index in 0..1024_usize {
+        let xmt = u32::try_from(1024 - index).unwrap() + 1;
+        selected.push(span(NodeKind::Point, xmt, 97 * index, 40 + index % 7));
+    }
+    selected.push(span(NodeKind::Line, 2, 20_000, 9_000));
+    let ownership = (0..1024_usize)
+        .map(|index| {
+            let xmt = u32::try_from(index).unwrap() + 2;
+            span(NodeKind::Body, xmt, 13 * index * 7 + 40, 24)
+        })
+        .collect::<Vec<_>>();
+
+    let pairwise = ownership
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            selected
+                .iter()
+                .all(|typed| !(typed.pos < candidate.end && candidate.pos < typed.end))
+        })
+        .collect::<Vec<_>>();
+    let admitted = Graph::admit_disjoint_ownership(ownership, &selected);
+    assert!(!admitted.is_empty() && admitted.len() < 1024);
+    assert_eq!(admitted, pairwise);
+}
+
+/// A body-shape SHELL whose first FACE is `face`; `last_face` 1 is null.
+fn shell_record(xmt: u16, face: u16, last_face: u16) -> Vec<u8> {
+    let mut shell = record(13, 24);
+    put_ref(&mut shell, 2, xmt);
+    for (at, value) in [(8, 1), (10, 2), (12, 1), (14, face), (16, 1), (18, 1)] {
+        put_ref(&mut shell, at, value);
+    }
+    put_ref(&mut shell, 20, 12);
+    put_ref(&mut shell, 22, last_face);
+    shell
+}
+
+fn face_record(xmt: u16, next_face: u16, shell: u16) -> Vec<u8> {
+    let mut face = record(14, 39);
+    put_ref(&mut face, 2, xmt);
+    put_f64(&mut face, 10, 0.000_2);
+    for (at, value) in [
+        (8, 1),
+        (18, next_face),
+        (20, 1),
+        (22, 5),
+        (24, shell),
+        (26, 6),
+    ] {
+        put_ref(&mut face, at, value);
+    }
+    face[28] = b'+';
+    face
+}
+
+// Fixture identities stay in 0x0100..=0x09ff: no high byte is a record tag,
+// so no reference field frames a second record.
+#[test]
+fn cyclic_shell_face_chains_are_rejected_in_one_lap() {
+    const SHELLS: u16 = 1024;
+    let mut stream = Vec::new();
+    for index in 0..SHELLS {
+        let (shell, face) = (0x100 + 2 * index, 0x101 + 2 * index);
+        stream.extend(shell_record(shell, face, 1));
+        stream.extend(face_record(face, face, shell));
+    }
+    stream.extend(shell_record(0x900, 0x901, 1));
+    stream.extend(face_record(0x901, 0x902, 0x900));
+    stream.extend(face_record(0x902, 1, 0x900));
+
+    let graph = Graph::parse(&stream);
+    assert_eq!(graph.kind_count(NodeKind::Shell), usize::from(SHELLS) + 1);
+    let shells = graph.body_shape_shells().collect::<Vec<_>>();
+    assert_eq!(shells.len(), 1);
+    assert_eq!(shells[0].xmt(), 0x900);
+    assert_eq!(graph.body_shape_face_count(), 2);
+    assert_eq!(graph.shell_face_xmts(shells[0]), Some(vec![0x901, 0x902]));
+}
+
+#[test]
+fn last_face_shells_count_their_faces_from_the_shell_index() {
+    const SHELLS: u16 = 512;
+    let mut stream = Vec::new();
+    for index in 0..SHELLS {
+        let (shell, face) = (0x100 + 3 * index, 0x101 + 3 * index);
+        stream.extend(shell_record(shell, face, face));
+        stream.extend(face_record(face, 1, shell));
+        stream.extend(face_record(face + 1, 1, shell));
+    }
+
+    let graph = Graph::parse(&stream);
+    let shells = graph.body_shape_shells().collect::<Vec<_>>();
+    assert_eq!(shells.len(), usize::from(SHELLS));
+    assert_eq!(graph.body_shape_face_count(), 2 * usize::from(SHELLS));
+    for shell in shells {
+        let face = shell.xmt() + 1;
+        assert_eq!(graph.shell_face_xmts(shell), Some(vec![face, face + 1]));
+    }
+}
+
+#[test]
+fn identical_domain_selection_materializes_node_payloads_once() {
+    let mut stream = Vec::new();
+    for xmt in 100..200 {
+        let mut point = record(29, 40);
+        put_ref(&mut point, 2, xmt);
+        put_vec3(&mut point, 16, [0.01, 0.02, 0.03]);
+        stream.extend(point);
+    }
+    let graph = Graph::parse(&stream);
+    assert_eq!(graph.kind_count(NodeKind::Point), 100);
+    for xmt in 100..200 {
+        assert!(graph.get(NodeKind::Point, xmt).is_some());
+    }
+}
+
+#[test]
+fn edge_endpoint_witness_uses_partner_and_only_null_falls_back() {
+    use cadmpeg_ir::math::Point3;
+
+    for (partner, point, expected_end) in [
+        (20, 22, Some(Point3::new(40.0, 50.0, 60.0))),
+        (1, 22, Some(Point3::new(10.0, 20.0, 30.0))),
+        (0, 22, None),
+        (99, 22, None),
+        (20, 99, None),
+    ] {
+        let mut stream = topology_partition_stream();
+        let first_fin = stream.windows(4).position(|w| w == [0, 17, 0, 7]).unwrap();
+        put_ref(&mut stream, first_fin + 14, partner);
+        let mut fin = record(17, 23);
+        put_ref(&mut fin, 2, 20);
+        put_ref(&mut fin, 6, 1); // dummy partner has no loop
+        put_ref(&mut fin, 8, 20);
+        put_ref(&mut fin, 10, 20);
+        put_ref(&mut fin, 12, 21);
+        put_ref(&mut fin, 14, 7);
+        put_ref(&mut fin, 16, 8);
+        put_ref(&mut fin, 18, 9);
+        fin[22] = b'-';
+        stream.extend(fin);
+        let mut vertex = record(18, 28);
+        put_ref(&mut vertex, 2, 21);
+        put_ref(&mut vertex, 16, point);
+        put_f64(&mut vertex, 18, 0.000_1);
+        stream.extend(vertex);
+        let mut position = record(29, 40);
+        put_ref(&mut position, 2, 22);
+        put_ref(&mut position, 10, 21);
+        put_vec3(&mut position, 16, [0.04, 0.05, 0.06]);
+        stream.extend(position);
+        crate::test_support::with_decode_context(|_ctx| {
+            let graph = Graph::parse(&stream);
+            let witness = graph.unique_curve_edge_witness(9);
+            assert_eq!(
+                witness.map(|w| w.endpoints[1].get()),
+                expected_end,
+                "partner={partner}, point={point}"
+            );
+            if let Some(witness) = witness {
+                assert_eq!(witness.endpoints[0].get(), Point3::new(10.0, 20.0, 30.0));
+            }
+        });
+    }
+}

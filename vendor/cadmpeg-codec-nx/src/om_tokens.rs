@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Literals used by the NX object-model decoder.
+
+use crate::om::ExpressionUnit;
+
+/// Root OM entity marker.
+pub(crate) const ROOT_MARKER: &[u8] = b"\x04\x01\x0eNX ";
+/// Section marker required before numeric expressions are decoded.
+pub(crate) const HOST_GLOBALS: &[u8] = b"hostglobalvariables";
+/// Registered class-definition name prefix.
+pub(crate) const CLASS_NAME_PREFIX: &[u8] = b"UGS::";
+/// Numeric-expression payload prefix.
+pub(crate) const NUMBER_PREFIX: &[u8] = b"(Number [";
+
+/// Resolve a numeric-expression unit token.
+#[must_use]
+pub(crate) fn unit_for(token: &str) -> Option<ExpressionUnit> {
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return None;
+    }
+    Some(match token {
+        "mm" => ExpressionUnit::Millimeter,
+        "in" => ExpressionUnit::Inch,
+        "degrees" => ExpressionUnit::Degree,
+        token => ExpressionUnit::Native(token.to_string()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unit_for;
+    use crate::om::ExpressionUnit;
+
+    #[test]
+    fn resolves_known_and_native_units() {
+        assert_eq!(unit_for("mm"), Some(ExpressionUnit::Millimeter));
+        assert_eq!(unit_for("in"), Some(ExpressionUnit::Inch));
+        assert_eq!(unit_for("degrees"), Some(ExpressionUnit::Degree));
+        assert_eq!(
+            unit_for("custom/unit"),
+            Some(ExpressionUnit::Native("custom/unit".into()))
+        );
+        assert_eq!(unit_for(""), None);
+        assert_eq!(unit_for("custom unit"), None);
+    }
+}

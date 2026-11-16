@@ -1,0 +1,31 @@
+{
+  "en": {
+    "ui.dim3.angle": "Angle between lines",
+    "ui.dim3.apply": "Apply",
+    "ui.dim3.axes_note": "Signed B minus A offsets use the stored world or owning-component axes, never the camera axes.",
+    "ui.dim3.degrees": "Angle (degrees)",
+    "ui.dim3.dof": "3D degrees of freedom",
+    "ui.dim3.edit": "Edit",
+    "ui.dim3.fix": "Fix point / curve",
+    "ui.dim3.fixed": "Fixed",
+    "ui.dim3.freedom_note": "Free axes show coordinate components that can still move, possibly together with other points. Viewport arrows show local allowed directions; these are not independent axis locks.",
+    "ui.dim3.help": "Pick a line for its length, an arc for radius, or two points for distance. Choose Angle and pick two lines. Dimensions remain driving when geometry moves.",
+    "ui.dim3.kind": "Dimension",
+    "ui.dim3.length": "Length / distance",
+    "ui.dim3.mm": "Value (mm)",
+    "ui.dim3.new": "New dimension",
+    "ui.dim3.number": "Enter a finite numeric value.",
+    "ui.dim3.pick_a": "Pick A",
+    "ui.dim3.pick_b": "Pick B",
+    "ui.dim3.radius": "Arc radius",
+    "ui.dim3.remove": "Remove",
+    "ui.dim3.report": "Show remaining freedom",
+    "ui.dim3.saved": "Saved 3D constraints",
+    "ui.dim3.title": "3D Dimensions",
+    "ui.dim3.unknown": "Unknown",
+    "ui.dim3.update": "Update dimension",
+    "ui.dim3.x": "X offset",
+    "ui.dim3.y": "Y offset",
+    "ui.dim3.z": "Z offset"
+  }
+}

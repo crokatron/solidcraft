@@ -23,6 +23,9 @@ use crate::schema::inspect::{
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
 
+const GEOMETRY_SNAP_CONTRACT: TypedContract<crate::schema::inspect::GeometrySnapParams> = TypedContract::new();
+const GEOMETRY_INTERSECTION_CONTRACT: TypedContract<crate::schema::inspect::GeometryIntersectionParams> = TypedContract::new();
+const COORDINATE_FRAMES_CONTRACT: TypedContract<crate::schema::inspect::CoordinateFramesParams> = TypedContract::new();
 const BODY_LIST_CONTRACT: TypedContract<BodyListParams> = TypedContract::new();
 const THREADS_CONTRACT: TypedContract<ModelThreadsParams> = TypedContract::new();
 const BODY_FEATURES_CONTRACT: TypedContract<BodyFeaturesParams> = TypedContract::new();
@@ -53,7 +56,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .contract(&MEASURE_CONTRACT)
         .output(output_schema_for::<MeasureResult>)
-        .params("bodies?: [names] (default all); names_only?: bool (each world body's name and its definition's, nothing measured) → closed per body; volume_mm3, center_of_mass, density_g_cm3 and mass_g only for closed, consistently oriented bodies; area, bbox and counts for all; total.open_bodies_skipped counts bodies excluded from volume/mass totals; or items: [1-2 selections] (face/edge: type, body, and point on it or index from model.faces/model.edges, or both) → length/area/volume; a face's perimeter_mm, with outer_perimeter_mm and inner_perimeter_mm on a flat face with holes; diameter, radius, circumference or arc_length/angle_deg of circles, arcs and cylinders; slot sizes; min (distance_mm, from, to), max, center_distance (centre to centre, or from an axis) and angle"),
+        .params("bodies?: [names] (default all); names_only?: bool (each world body's name and its definition's, nothing measured) â†’ closed per body; volume_mm3, center_of_mass, density_g_cm3 and mass_g only for closed, consistently oriented bodies; area, bbox and counts for all; total.open_bodies_skipped counts bodies excluded from volume/mass totals; or items: [1-2 selections] (face/edge: type, body, and point on it or index from model.faces/model.edges, or both) â†’ length/area/volume; a face's perimeter_mm, with outer_perimeter_mm and inner_perimeter_mm on a flat face with holes; diameter, radius, circumference or arc_length/angle_deg of circles, arcs and cylinders; slot sizes; min (distance_mm, from, to), max, center_distance (centre to centre, or from an axis) and angle"),
     CommandSpec::new("document.inspect", "Inspect Design", crate::checked!("document.inspect", inspect))
         .icon("inspect")
         .noundo()
@@ -65,7 +68,7 @@ pub static COMMANDS: &[CommandSpec] = &[
              bodies?: true (default) | \"names\" (only the body names, nothing measured) | false (left out)",
         ),
     CommandSpec::new("document.revision", "Design Revision", revision).icon("inspect").noundo().params(
-        "→ document_id (this open design's id: kept while it stays open, another for each design started or opened), \
+        "â†’ document_id (this open design's id: kept while it stays open, another for each design started or opened), \
          revision (moves whenever the design, what is hidden or a component's uncaptured position changes, \
          never on a selection or a view; from one counter for the whole run, so it never repeats). Read-only",
     ),
@@ -76,6 +79,18 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&SKETCH_INSPECT_CONTRACT)
         .output(output_schema_for::<SketchInspected>)
         .params("sketch?: id|name (default active)"),
+    CommandSpec::new("model.geometry_snap", "Snap Move Handles", crate::checked!("model.geometry_snap", geometry_snap))
+        .icon("inspect").noundo().contract(&GEOMETRY_SNAP_CONTRACT)
+        .output(output_schema_for::<crate::geometry_snap::GeometrySnap>)
+        .params("Read-only exact BRep snap: pick {body,kind:vertex|edge|face,index?,point:[x,y,z]}, mode:point|midpoint|center. World coordinates include pending placements. Midpoint is half arc length on the exact curve; center requires a circular edge."),
+    CommandSpec::new("model.geometry_intersection", "Intersect Move References", crate::checked!("model.geometry_intersection", geometry_intersection))
+        .icon("inspect").noundo().contract(&GEOMETRY_INTERSECTION_CONTRACT)
+        .output(output_schema_for::<crate::geometry_snap::GeometrySnap>)
+        .params("Read-only exact extended-line intersection: a,b are edge picks {body,kind:edge,index,point:[x,y,z]}. Rejects parallel, skew and curved edges."),
+    CommandSpec::new("model.coordinate_frames", "List Coordinate Systems", crate::checked!("model.coordinate_frames", coordinate_frames))
+        .icon("inspect").noundo().contract(&COORDINATE_FRAMES_CONTRACT)
+        .output(output_schema_for::<crate::schema::inspect::CoordinateFramesResult>)
+        .params("Read-only: world, component occurrence origins, named joint origins and evaluated construction-plane CSYS entries. Each has a stable key, label and column-major world matrix including pending placements. Matrices are snapshots, not assembly constraints."),
     CommandSpec::new("model.edges", "List Edges", crate::checked!("model.edges", model_edges))
         .icon("inspect")
         .noundo()
@@ -88,7 +103,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&BODY_LIST_CONTRACT)
         .output(output_schema_for::<ModelFaces>)
         .params(
-        "body: name → per face: index, name (what face.delete, sheet.convert `face`, solid.shell … take in place of a point), exact, area, centroid (not always on the face), \
+        "body: name â†’ per face: index, name (what face.delete, sheet.convert `face`, solid.shell â€¦ take in place of a point), exact, area, centroid (not always on the face), \
          plane_normal, point (a point on the face that picks it), cylinder? ({origin, axis, radius} of a cylindrical face), \
          sheet_face? (a folded sheet's face: `sheet:<body>:<panel>:<side>`, panel base or a flange's tag F<feature>.<k>, side top | bottom | rim.<edge> | bend.inner | bend.outer; \
          taken wherever a face name is, and it holds while sizes change and flanges come and go)",
@@ -104,7 +119,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&BODY_FEATURES_CONTRACT)
         .output(output_schema_for::<ModelBodyFeatures>)
         .params(
-            "body?: name (a placed copy's name means the body it shows; default every body) → bodies: [{body, features: [{id, name}]}], \
+            "body?: name (a placed copy's name means the body it shows; default every body) â†’ bodies: [{body, features: [{id, name}]}], \
              in timeline order the feature that created each body, every later one that changed it, and those of bodies consumed into it. Read-only",
         ),
     CommandSpec::new("material.assign", "Physical Material", crate::checked!("material.assign", physical_material))
@@ -112,7 +127,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("material")
         .contract(&MATERIAL_ASSIGN_CONTRACT)
         .output(output_schema_for::<MaterialAssignResult>)
-        .params("bodies: [names]; material: name (Steel, Aluminum, ABS Plastic, …, or one made with material.create; `material.list`)"),
+        .params("bodies: [names]; material: name (Steel, Aluminum, ABS Plastic, â€¦, or one made with material.create; `material.list`)"),
     CommandSpec::new("appearance.assign", "Appearance", crate::checked!("appearance.assign", appearance))
         .at("SOLID", "MODIFY")
         .icon("appearance")
@@ -121,7 +136,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .output(crate::schema::output_schema_for::<AppearanceAssignResult>)
         .params(
         "bodies?: [names]; faces?: [[x,y,z] on faces] (body?: which body, default the nearest); components?: [names or ids, or occurrence names]; \
-             appearance?: library name or stable starter.* ID (appearance.library) | color: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1, default 1); \
+             appearance?: library name or stable starter.* ID (appearance.library) | color: \"#rrggbb\" or [r, g, b] (0â€“255), opacity? (0â€“1, default 1); \
              name?: inert copied look label (requires color, mutually exclusive with appearance); pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (requires color/appearance and opacity 1); a starter ID or registered starter name resolves its recipe before color overrides; omitted pbr retains that response and pbr: null explicitly clears it. Unavailable glass recipes refuse through either selector. Other custom labels with an explicit color retain legacy scalar behavior. Neither appearance nor color (or color: null): clear, so the face follows its body, the body its component, the component its material",
     ),
     CommandSpec::new("appearance.copy", "Copy Look", appearance_gestures::copy).icon("copy").noundo().key("Ctrl+Alt+C")
@@ -129,7 +144,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("appearance.paste", "Paste Look", appearance_gestures::paste).icon("paste").key("Ctrl+Alt+V")
         .params("bodies/faces/components: appearance.assign targets. Applies the copied look atomically in one undo step; no dialogs."),
     CommandSpec::new("appearance.favorite", "Favorite Look", appearance_gestures::favorite).icon("star").noundo().doc_only()
-        .params("look: appearance.assign look; favorite: bool → validated look and preference request; UI library preference only, no document change or dialogs."),
+        .params("look: appearance.assign look; favorite: bool â†’ validated look and preference request; UI library preference only, no document change or dialogs."),
     CommandSpec::new("appearance.chain", "Appearance Chain", appearance_chain::chain).icon("inspect").noundo().params(
         "target: {body: name} | {body: name, face: zero-based model.faces index} | {component: name or id}; a placed copy's name (`KB (K:2)`, `K:2`) means the body or component it shows. Returns steps [{step: face|body|component|material, look: {name,color,opacity,pbr?} or null}] in precedence order and active (step or null). Component material is the common default look of its directly owned bodies, null if mixed/empty. Imported paint is a display fallback outside the four steps. Read-only; no dialogs",
     ),
@@ -141,20 +156,20 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .contract(&LIBRARY_CONTRACT)
         .output(crate::schema::output_schema_for::<AppearanceLibraryResult>)
-        .params("→ 20 legacy scalar appearances, six opaque PBR finishes and 40 starter recipes with IDs, categories, provenance, requirements and availability; six starter glass recipes are unavailable"),
+        .params("â†’ 20 legacy scalar appearances, six opaque PBR finishes and 40 starter recipes with IDs, categories, provenance, requirements and availability; six starter glass recipes are unavailable"),
     CommandSpec::new("appearance.list", "List Appearances", crate::checked!("appearance.list", appearance_list))
         .icon("list")
         .noundo()
         .contract(&LIST_CONTRACT)
         .output(crate::schema::output_schema_for::<AppearanceListResult>)
-        .params("body?: name (or a placed copy's, `KB (K:2)`: the body it shows) → assigned appearances; with body, its resolved look and its faces' (face index, look)"),
+        .params("body?: name (or a placed copy's, `KB (K:2)`: the body it shows) â†’ assigned appearances; with body, its resolved look and its faces' (face index, look)"),
     CommandSpec::new("material.list", "List Materials", crate::checked!("material.list", material_list))
         .icon("list")
         .noundo()
         .doc_only()
         .contract(&MATERIAL_LIST_CONTRACT)
         .output(output_schema_for::<MaterialListResult>)
-        .params("→ built-in and design-owned materials (user: true, look, optional physical_card/physical_validation/density_comparison). Read-only; candidate engineering records do not certify sources or supply a solver"),
+        .params("â†’ built-in and design-owned materials (user: true, look, optional physical_card/physical_validation/density_comparison). Read-only; candidate engineering records do not certify sources or supply a solver"),
     CommandSpec::new("engine.commands", "List Commands", crate::checked!("engine.commands", commands))
         .icon("list")
         .noundo()
@@ -468,17 +483,21 @@ fn sketch_json(s: &Session, world: &solidcraft_doc::ModelState, id: u64) -> Opti
             }),
         })
         .collect();
+    let spatial = super::sketch_store::read(&s.doc,id).unwrap_or(sk).wire_freedom();
     Some(SketchInspected {
         id,
         name: ss.name.clone(),
         plane: serde_json::to_value(ss.plane).unwrap_or_default(),
         status: ss.report.status.into(),
         dof: ss.report.dof,
-        fully_constrained: ss.report.fully_constrained(),
+        fully_constrained: ss.report.fully_constrained() && spatial.dof == Some(0),
         failing: ss.report.failing.clone(),
         curves,
         points,
         constraints,
+        wire_constraints: sk.wire_constraints.iter().filter_map(|c| serde_json::to_value(c).ok()).collect(),
+        spatial_dof: spatial.dof,
+        spatial_freedom: serde_json::to_value(spatial).unwrap_or_default(),
         profiles,
         profiles_3d,
         links: serde_json::to_value(&sk.links).unwrap_or_default(),
@@ -647,7 +666,7 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
             if with_counts {
                 v.plane = Some(serde_json::to_value(ss.plane).unwrap_or_default());
                 v.points = Some(ss.sketch.points.len());
-                v.constraints = Some(ss.sketch.constraints.len());
+                v.constraints = Some(ss.sketch.constraints.len() + ss.sketch.wire_constraints.len());
             }
             v
         })
@@ -790,7 +809,7 @@ fn physical_material(s: &mut Session, p: &Value) -> Result<Value> {
     typed_reply(cmd, MaterialAssignResult { bodies, material: canonical, param_warnings: Vec::new() })
 }
 
-/// A colour parameter: `"#rrggbb"` or `[r, g, b]` (0–255).
+/// A colour parameter: `"#rrggbb"` or `[r, g, b]` (0â€“255).
 pub(crate) fn color_param(v: &Value) -> Option<[u8; 3]> {
     if let Some(t) = v.as_str() {
         let h = t.trim().trim_start_matches('#');
@@ -949,7 +968,7 @@ pub(super) fn appearance_look(cmd: &str, p: &Value) -> Result<Option<solidcraft_
         match (str_(p, "appearance"), p.get("color")) {
             // A colour with a name: that colour, called that (a name not in the library is fine).
             (Some(n), Some(v)) if !v.is_null() => {
-                let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0–255"))?;
+                let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0â€“255"))?;
                 let o = p.get("opacity").and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(1.0);
                 let mut l = Look::custom(c, o);
                 l.name = n.chars().take(128).collect();
@@ -968,9 +987,9 @@ pub(super) fn appearance_look(cmd: &str, p: &Value) -> Result<Option<solidcraft_
             }
             (None, None | Some(Value::Null)) => None,
             (None, Some(v)) => {
-                let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0–255"))?;
+                let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0â€“255"))?;
                 let o = match p.get("opacity") {
-                    Some(o) => o.as_f64().filter(|x| x.is_finite() && (0.0..=1.0).contains(x)).ok_or_else(|| bad(cmd, "`opacity` must be 0…1"))?,
+                    Some(o) => o.as_f64().filter(|x| x.is_finite() && (0.0..=1.0).contains(x)).ok_or_else(|| bad(cmd, "`opacity` must be 0â€¦1"))?,
                     None => 1.0,
                 };
                 Some(Look::custom(c, o))
@@ -1159,4 +1178,17 @@ fn colored_components(s: &mut Session, p: &Value) -> Result<Value> {
         s.colored_components = None;
     }
     Ok(json!({"enabled": enabled}))
+}
+
+fn coordinate_frames(s: &mut Session, _p: &Value) -> Result<Value> {
+    reply("model.coordinate_frames", crate::schema::inspect::CoordinateFramesResult { frames:s.coordinate_frames(),param_warnings:Vec::new() })
+}
+
+fn geometry_snap(s:&mut Session,p:&Value)->Result<Value>{
+ let p:crate::schema::inspect::GeometrySnapParams=serde_json::from_value(p.clone()).map_err(|e|bad("model.geometry_snap",e.to_string()))?;
+ reply("model.geometry_snap",s.geometry_snap(&p.pick,p.mode)?)
+}
+fn geometry_intersection(s:&mut Session,p:&Value)->Result<Value>{
+ let p:crate::schema::inspect::GeometryIntersectionParams=serde_json::from_value(p.clone()).map_err(|e|bad("model.geometry_intersection",e.to_string()))?;
+ reply("model.geometry_intersection",s.geometry_intersection(&p.a,&p.b)?)
 }

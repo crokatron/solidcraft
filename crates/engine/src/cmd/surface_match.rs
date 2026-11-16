@@ -15,6 +15,33 @@ use crate::schema::surface_match::MatchSurfaceParams;
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{Result, Session};
 
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct MatchResult {
+    #[serde(flatten)]
+    feature: FeatureResult,
+    match_report: Option<String>,
+    continuity: Option<ContinuityReport>,
+}
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct ContinuityReport {
+    requested_order: String,
+    construction: String,
+    seam_gap_bound_mm: f64,
+    first_jet_bound: f64,
+    second_jet_bound: f64,
+    max_gap_mm: f64,
+    max_normal_angle_deg: f64,
+    max_curvature_jump_per_mm: f64,
+    samples: usize,
+    control_points_u: usize,
+    control_points_v: usize,
+    boundary_loops: usize,
+    boundary_edges: usize,
+    source_displacement_bound_mm: f64,
+    regularity_verified: bool,
+}
 const CONTRACT: TypedContract<MatchSurfaceParams> = TypedContract::new();
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -22,9 +49,9 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SURFACE", "MODIFY")
         .icon("continuity")
         .contract(&CONTRACT)
-        .output(output_schema_for::<FeatureResult>)
+        .output(output_schema_for::<MatchResult>)
         .params(
-            "body: surface name (the body whose face is rebuilt); faces?: [[x,y,z]] (points on that face, default: the body's first); target: body name (the body the seam must meet); edges: [[x,y,z]] (points on one edge chain of the target: the rebuilt boundary takes its place); order?: g1|g2|g3 (default g2: position and tangent plane, the curvature too, or how that curvature changes along the seam). The far boundary stays where it was and the body keeps its name",
+            "body: surface name (the body whose face is rebuilt); faces?: [[x,y,z]] (points on that face, default: the body's first); target: body name (the body the seam must meet); edges: [[x,y,z]] (points on one edge chain of the target: the rebuilt boundary takes its place); source_edges?: one picked source trim edge enables bounded polynomial matching; order?: g0|g1|g2 for bounded matching, g1|g2|g3 for legacy matching (default g2). cross_scale?: positive scale up to 100 (default 1), reverse_target?: bool (default true). Bounded matching preserves trim loops and the opposite limiting line; other boundaries may reshape. Reports seam measurements and a source movement bound. The target stays fixed and the source body keeps its name",
         ),
 ];
 
@@ -50,11 +77,34 @@ fn match_surface(s: &mut Session, p: &Value) -> Result<Value> {
     if edges.is_empty() || edges.len() > 10_000 {
         return Err(bad(cmd, "`edges` must list 1 to 10000 points on the target's edge chain"));
     }
+    if body == target {
+        return Err(bad(cmd, "Choose a different fixed neighbour."));
+    }
+    let source_edges: Vec<solidcore_record::Vec3> =
+        p.get("source_edges").and_then(Value::as_array).map(|items| items.iter().filter_map(vec3).collect()).unwrap_or_default();
+    let cross_scale = p.get("cross_scale").and_then(Value::as_f64).unwrap_or(1.);
+    let reverse_target = p.get("reverse_target").and_then(Value::as_bool).unwrap_or(true);
+    if !cross_scale.is_finite() || cross_scale <= 0. || cross_scale > 100. {
+        return Err(bad(cmd, "Cross-boundary scale must be positive and at most 100."));
+    }
+    if !source_edges.is_empty() && (source_edges.len() != 1 || edges.len() != 1) {
+        return Err(bad(cmd, "Bounded matching needs one source boundary edge and one fixed neighbour edge."));
+    }
     let order = match p.get("order") {
         None => Continuity::G2,
+        Some(v) if v.as_str().is_some_and(|v| v.eq_ignore_ascii_case("g0")) && !source_edges.is_empty() => Continuity::G0,
         Some(v) => crate::params::continuity(cmd, Some(v), "`order`", Construction::Match)?,
     };
-    add_feature(
+    let report = if source_edges.is_empty() {
+        None
+    } else {
+        let world = s.world_state()?;
+        let source = world.body(&body).ok_or_else(|| bad(cmd, "Moving surface is missing."))?;
+        let fixed = world.body(&target).ok_or_else(|| bad(cmd, "Fixed neighbour is missing."))?;
+        let (_, report) = solidcraft_kernel::matched_trimmed(&source.body, &source_edges, &fixed.body, &edges, order, cross_scale, reverse_target)?;
+        Some(serde_json::to_value(report).map_err(|e| bad(cmd, e.to_string()))?)
+    };
+    let mut result = add_feature(
         s,
         p,
         FeatureKind::SurfaceMatch {
@@ -63,8 +113,18 @@ fn match_surface(s: &mut Session, p: &Value) -> Result<Value> {
             target: BodyName::from(target),
             edges: edges.into_iter().map(Position).collect(),
             order,
+            source_edges: source_edges.into_iter().map(Position).collect(),
+            cross_scale,
+            reverse_target,
         },
-    )
+    )?;
+    if let Some(report) = report {
+        result["continuity"] = report;
+        result["match_report"] = serde_json::json!(
+            "Matched the chosen boundary to the fixed neighbour. The opposite limiting line stays fixed; other boundaries may reshape. Review surface flow and scan deviation before continuing."
+        );
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

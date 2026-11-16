@@ -1,0 +1,1161 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::native::attach::attach_current_feature_states;
+use crate::native::attach::attach_sketch_graph;
+use crate::native::attach::body_selection::boolean_target_output;
+use crate::native::attach::extrude_boolean_op;
+use crate::native::attach::extrude_feature_definition;
+use crate::native::attach::feature_projection::blind_hole_operations;
+use crate::native::attach::feature_projection::expressions_by_id;
+use crate::native::attach::feature_projection::hole_package_projection;
+use crate::native::attach::feature_projection::native_feature_parameters;
+use crate::native::attach::feature_projection::non_boolean_feature_definition_with_parameters;
+use crate::native::attach::feature_projection::simple_hole_operations;
+use crate::native::attach::feature_projection::HolePackageSources;
+use crate::native::attach::feature_projection::HoleProjection;
+use crate::native::attach::native_result_body_identity;
+use crate::native::attach::resolve_rm_source_color_bindings;
+use crate::native::attach::AnnotationBuilder;
+use crate::native::attach::BodyId;
+use crate::native::attach::CadIr;
+use crate::native::attach::Feature;
+use crate::native::attach::FeatureDefinition;
+use crate::native::attach::FeatureId;
+use crate::native::attach::FeatureOperation;
+use crate::native::attach::FeatureTreeNodeRole;
+use crate::native::attach::RmSourceColorBinding;
+use crate::native::attach::SketchGeometryDefinition;
+use crate::native::attach::SketchSources;
+use crate::native::history::active_feature_closure;
+use crate::native::history::BodyWriterHistory;
+use cadmpeg_ir::annotations::StreamHandle;
+use std::collections::BTreeMap;
+
+use crate::native::om::display_color::{
+    DisplayColorFrame, RmDisplayColorAssignment, RmDisplayColorAssignmentEncoding,
+};
+use crate::om::column_row::TargetRow;
+use crate::om::compact::CompactIndexAtom;
+
+#[test]
+fn rm_source_color_bindings_require_one_palette_per_source_identity() {
+    let assignment = |id: &str, source_id: Option<&str>, color_definition: &str, offset: u64| {
+        RmDisplayColorAssignment {
+            id: id.into(),
+            ordinal: 0,
+            frame: DisplayColorFrame::new(
+                RmDisplayColorAssignmentEncoding::Target(
+                    TargetRow::<(), u64>::new(
+                        CompactIndexAtom::read(&[7]).unwrap().into(),
+                        [1, 2, 3].map(|value| CompactIndexAtom::read(&[value]).unwrap().into()),
+                        crate::om::discriminators::IndexRowMode::Form04,
+                        offset + 2,
+                    )
+                    .unwrap(),
+                ),
+                crate::om::color::PaletteIndex::new(201).unwrap(),
+            )
+            .unwrap(),
+            target_object_id: source_id.map(str::to_owned),
+            color_definition: color_definition.into(),
+            source_entry: "/Root/FastLoad/RMFastLoad".into(),
+        }
+    };
+    let assignments = [
+        assignment("assignment-b", Some("source-a"), "color-a", 20),
+        assignment("assignment-a", Some("source-a"), "color-a", 10),
+        assignment("assignment-c", Some("source-b"), "color-a", 30),
+        assignment("assignment-d", Some("source-c"), "color-a", 40),
+        assignment("assignment-e", Some("source-c"), "color-b", 50),
+        assignment("assignment-f", None, "color-a", 60),
+    ];
+    assert_eq!(
+        resolve_rm_source_color_bindings(&assignments),
+        vec![
+            RmSourceColorBinding {
+                source_id: "source-a".into(),
+                color_definition: "color-a".into(),
+                source_offset: 10,
+            },
+            RmSourceColorBinding {
+                source_id: "source-b".into(),
+                color_definition: "color-a".into(),
+                source_offset: 30,
+            },
+        ]
+    );
+}
+#[test]
+fn ungrouped_simple_holes_follow_authoritative_history_order() {
+    use crate::native::features::holes::FeatureSimpleHoleConstructionGroup;
+    use crate::native::features::holes::FeatureSimpleHoleTemplate;
+    use crate::native::features::holes::SimpleHoleEndTreatment;
+    use crate::native::features::holes::SimpleHoleExtent;
+    use crate::native::features::holes::SimpleHoleFamily;
+    use crate::native::features::holes::SimpleHoleForm;
+
+    let template = |operation_label: &str| FeatureSimpleHoleTemplate {
+        id: format!("template-{operation_label}"),
+        operation_label: operation_label.to_string(),
+        payload_string: format!("payload-{operation_label}"),
+        family: SimpleHoleFamily::GeneralHole,
+        form: SimpleHoleForm::Simple,
+        extent: SimpleHoleExtent::Through,
+        start_treatment: SimpleHoleEndTreatment::Chamfer,
+        end_treatment: SimpleHoleEndTreatment::Chamfer,
+    };
+    let templates = vec![template("operation#newer"), template("operation#older")];
+    let operation_positions =
+        BTreeMap::from([("operation#older", 0usize), ("operation#newer", 1usize)]);
+    assert_eq!(
+        simple_hole_operations(&templates, &[], &operation_positions),
+        Some(vec!["operation#older".into(), "operation#newer".into()])
+    );
+
+    let unordered_group = FeatureSimpleHoleConstructionGroup {
+        id: "group".into(),
+        first_data_blocks: ["a".into(), "b".into()],
+        second_data_blocks: ["c".into(), "d".into()],
+        members: crate::native::features::holes::SimpleHoleConstructionMembers::new(vec![
+            crate::native::features::holes::FeatureSimpleHoleConstructionMember {
+                operation_label: "operation#newer".into(),
+                scalar_lane: "lane-newer".into(),
+                block_reference: "blocks-newer".into(),
+            },
+            crate::native::features::holes::FeatureSimpleHoleConstructionMember {
+                operation_label: "operation#older".into(),
+                scalar_lane: "lane-older".into(),
+                block_reference: "blocks-older".into(),
+            },
+        ])
+        .unwrap(),
+    };
+    assert!(simple_hole_operations(&templates, &[unordered_group], &operation_positions).is_none());
+
+    let mut blind_template = template("operation#blind");
+    blind_template.extent = SimpleHoleExtent::Blind;
+    blind_template.start_treatment = SimpleHoleEndTreatment::None;
+    blind_template.end_treatment = SimpleHoleEndTreatment::None;
+    let mixed_templates = vec![
+        templates[0].clone(),
+        blind_template.clone(),
+        templates[1].clone(),
+    ];
+    let mixed_positions = BTreeMap::from([
+        ("operation#older", 0usize),
+        ("operation#newer", 1usize),
+        ("operation#blind", 2usize),
+    ]);
+    assert_eq!(
+        simple_hole_operations(&mixed_templates, &[], &mixed_positions),
+        Some(vec!["operation#older".into(), "operation#newer".into()])
+    );
+    assert_eq!(
+        blind_hole_operations(&mixed_templates, &mixed_positions),
+        Some(vec!["operation#blind".into()])
+    );
+    let duplicate_members =
+        crate::native::features::holes::SimpleHoleConstructionMembers::new(vec![
+            crate::native::features::holes::FeatureSimpleHoleConstructionMember {
+                operation_label: "operation#older".into(),
+                scalar_lane: "lane-a".into(),
+                block_reference: "refs-a".into(),
+            },
+            crate::native::features::holes::FeatureSimpleHoleConstructionMember {
+                operation_label: "operation#newer".into(),
+                scalar_lane: "lane-b".into(),
+                block_reference: "refs-b".into(),
+            },
+            crate::native::features::holes::FeatureSimpleHoleConstructionMember {
+                operation_label: "operation#older".into(),
+                scalar_lane: "lane-a".into(),
+                block_reference: "refs-a".into(),
+            },
+        ]);
+    assert!(duplicate_members.is_err());
+}
+
+#[test]
+fn exact_hole_package_owns_common_internal_simple_holes() {
+    use crate::native::features::holes::FeatureHolePackageConstructionGroupUse;
+    use crate::native::features::holes::FeatureSimpleHoleConstructionGroup;
+    use crate::native::features::holes::FeatureSimpleHoleTemplate;
+    use crate::native::features::holes::SimpleHoleEndTreatment;
+    use crate::native::features::holes::SimpleHoleExtent;
+    use crate::native::features::holes::SimpleHoleFamily;
+    use crate::native::features::holes::SimpleHoleForm;
+    use cadmpeg_ir::ids::BodyId;
+    use cadmpeg_ir::{features::holes::HoleKind, scalar::Length};
+
+    let operations = ["simple-a".to_string(), "simple-b".to_string()];
+    let templates = operations
+        .iter()
+        .map(|operation| FeatureSimpleHoleTemplate {
+            id: format!("template-{operation}"),
+            operation_label: operation.clone(),
+            payload_string: format!("string-{operation}"),
+            family: SimpleHoleFamily::GeneralHole,
+            form: SimpleHoleForm::Simple,
+            extent: SimpleHoleExtent::Through,
+            start_treatment: SimpleHoleEndTreatment::Chamfer,
+            end_treatment: SimpleHoleEndTreatment::Chamfer,
+        })
+        .collect::<Vec<_>>();
+    let group = FeatureSimpleHoleConstructionGroup {
+        id: "group".into(),
+        first_data_blocks: ["a".into(), "b".into()],
+        second_data_blocks: ["c".into(), "d".into()],
+        members: crate::native::features::holes::SimpleHoleConstructionMembers::new(vec![
+            crate::native::features::holes::FeatureSimpleHoleConstructionMember {
+                operation_label: operations[0].clone(),
+                scalar_lane: "lane-a".into(),
+                block_reference: "blocks-a".into(),
+            },
+            crate::native::features::holes::FeatureSimpleHoleConstructionMember {
+                operation_label: operations[1].clone(),
+                scalar_lane: "lane-b".into(),
+                block_reference: "blocks-b".into(),
+            },
+        ])
+        .unwrap(),
+    };
+    let use_ = FeatureHolePackageConstructionGroupUse {
+        id: "use".into(),
+        operation_label: "package".into(),
+        construction_group_lane: "package-lane".into(),
+        simple_hole_construction_group: group.id.clone(),
+        source_offset: 0,
+    };
+    let body = BodyId::mint("test:model:entity#body").expect("identity grammar");
+    let outputs = operations
+        .iter()
+        .map(|operation| (operation.clone(), vec![body.clone()]))
+        .collect();
+    let diameters = operations
+        .iter()
+        .map(|operation| (operation.clone(), Length::new(5.1).unwrap()))
+        .collect();
+    let chamfer = HoleKind::Chamfer {
+        diameter: cadmpeg_ir::scalar::PositiveLength::new(7.1).unwrap(),
+        angle: cadmpeg_ir::scalar::InteriorAngle::new(std::f64::consts::FRAC_PI_2).unwrap(),
+    };
+    let chamfers = operations
+        .iter()
+        .map(|operation| (operation.clone(), chamfer))
+        .collect();
+
+    ({
+        let projection = hole_package_projection(
+            &cadmpeg_ir::document::CadIr::empty(),
+            &templates,
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&use_),
+            HolePackageSources {
+                outputs: &outputs,
+                diameters: &diameters,
+                chamfers: &chamfers,
+            },
+        );
+        assert_eq!(
+            projection.internal_operations,
+            operations.iter().cloned().collect()
+        );
+        assert_eq!(projection.outputs["package"], std::slice::from_ref(&body));
+        assert_eq!(projection.diameters["package"], Length::new(5.1).unwrap());
+        assert_eq!(projection.chamfers["package"], chamfer);
+
+        let untreated_templates = templates
+            .iter()
+            .cloned()
+            .map(|mut template| {
+                template.start_treatment = SimpleHoleEndTreatment::None;
+                template.end_treatment = SimpleHoleEndTreatment::None;
+                template
+            })
+            .collect::<Vec<_>>();
+        let projection = hole_package_projection(
+            &cadmpeg_ir::document::CadIr::empty(),
+            &untreated_templates,
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&use_),
+            HolePackageSources {
+                outputs: &outputs,
+                diameters: &diameters,
+                chamfers: &BTreeMap::new(),
+            },
+        );
+        assert_eq!(
+            projection.internal_operations,
+            operations.iter().cloned().collect()
+        );
+        assert_eq!(projection.outputs["package"], [body]);
+        assert_eq!(projection.diameters["package"], Length::new(5.1).unwrap());
+        assert!(!projection.chamfers.contains_key("package"));
+
+        let mut mixed_templates = untreated_templates.clone();
+        mixed_templates[0].start_treatment = SimpleHoleEndTreatment::Chamfer;
+        let projection = hole_package_projection(
+            &cadmpeg_ir::document::CadIr::empty(),
+            &mixed_templates,
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&use_),
+            HolePackageSources {
+                outputs: &outputs,
+                diameters: &diameters,
+                chamfers: &BTreeMap::new(),
+            },
+        );
+        assert!(projection.internal_operations.is_empty());
+        assert!(projection.outputs.is_empty());
+
+        let mut mismatched_outputs = outputs;
+        mismatched_outputs.insert(
+            "simple-b".into(),
+            vec![BodyId::mint("test:model:entity#other-body").expect("identity grammar")],
+        );
+        let projection = hole_package_projection(
+            &cadmpeg_ir::document::CadIr::empty(),
+            &templates,
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&use_),
+            HolePackageSources {
+                outputs: &mismatched_outputs,
+                diameters: &diameters,
+                chamfers: &chamfers,
+            },
+        );
+        assert!(projection.internal_operations.is_empty());
+        assert!(projection.outputs.is_empty());
+    });
+}
+
+#[test]
+fn hole_package_projection_counts_uses_and_templates_over_many_packages() {
+    use crate::native::features::holes::FeatureHolePackageConstructionGroupUse;
+    use crate::native::features::holes::FeatureSimpleHoleConstructionGroup;
+    use crate::native::features::holes::FeatureSimpleHoleConstructionMember;
+    use crate::native::features::holes::FeatureSimpleHoleTemplate;
+    use crate::native::features::holes::SimpleHoleConstructionMembers;
+    use crate::native::features::holes::SimpleHoleEndTreatment;
+    use crate::native::features::holes::SimpleHoleExtent;
+    use crate::native::features::holes::SimpleHoleFamily;
+    use crate::native::features::holes::SimpleHoleForm;
+    use cadmpeg_ir::scalar::Length;
+
+    let template = |operation_label: String| FeatureSimpleHoleTemplate {
+        id: format!("template-{operation_label}"),
+        payload_string: format!("string-{operation_label}"),
+        operation_label,
+        family: SimpleHoleFamily::GeneralHole,
+        form: SimpleHoleForm::Simple,
+        extent: SimpleHoleExtent::Through,
+        start_treatment: SimpleHoleEndTreatment::None,
+        end_treatment: SimpleHoleEndTreatment::None,
+    };
+    let package_use =
+        |operation_label: String, group: String| FeatureHolePackageConstructionGroupUse {
+            id: format!("use-{operation_label}-{group}"),
+            operation_label,
+            construction_group_lane: "package-lane".into(),
+            simple_hole_construction_group: group,
+            source_offset: 0,
+        };
+    let members = |package: usize| [format!("simple-{package}-a"), format!("simple-{package}-b")];
+    let body = BodyId::mint("test:model:entity#body").expect("identity grammar");
+    // A package is rejected when its label repeats (multiples of 13), its
+    // group is used twice (multiples of 17), or a member template repeats
+    // (multiples of 11).
+    let mut templates = Vec::new();
+    let mut groups = Vec::new();
+    let mut uses = Vec::new();
+    for package in 0..1024 {
+        let [first, second] = members(package);
+        templates.push(template(first.clone()));
+        templates.push(template(second.clone()));
+        if package.is_multiple_of(11) {
+            templates.push(template(first.clone()));
+        }
+        groups.push(FeatureSimpleHoleConstructionGroup {
+            id: format!("group-{package}"),
+            first_data_blocks: ["a".into(), "b".into()],
+            second_data_blocks: ["c".into(), "d".into()],
+            members: SimpleHoleConstructionMembers::new(
+                [first, second]
+                    .into_iter()
+                    .map(|operation_label| FeatureSimpleHoleConstructionMember {
+                        scalar_lane: format!("lane-{operation_label}"),
+                        block_reference: format!("blocks-{operation_label}"),
+                        operation_label,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        });
+        uses.push(package_use(
+            format!("package-{package}"),
+            format!("group-{package}"),
+        ));
+        if package.is_multiple_of(13) {
+            uses.push(package_use(
+                format!("package-{package}"),
+                format!("group-missing-{package}"),
+            ));
+        }
+        if package.is_multiple_of(17) {
+            uses.push(package_use(
+                format!("package-extra-{package}"),
+                format!("group-{package}"),
+            ));
+        }
+    }
+    let member_labels = (0..1024).flat_map(members).collect::<Vec<_>>();
+    let outputs = member_labels
+        .iter()
+        .map(|operation| (operation.clone(), vec![body.clone()]))
+        .collect();
+    let diameters = member_labels
+        .iter()
+        .map(|operation| (operation.clone(), Length::new(5.1).unwrap()))
+        .collect();
+
+    let projection = hole_package_projection(
+        &CadIr::empty(),
+        &templates,
+        &groups,
+        &uses,
+        HolePackageSources {
+            outputs: &outputs,
+            diameters: &diameters,
+            chamfers: &BTreeMap::new(),
+        },
+    );
+
+    let accepted = (0..1024)
+        .filter(|package: &usize| {
+            !package.is_multiple_of(13)
+                && !package.is_multiple_of(17)
+                && !package.is_multiple_of(11)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        projection.outputs.keys().cloned().collect::<Vec<_>>(),
+        accepted
+            .iter()
+            .map(|package| format!("package-{package}"))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        projection.internal_operations,
+        accepted.iter().copied().flat_map(members).collect()
+    );
+    assert!(projection.placements.is_empty());
+}
+
+#[test]
+fn current_body_writers_close_false_suppression_without_a_configuration() {
+    let body = BodyId::mint("test:model:entity#body").expect("identity grammar");
+    let feature = |id: &str, ordinal, dependencies: Vec<FeatureId>, outputs: Vec<BodyId>| Feature {
+        product_definition: None,
+        id: FeatureId::mint(id).expect("identity grammar"),
+        ordinal,
+        name: None,
+        suppressed: None,
+        dependencies: cadmpeg_ir::features::DistinctMembers::try_from(dependencies).unwrap(),
+        source_properties: BTreeMap::new(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::new(
+            FeatureDefinition::Operation(FeatureOperation::TreeNode {
+                role: FeatureTreeNodeRole::History,
+                children: cadmpeg_ir::features::TreeChildren::default(),
+            }),
+            cadmpeg_ir::features::DistinctMembers::try_from(outputs).unwrap(),
+        ),
+        native_ref: None,
+    };
+    let mut ir = CadIr::empty();
+    let mut body_record = cadmpeg_ir::examples::unit_cube()
+        .expect("unit cube fixture is admitted")
+        .model
+        .bodies
+        .remove(0);
+    body_record.id = body.clone();
+    ir.model.bodies.push(body_record);
+    ir.model.features = vec![
+        feature("synthetic:test:id#dependency", 1, Vec::new(), Vec::new()),
+        feature(
+            "synthetic:test:id#writer",
+            2,
+            vec![FeatureId::mint("synthetic:test:id#dependency").expect("identity grammar")],
+            vec![body],
+        ),
+        feature("synthetic:test:id#unrelated", 3, Vec::new(), Vec::new()),
+    ];
+    let mut annotations = AnnotationBuilder::new();
+
+    attach_current_feature_states(&mut ir, &mut annotations).expect("valid exactness fields");
+
+    assert_eq!(ir.model.features[0].suppressed, Some(false));
+    assert_eq!(ir.model.features[1].suppressed, Some(false));
+    assert_eq!(ir.model.features[2].suppressed, None);
+
+    ir.model.features[0].ordinal = 2;
+    assert!(active_feature_closure(
+        &ir,
+        &[BodyId::mint("test:model:entity#body").expect("identity grammar")]
+    )
+    .is_err());
+    ir.model.features[0].ordinal = 1;
+    ir.model.features[2].id =
+        FeatureId::mint("synthetic:test:id#writer").expect("identity grammar");
+    assert!(active_feature_closure(
+        &ir,
+        &[BodyId::mint("test:model:entity#body").expect("identity grammar")]
+    )
+    .is_err());
+    ir.model.features[2].id =
+        FeatureId::mint("synthetic:test:id#unrelated").expect("identity grammar");
+    ir.model.features[1].suppressed = Some(true);
+    assert!(active_feature_closure(
+        &ir,
+        &[BodyId::mint("test:model:entity#body").expect("identity grammar")]
+    )
+    .is_err());
+}
+
+#[test]
+fn native_sketch_groups_require_unique_exact_ownership_atomically() {
+    let label = crate::native::features::FeatureOperationLabel {
+        id: "nx:feature-history:operation-label#section-7".to_string(),
+        section_link: "section".to_string(),
+        ordinal: 7,
+        value: "SKETCH".to_string(),
+        objects: crate::om::header_references::HeaderReferences([None; 4]),
+        stable_identity: None,
+        source_offset: 40,
+    };
+    let group = crate::native::features::FeatureSketchPointGroup {
+        id: "point-group".to_string(),
+        operation_label: label.id.clone(),
+        name: "Point1".to_string(),
+        points: vec!["payload-point".to_string()],
+        coordinates: cadmpeg_ir::units::FiniteVector::new([12.5, -3.0])
+            .expect("finite coordinates"),
+    };
+    let point_use = crate::native::features::FeatureSketchPointUse {
+        id: "nx:feature-history:sketch-point-use#section-7-0".to_string(),
+        operation_label: label.id.clone(),
+        references: vec![crate::native::features::FeatureSketchPointUseReference {
+            sketch_reference: "reference".to_string(),
+            block_use: "block-use".to_string(),
+            source_offset: 52,
+        }],
+        sketch_point_group: group.id.clone(),
+        named_point: "named-point".to_string(),
+    };
+    let mut ir = CadIr::empty();
+    let mut annotations = AnnotationBuilder::new();
+    let stream = StreamHandle::new(cadmpeg_ir::stream_name!("nx:container"));
+
+    crate::test_support::with_decode_context(|_ctx| {
+        let sketch = attach_sketch_graph(
+            &mut ir.model.sketches,
+            &mut ir.model.sketch_entities,
+            &label,
+            &SketchSources {
+                point_uses: &[&point_use],
+                point_groups: std::slice::from_ref(&group),
+                points: &[],
+                payload_scalars: &[],
+                fixed_points: &[],
+                coordinate_pairs: &[],
+            },
+            &mut annotations,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(ir.model.sketches[0].id, sketch);
+        assert!(matches!(
+            ir.model.sketch_entities[0].geometry.definition(),
+            SketchGeometryDefinition::Native { native_kind }
+                if native_kind == "nx-point-group"
+        ));
+
+        let mut rejected_ir = CadIr::empty();
+        let mut rejected_annotations = AnnotationBuilder::new();
+        let rejected_stream = StreamHandle::new(cadmpeg_ir::stream_name!("nx:container"));
+        assert!(attach_sketch_graph(
+            &mut rejected_ir.model.sketches,
+            &mut rejected_ir.model.sketch_entities,
+            &label,
+            &SketchSources {
+                point_uses: &[&point_use, &point_use],
+                point_groups: &[group],
+                points: &[],
+                payload_scalars: &[],
+                fixed_points: &[],
+                coordinate_pairs: &[],
+            },
+            &mut rejected_annotations,
+            &rejected_stream,
+        )
+        .is_none());
+        assert!(rejected_ir.model.sketches.is_empty());
+        assert!(rejected_ir.model.sketch_entities.is_empty());
+    });
+}
+
+#[test]
+fn named_sketch_groups_retain_native_geometry_without_solved_axes() {
+    let label = crate::native::features::FeatureOperationLabel {
+        id: "nx:feature-history:operation-label#section-8".to_string(),
+        section_link: "section".to_string(),
+        ordinal: 8,
+        value: "SKETCH".to_string(),
+        objects: crate::om::header_references::HeaderReferences([None; 4]),
+        stable_identity: None,
+        source_offset: 40,
+    };
+    let point = crate::native::features::FeatureSketchPoint {
+        id: "point".to_string(),
+        operation_label: label.id.clone(),
+        named_record: "named-record".to_string(),
+        name: "Point1".to_string(),
+        scalar_fields: ["scalar-1".to_string(), "scalar-2".to_string()],
+        coordinates: cadmpeg_ir::units::FiniteVector::new([12.5, -3.0])
+            .expect("finite coordinates"),
+    };
+    let group = crate::native::features::FeatureSketchPointGroup {
+        id: "point-group".to_string(),
+        operation_label: label.id.clone(),
+        name: point.name.clone(),
+        points: vec![point.id.clone()],
+        coordinates: point.coordinates,
+    };
+    let scalar = |id: &str, ordinal: u32, value: f64, source_offset: u64| {
+        crate::native::features::FeaturePayloadScalar {
+            id: id.to_string(),
+            operation_label: label.id.clone(),
+            payload: crate::native::features::FeatureScalarPayload::Construction {
+                construction_payload: "payload".to_string(),
+            },
+            ordinal,
+            field_code: 100,
+            scalar: {
+                let mut raw = value.to_be_bytes();
+                raw[0] -= 0x10;
+                crate::om::scalar::ShiftedBinary64::try_from(raw).unwrap()
+            },
+            payload_offset: u64::from(ordinal),
+            source_offset,
+        }
+    };
+    let scalars = [
+        scalar("scalar-1", 0, 12.5, 51),
+        scalar("scalar-2", 1, -3.0, 59),
+    ];
+    let mut ir = CadIr::empty();
+    let mut annotations = AnnotationBuilder::new();
+    let stream = StreamHandle::new(cadmpeg_ir::stream_name!("nx:container"));
+
+    crate::test_support::with_decode_context(|_ctx| {
+        let sketch = attach_sketch_graph(
+            &mut ir.model.sketches,
+            &mut ir.model.sketch_entities,
+            &label,
+            &SketchSources {
+                point_uses: &[],
+                point_groups: std::slice::from_ref(&group),
+                points: std::slice::from_ref(&point),
+                payload_scalars: &scalars,
+                fixed_points: &[],
+                coordinate_pairs: &[],
+            },
+            &mut annotations,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(ir.model.sketches[0].id, sketch);
+        assert_eq!(ir.model.sketch_entities.len(), 1);
+        assert_eq!(
+            ir.model.sketch_entities[0].native_ref.as_deref(),
+            Some("point-group")
+        );
+        assert!(matches!(
+            ir.model.sketch_entities[0].geometry.definition(),
+            SketchGeometryDefinition::Native { native_kind }
+                if native_kind == "nx-point-group"
+        ));
+    });
+}
+
+#[test]
+fn nx_native_feature_parameters_require_unique_resolved_names() {
+    let expression = |id: &str, name: &str, text: &str| crate::native::om::ParameterFormula {
+        id: id.to_string(),
+        owner: None,
+        declaration: None,
+        name: crate::om::parameter_name::ParameterName::new(name.to_string()),
+        unit: crate::native::om::ExpressionUnit::Millimeter,
+        expression: text.to_string(),
+        value: None,
+        source_entry: "entry".to_string(),
+        source_table: cadmpeg_core::text::NonBlankString::new("nx:test:expression-table#table")
+            .unwrap(),
+        source_offset: 0,
+    };
+    let parameter_use = |id: &str, expression: &str| crate::native::features::FeatureParameterUse {
+        id: id.to_string(),
+        operation_label: "operation".to_string(),
+        expression: expression.to_string(),
+        bindings: vec![crate::native::features::FeatureParameterUseBinding {
+            binding: format!("binding-{id}"),
+            source_offset: 0,
+        }],
+    };
+    let expressions = vec![
+        expression("expression-a", "p1_length", "p2_length * 2"),
+        expression("expression-b", "p2_length", "12.5"),
+    ];
+    let uses = [
+        parameter_use("use-a", "expression-a"),
+        parameter_use("use-b", "expression-b"),
+    ];
+    let use_refs = uses.iter().collect::<Vec<_>>();
+    let parameters = native_feature_parameters(&use_refs, &expressions_by_id(&expressions));
+    assert_eq!(
+        parameters,
+        std::collections::BTreeMap::from([
+            ("p1_length".to_string(), "p2_length * 2".to_string()),
+            ("p2_length".to_string(), "12.5".to_string()),
+        ])
+    );
+    assert_eq!(
+        non_boolean_feature_definition_with_parameters(
+            "UNKNOWN OPERATION",
+            &[],
+            None,
+            None,
+            HoleProjection::default(),
+            cadmpeg_core::text::named_entries("UNKNOWN OPERATION", parameters)
+                .expect("the fixture states named parameters"),
+        )
+        .unwrap(),
+        cadmpeg_ir::features::FeatureDefinition::Operation(
+            cadmpeg_ir::features::FeatureOperation::Native {
+                kind: "UNKNOWN OPERATION".into(),
+                parameters: std::collections::BTreeMap::from([
+                    (
+                        cadmpeg_core::nonblank_literal!("p1_length"),
+                        "p2_length * 2".to_string()
+                    ),
+                    (
+                        cadmpeg_core::nonblank_literal!("p2_length"),
+                        "12.5".to_string()
+                    ),
+                ]),
+            }
+        )
+    );
+    assert!(matches!(
+        non_boolean_feature_definition_with_parameters("DELETE",
+            &[],
+            None,
+            None,
+            HoleProjection::default(),
+            std::collections::BTreeMap::default(),
+        ).unwrap(),
+        cadmpeg_ir::features::FeatureDefinition::Operation(cadmpeg_ir::features::FeatureOperation::Native { kind, .. }) if kind.as_str() == "DELETE"
+    ));
+    assert!(matches!(
+        non_boolean_feature_definition_with_parameters(
+            "THRU_CURVE",
+            &[],
+            None,
+            None,
+            HoleProjection::default(),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap(),
+        cadmpeg_ir::features::FeatureDefinition::Operation(
+            cadmpeg_ir::features::FeatureOperation::Unresolved {
+                family: cadmpeg_ir::features::UnresolvedFamily::Loft
+            }
+        )
+    ));
+    assert!(matches!(
+        non_boolean_feature_definition_with_parameters("SWP104",
+            &[],
+            None,
+            None,
+            HoleProjection::default(),
+            std::collections::BTreeMap::new(),
+        ).unwrap(), cadmpeg_ir::features::FeatureDefinition::Operation(cadmpeg_ir::features::FeatureOperation::Native {
+            kind,
+            parameters,
+        }) if kind.as_str() == "SWP104" && parameters.is_empty()));
+    let duplicate_expressions = vec![
+        expression("expression-a", "p1_length", "1"),
+        expression("expression-b", "p1_length", "2"),
+    ];
+    assert!(
+        native_feature_parameters(&use_refs, &expressions_by_id(&duplicate_expressions)).is_empty()
+    );
+    let unresolved = [parameter_use("use-c", "missing")];
+    assert!(native_feature_parameters(
+        &unresolved.iter().collect::<Vec<_>>(),
+        &expressions_by_id(&expressions)
+    )
+    .is_empty());
+}
+
+#[test]
+fn nx_native_feature_parameters_match_the_backward_expression_scan() {
+    fn backward_scan(
+        uses: &[&crate::native::features::FeatureParameterUse],
+        expressions: &[crate::native::om::ParameterFormula],
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut parameters = std::collections::BTreeMap::new();
+        for parameter_use in uses {
+            let Some(expression) = expressions
+                .iter()
+                .rev()
+                .find(|expression| expression.id == parameter_use.expression)
+            else {
+                return std::collections::BTreeMap::new();
+            };
+            if parameters.contains_key(expression.name.as_str()) {
+                return std::collections::BTreeMap::new();
+            }
+            parameters.insert(
+                expression.name.as_str().to_owned(),
+                expression.expression.clone(),
+            );
+        }
+        parameters
+    }
+    let expression = |id: usize, name: usize, text: usize| crate::native::om::ParameterFormula {
+        id: format!("expression-{id}"),
+        owner: None,
+        declaration: None,
+        name: crate::om::parameter_name::ParameterName::new(format!("p{name}")),
+        unit: crate::native::om::ExpressionUnit::Millimeter,
+        expression: format!("{text}"),
+        value: None,
+        source_entry: "entry".to_string(),
+        source_table: cadmpeg_core::text::NonBlankString::new("nx:test:expression-table#table")
+            .unwrap(),
+        source_offset: 0,
+    };
+    let parameter_use =
+        |id: usize, expression: usize| crate::native::features::FeatureParameterUse {
+            id: format!("use-{id}"),
+            operation_label: "operation".to_string(),
+            expression: format!("expression-{expression}"),
+            bindings: Vec::new(),
+        };
+    let mut state = 0x5eed_u64;
+    let mut next = |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from((state >> 33) % bound).unwrap()
+    };
+    let mut nonempty = 0;
+    for _ in 0..500 {
+        let expressions = (0..next(8))
+            .map(|text| expression(next(5), next(6), text))
+            .collect::<Vec<_>>();
+        let uses = (0..next(4))
+            .map(|id| parameter_use(id, next(6)))
+            .collect::<Vec<_>>();
+        let use_refs = uses.iter().collect::<Vec<_>>();
+        let parameters = native_feature_parameters(&use_refs, &expressions_by_id(&expressions));
+        assert_eq!(parameters, backward_scan(&use_refs, &expressions));
+        nonempty += usize::from(!parameters.is_empty());
+    }
+    assert!(nonempty > 50);
+}
+
+#[test]
+fn nx_intersection_labels_project_without_fabricating_construction_fields() {
+    for operation in ["ASSOCIATIVE_INTERSECTION", "Intersection Curve"] {
+        assert!(matches!(
+        non_boolean_feature_definition_with_parameters(operation,
+            &[],
+            None,
+            None,
+            HoleProjection::default(),
+            std::collections::BTreeMap::default(),
+        ).unwrap(), cadmpeg_ir::features::FeatureDefinition::Operation(cadmpeg_ir::features::FeatureOperation::SectionShape {
+            operands,
+
+            approximate: None,
+        }) if matches!(
+            (operands.first(), operands.second(),),
+            (
+                cadmpeg_ir::features::BodySelection::Unresolved,
+                cadmpeg_ir::features::BodySelection::Unresolved,
+            )
+        )));
+    }
+}
+
+#[test]
+fn nx_multi_instance_output_projects_as_an_unresolved_pattern() {
+    assert!(
+        matches!(&(non_boolean_feature_definition_with_parameters("Multi Instance Output",
+                &[],
+                None,
+                None,
+                HoleProjection::default(),
+                std::collections::BTreeMap::default(),
+            ).unwrap()),
+            cadmpeg_ir::features::FeatureDefinition::Operation(cadmpeg_ir::features::FeatureOperation::Pattern {
+                seeds,
+                pattern: admitted_pattern,
+            }) if matches!(admitted_pattern.definition(), cadmpeg_ir::features::patterns::PatternTransform::Unresolved { form: None } if seeds.is_empty())
+        )
+    );
+}
+
+#[test]
+fn boolean_target_is_an_independent_intermediate_result_writer() {
+    use crate::native::features::{
+        FeatureBodyReference, FeatureBooleanKind, FeatureBooleanOperation,
+    };
+
+    let boolean = FeatureBooleanOperation {
+        id: "nx:test:boolean#0".into(),
+        operation_label: "nx:test:operation#0".into(),
+        kind: FeatureBooleanKind::Unite,
+        target: crate::test_support::native_references::boolean_reference(7, 1),
+        tools: vec![crate::test_support::native_references::boolean_reference(
+            8, 2,
+        )],
+        source_offset: 0,
+    };
+    assert_eq!(
+        native_result_body_identity(None, Some(&boolean)),
+        Some((
+            cadmpeg_core::nonblank_literal!("nx:test:boolean#0:target"),
+            "nx:test:boolean#0".into(),
+        ))
+    );
+
+    let primary = FeatureBodyReference {
+        ordinal: None,
+        id: "nx:test:primary#0".into(),
+        operation_label: boolean.operation_label.clone(),
+        body: crate::om::reference_index::FeatureReferenceToken::from_wire(7, &[7]).unwrap(),
+        source_offset: 3,
+    };
+    assert_eq!(
+        native_result_body_identity(Some(&primary), Some(&boolean)),
+        Some((
+            cadmpeg_core::nonblank_literal!("nx:test:primary#0"),
+            "nx:test:primary#0".into(),
+        ))
+    );
+}
+
+#[test]
+fn boolean_target_output_requires_one_resolved_segment_body() {
+    use cadmpeg_ir::features::{BodySelection, BooleanKind, FeatureDefinition, FeatureOperation};
+    use cadmpeg_ir::ids::BodyId;
+
+    let body = BodyId::mint("nx:s0:body#0").expect("identity grammar");
+    let definition = FeatureDefinition::Operation(FeatureOperation::Combine {
+        operands: cadmpeg_ir::features::CombineOperands::new(
+            BodySelection::Resolved {
+                bodies: cadmpeg_ir::features::DistinctMembers::try_from(vec![body.clone()])
+                    .expect("distinct bodies"),
+                native: "target".into(),
+            },
+            BodySelection::Unresolved,
+        )
+        .unwrap(),
+
+        op: BooleanKind::Join,
+        keep_tools: false,
+    });
+    assert_eq!(boolean_target_output(Some(&definition)), Some(&body));
+
+    let ambiguous = FeatureDefinition::Operation(FeatureOperation::Combine {
+        operands: cadmpeg_ir::features::CombineOperands::new(
+            BodySelection::Unresolved,
+            BodySelection::Unresolved,
+        )
+        .unwrap(),
+
+        op: BooleanKind::Join,
+        keep_tools: false,
+    });
+    assert!(boolean_target_output(Some(&ambiguous)).is_none());
+}
+
+#[test]
+fn topology_inferred_hole_axis_is_not_an_authored_direction() {
+    use cadmpeg_ir::features::{holes::HolePlacement, FeatureDefinition, FeatureOperation};
+    use cadmpeg_ir::math::{Point3, Vector3};
+
+    for kind in ["SIMPLE HOLE", "HOLE PACKAGE"] {
+        assert!(matches!(
+            non_boolean_feature_definition_with_parameters(kind,
+                &[],
+                None,
+                None,
+                HoleProjection {
+                    placements: vec![HolePlacement::Axis {
+                        origin: cadmpeg_ir::features::FinitePoint3::new(Point3::new(1.0, 2.0, 3.0)).unwrap(),
+                        axis: cadmpeg_ir::features::FeatureDirection3::new(Vector3::new(0.0, 0.0, 1.0)).unwrap(),
+                    }],
+                    ..HoleProjection::default()
+                },
+                std::collections::BTreeMap::new(),
+            ).unwrap(),
+            FeatureDefinition::Operation(FeatureOperation::Hole {
+                placements,
+                ..
+            }) if placements.as_deref() == Some(&[HolePlacement::Axis {
+                origin: cadmpeg_ir::features::FinitePoint3::new(Point3::new(1.0, 2.0, 3.0)).unwrap(),
+                axis: cadmpeg_ir::features::FeatureDirection3::new(Vector3::new(0.0, 0.0, 1.0)).unwrap(),
+            }][..])
+        ));
+    }
+}
+
+#[test]
+fn complete_extrude_profile_projects_without_guessing_scalar_roles() {
+    use cadmpeg_ir::features::{
+        BooleanOp, ExtrudeExtent, ExtrudeSide, FeatureDefinition, FeatureOperation,
+        LinearTermination, PlanarProfileRef, ProfileRef,
+    };
+
+    assert_eq!(
+        extrude_feature_definition(
+            Some("nx:profile#1"),
+            None,
+            BooleanOp::NewBody,
+            &[cadmpeg_ir::topology::BodyKind::Solid],
+        ),
+        FeatureDefinition::Operation(FeatureOperation::Extrude {
+            profile: ProfileRef::Planar(PlanarProfileRef::Native("nx:profile#1".to_string())),
+            direction: cadmpeg_ir::features::ExtrudeDirection::Unresolved {},
+            extent: ExtrudeExtent::OneSided {
+                side: ExtrudeSide {
+                    termination: LinearTermination::Unresolved {},
+                    draft: None,
+                },
+            },
+            op: BooleanOp::NewBody,
+            start: cadmpeg_ir::features::ExtrudeStart::Unresolved {},
+            solid: Some(true),
+            face_maker: None,
+            inner_wire_taper: None,
+            length_along_profile_normal: None,
+            allow_multi_profile_faces: None,
+        })
+    );
+    assert!(matches!(
+        extrude_feature_definition(
+            None,
+            None,
+            BooleanOp::Unresolved,
+            &[cadmpeg_ir::topology::BodyKind::Sheet],
+        ),
+        FeatureDefinition::Operation(FeatureOperation::Extrude {
+            profile: ProfileRef::Planar(PlanarProfileRef::Unresolved(_)),
+            solid: Some(false),
+            ..
+        })
+    ));
+    assert!(matches!(
+        extrude_feature_definition(
+            Some("nx:profile#1"),
+            Some("nx:profile#2"),
+            BooleanOp::Unresolved,
+            &[
+                cadmpeg_ir::topology::BodyKind::Solid,
+                cadmpeg_ir::topology::BodyKind::Sheet,
+            ],
+        ),
+        FeatureDefinition::Operation(FeatureOperation::Extrude {
+            profile: ProfileRef::Planar(PlanarProfileRef::Unresolved(_)),
+            solid: None,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn extrusion_is_new_body_only_for_one_first_written_surface_or_solid_output() {
+    use cadmpeg_ir::features::BooleanOp;
+    use cadmpeg_ir::topology::BodyKind;
+
+    ({
+        let history = BodyWriterHistory::default();
+        assert_eq!(
+            extrude_boolean_op(&history, Some(7), None, &[BodyKind::Solid]),
+            BooleanOp::NewBody
+        );
+        assert_eq!(
+            extrude_boolean_op(
+                &BodyWriterHistory::default(),
+                None,
+                None,
+                &[BodyKind::Solid],
+            ),
+            BooleanOp::Unresolved
+        );
+        assert_eq!(
+            extrude_boolean_op(&history, Some(7), None, &[BodyKind::Sheet]),
+            BooleanOp::NewBody
+        );
+        assert_eq!(
+            extrude_boolean_op(&history, Some(7), None, &[BodyKind::Wire]),
+            BooleanOp::Unresolved
+        );
+        assert_eq!(
+            extrude_boolean_op(&history, Some(7), None, &[BodyKind::General]),
+            BooleanOp::Unresolved
+        );
+        assert_eq!(
+            extrude_boolean_op(&history, Some(7), None, &[BodyKind::Solid, BodyKind::Solid],),
+            BooleanOp::Unresolved
+        );
+        assert_eq!(
+            extrude_boolean_op(&history, Some(7), None, &[]),
+            BooleanOp::Unresolved
+        );
+
+        let prior =
+            FeatureId::mint("synthetic:test:id#prior-offset-writer").expect("identity grammar");
+        let offset_body = "store:block#7";
+        let mut offset_history = BodyWriterHistory::default();
+        offset_history.record_writer(None, Some(offset_body), &[], &prior);
+        assert_eq!(
+            extrude_boolean_op(&offset_history, None, Some(offset_body), &[BodyKind::Solid]),
+            BooleanOp::Unresolved
+        );
+        assert_eq!(
+            extrude_boolean_op(
+                &offset_history,
+                None,
+                Some("store:block#8"),
+                &[BodyKind::Solid],
+            ),
+            BooleanOp::NewBody
+        );
+    });
+}
+
+mod colors;
+
+mod body_selection;
+
+mod parameter_projection;

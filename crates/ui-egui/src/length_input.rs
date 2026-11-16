@@ -267,6 +267,7 @@ pub(crate) fn fields<'a>(doc: &Document, kind: &'a mut crate::dialogs::Kind) -> 
                 Mod::Offset { distance, distance2, .. } => vec![distance, distance2],
                 Mod::Move { x, y, .. } => vec![x, y],
                 Mod::PatternRect { spacing, spacing2, .. } => vec![spacing, spacing2],
+                Mod::Fillet3d { radius } => vec![radius],
                 Mod::Corner { size, distance2, .. } => vec![size, distance2],
                 _ => vec![],
             }

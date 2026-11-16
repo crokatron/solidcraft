@@ -49,6 +49,10 @@ pub fn has_geometry(sketch: &solidcraft_engine::sketch::Sketch) -> bool {
     !sketch.curves.is_empty() || !sketch.wires.is_empty()
 }
 
+/// Spatial curves have their own mobility analysis, separate from the planar solver.
+pub(crate) fn has_spatial_geometry(sketch: &solidcraft_engine::sketch::Sketch) -> bool {
+    sketch.wires.iter().any(|wire| wire.link.is_none() && !wire.fit.is_empty())
+}
 /// Nothing the user added: no curve, 3D curve, constraint or dimension, pattern, projection,
 /// text or offset, and no point but the fixed origin.
 pub fn is_blank(sketch: &solidcraft_engine::sketch::Sketch) -> bool {
@@ -371,7 +375,15 @@ pub(crate) fn shared_presentation(app: &SolveApp) -> Option<crate::panel_runtime
     Some(crate::panel_runtime::PanelPresentation {
         title,
         icon: "sketch".into(),
-        status: Some(constraint_status(sketch.report.dof, solved, has_geometry(&sketch.sketch))),
+        status: Some(if solved && has_spatial_geometry(&sketch.sketch) {
+            let local = app.session.model.state();
+            local
+                .sketch(sketch.feature)
+                .map(|ss| crate::spatial_freedom::status(&ss.sketch, ss.report.dof))
+                .unwrap_or_else(|| solidcraft_ui_text::tr("ui.spatial_dof_unknown").to_string())
+        } else {
+            constraint_status(sketch.report.dof, solved, has_geometry(&sketch.sketch))
+        }),
         attention: !solved,
         actions: Vec::new(),
     })
@@ -455,9 +467,39 @@ pub(crate) fn shared_body(app: &mut SolveApp, ui: &mut egui::Ui) {
     draw_options(app, &ctx, Some(ui));
 }
 
+/// Tool confirmations stay outside the scrolled options so the fixed header cannot cover them.
+fn tool_buttons(app: &SolveApp, ui: &mut egui::Ui) -> Option<crate::ui_kit::Action> {
+    let tool = app.tool.as_ref()?;
+    let remembered = app.preferences.command_dialog_values.get(tool.cmd).and_then(|v| v["confirmation"].as_str()).unwrap_or("ok");
+    let mut chosen = None;
+    let row = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(Tokens::get().space_10 as i8, Tokens::get().space_4 as i8)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (label, action, word, index) in [
+                ("OK", crate::ui_kit::Action::Ok, "ok", 0.),
+                ("Apply", crate::ui_kit::Action::Apply, "apply", 1.),
+                ("Cancel", crate::ui_kit::Action::Cancel, "cancel", 2.),
+            ] {
+                let button = ui
+                    .add(egui::Button::new(app.tr_label(label)).selected(remembered == word))
+                    .backing_on_hover_text(app.tr("ui.sketch3d.confirm_help"));
+                crate::scenario::publish_handle(&format!("sketch_tool:{label}"), button.rect.center());
+                crate::scenario::publish_rect(&format!("sketch_tool:{label}"), button.rect);
+                if remembered == word {
+                    crate::scenario::publish_count("sketch_tool:remembered_action", index);
+                }
+                if button.clicked() {
+                    chosen = Some(action);
+                }
+            }
+        });
+    });
+    crate::scenario::publish_rect("sketch_tool:controls", row.response.rect);
+    chosen
+}
+
 fn draw_options(app: &mut SolveApp, ctx: &egui::Context, shared: Option<&mut egui::Ui>) {
     let _language = solidcraft_ui_text::scope(&app.preferences.language);
-    let (opts, name, remaining, solved, total, geometry, open_ends, untied_ends) = {
+    let (opts, name, remaining, solved, total, geometry, spatial, open_ends, untied_ends) = {
         let st = crate::open_meshing::session_world(&app.session);
         let Some(ss) = app.session.active_sketch.and_then(|s| st.sketch(s)) else { return };
         (
@@ -467,12 +509,24 @@ fn draw_options(app: &mut SolveApp, ctx: &egui::Context, shared: Option<&mut egu
             ss.report.ok(),
             unconstrained_total(&ss.sketch),
             has_geometry(&ss.sketch),
+            has_spatial_geometry(&ss.sketch),
             ss.ends.open.len(),
             ss.ends.untied.len(),
         )
     };
-    let status = constraint_status(remaining, solved, geometry);
-    let fraction = constrained_fraction(remaining, total, solved && geometry);
+    let freedom = spatial.then(|| crate::spatial_freedom::active(app)).flatten();
+    let known = !spatial || freedom.as_ref().is_some_and(|r| r.dof.is_some());
+    let combined = freedom.as_ref().and_then(|r| r.dof).map_or(remaining, |d| remaining.saturating_add(d));
+    let total = total.saturating_add(freedom.as_ref().map_or(0, |r| r.variables));
+    let status = if solved && spatial {
+        match freedom.as_ref().and_then(|r| r.dof) {
+            Some(_) => constraint_status(combined, solved, geometry),
+            None => solidcraft_ui_text::tr("ui.spatial_dof_unknown").to_string(),
+        }
+    } else {
+        constraint_status(remaining, solved, geometry)
+    };
+    let fraction = constrained_fraction(combined, total, solved && geometry && known);
     let in_shared_host = shared.is_some();
     let option_label =
         |label: &'static str| if matches!(label, "ui.profile" | "ui.points") { solidcraft_ui_text::tr(label) } else { app.tr_label(label) };
@@ -496,28 +550,57 @@ fn draw_options(app: &mut SolveApp, ctx: &egui::Context, shared: Option<&mut egu
     let mut look = false;
     let mut finish = false;
     let mut tie = false;
+    let mut cycle_axis = false;
+    let mut tool_confirmation = None;
     let mut start = None;
     let feature = active_feature(app);
     let has_curves = !selected_curves(app).is_empty();
     let selected_types = if has_curves { selected_linetypes(app) } else { std::array::from_fn(|i| mode(app) == i as u8) };
     let mut contents = |ui: &mut egui::Ui, part| match part {
-        Part::Header => Some(
-            crate::ui_kit::status_header(
-                ui,
-                "sketch_palette",
-                &name,
-                crate::ui_kit::StatusHeader { icon: "sketch", text: &status, complete: solved && remaining == 0 && geometry, fraction },
-            )
-            .rect
-            .height(),
-        ),
+        Part::Header => {
+            let height = if in_shared_host {
+                None
+            } else {
+                Some(
+                    crate::ui_kit::status_header(
+                        ui,
+                        "sketch_palette",
+                        &name,
+                        crate::ui_kit::StatusHeader {
+                            icon: "sketch",
+                            text: &status,
+                            complete: solved && combined == 0 && geometry && known,
+                            fraction,
+                        },
+                    )
+                    .rect
+                    .height(),
+                )
+            };
+            if let Some(action) = tool_buttons(app, ui) {
+                tool_confirmation = Some(action);
+            }
+            height
+        }
         Part::Body => {
             let t = Tokens::get();
             if in_shared_host {
                 crate::ui_kit::text(ui, &status, crate::ui_kit::Text::Report("sketch_constraints", !solved));
-                let meter = crate::ui_kit::progress(ui, "sketch_palette", fraction);
-                crate::scenario::publish_rect("sketch_palette:meter", meter.rect);
-                crate::scenario::publish_count("sketch_palette:constrained_fraction", f64::from(fraction));
+                if known {
+                    let meter = crate::ui_kit::progress(ui, "sketch_palette", fraction);
+                    crate::scenario::publish_rect("sketch_palette:meter", meter.rect);
+                    crate::scenario::publish_count("sketch_palette:constrained_fraction", f64::from(fraction));
+                }
+            }
+            if crate::sketch3d::drawing(app) {
+                ui.label(crate::sketch3d::placement_label(app, ui.input(|i| i.modifiers.shift)));
+                let button = ui.button(solidcraft_ui_text::tr("ui.sketch3d.toggle_axis"));
+                crate::scenario::publish_handle("sketch3d:toggle_axis", button.rect.center());
+                cycle_axis = button.clicked();
+                ui.add(egui::Label::new(solidcraft_ui_text::tr("ui.sketch3d.axis_help")).wrap());
+            }
+            if spatial {
+                ui.add(egui::Label::new(solidcraft_ui_text::tr("ui.spatial_motion_tip")).wrap());
             }
             if open_ends > 0 {
                 let text = solidcraft_ui_text::format("sketch.open_ends", &[("count", &open_ends.to_string())]);
@@ -626,6 +709,7 @@ fn draw_options(app: &mut SolveApp, ctx: &egui::Context, shared: Option<&mut egu
     if let Some(ui) = shared {
         let at_top = crate::ui_kit::DialogButtons::current(ctx) == crate::ui_kit::DialogButtons::Top;
         crate::ui_kit::scope(ui, |ui| {
+            contents(ui, Part::Header);
             let footer_height = if at_top {
                 contents(ui, Part::Footer);
                 0.0
@@ -662,6 +746,12 @@ fn draw_options(app: &mut SolveApp, ctx: &egui::Context, shared: Option<&mut egu
         }
         // The button click would otherwise leave the shape's dimension box without the keyboard.
         crate::sketch_dims::restore_box_focus(app, ctx);
+    }
+    if let Some(action) = tool_confirmation {
+        crate::tools::confirm_tool(app, action);
+    }
+    if cycle_axis {
+        crate::sketch3d::cycle_axis(app);
     }
     if construction {
         toggle_construction(app);

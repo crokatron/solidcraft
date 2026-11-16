@@ -24,6 +24,8 @@ pub use clouds::{CELL_SIZE, Cell, CloudFilter, CloudStyle, ColorMode, FILTERS, G
 mod msaa_check;
 mod oit;
 mod product_highlights;
+mod textured;
+pub use textured::{ScanImage, ScanMesh, ScanPlacement, SCAN_VERTEX_SIZE};
 #[cfg(not(target_arch = "wasm32"))]
 pub use msaa_check::MsaaCheck;
 
@@ -538,6 +540,8 @@ impl InstancedMesh {
 /// highlight scene (hover, selection, the origin widget) changes often and is small.
 #[derive(Default, Clone)]
 pub struct GpuScene {
+    /// Authored scan colours and UV-mapped photographs, sampled per fragment.
+    pub textured: Vec<ScanPlacement>,
     /// The colours every vertex, line and instance index into.
     pub palette: Arc<Palette>,
     /// Non-selectable virtual ground receiving viewport AO, separate from model triangles.
@@ -1828,8 +1832,11 @@ struct GlassSource {
     glass: Arc<Vec<std::ops::Range<u32>>>,
 }
 
+type InstanceBuffers = std::collections::HashMap<usize, (Arc<SharedTris>, Arc<SharedGpu>)>;
+
 #[derive(Default)]
 struct Batches {
+    textured: textured::Batches,
     /// What the last scene taken uploaded.
     uploads: UploadStats,
     /// The blocks' see-through triangles the global glass stream was assembled from (block key,
@@ -1879,7 +1886,7 @@ struct Batches {
     selected_instanced: Vec<InstancedDraw>,
     /// The instanced meshes' triangles (and their levels) on the GPU, by the address of the
     /// triangles they were uploaded from (held, so it stays theirs).
-    instanced_tris: std::collections::HashMap<usize, (Arc<SharedTris>, Arc<SharedGpu>)>,
+    instanced_tris: InstanceBuffers,
     /// Evaluated chunks by their plans' addresses, holding the plans so the addresses stay
     /// theirs: a chunk whose plans are unchanged is not evaluated again when the scene is rebuilt.
     resident: std::collections::HashMap<Vec<usize>, (Vec<Arc<solidcore_tess::TessPlan>>, Arc<crate::GpuMesh>)>,
@@ -1903,7 +1910,7 @@ impl Batches {
         tess: Option<(&crate::TessGpu, &mut wgpu::CommandEncoder)>,
         oit_available: bool,
     ) {
-        self.take_sharing(device, queue, uniform, bgl, key, slot, tess, oit_available, None);
+        self.take_sharing(device, queue, uniform, bgl, key, slot, tess, oit_available, None, None);
     }
 
     /// [`Batches::take`], taking over the blocks, evaluated chunks and instanced triangles the
@@ -1922,12 +1929,14 @@ impl Batches {
         tess: Option<(&crate::TessGpu, &mut wgpu::CommandEncoder)>,
         oit_available: bool,
         mut donor: Option<&mut Batches>,
+        model_instances: Option<&InstanceBuffers>,
     ) {
         if self.key == Some(key) {
             return;
         }
         if let Some(sc) = slot.lock().ok().and_then(|mut s| s.take()) {
             self.uploads = UploadStats::default();
+            self.textured.sources = sc.textured;
             let palette = sc.palette.clone();
             let mut written = 0;
             match self.palette.take() {
@@ -1942,14 +1951,18 @@ impl Batches {
                 Some((tess, encoder)) => self.planned(device, tess, encoder, &sc.planned, donor.as_deref_mut()),
                 None => Vec::new(),
             };
-            self.instanced = self.instanced(device, &sc.instanced, donor.as_deref());
+            // All three lists share immutable mesh buffers. An empty highlight list must
+            // not evict the model buffers another scene needs for hover feedback.
+            let mut kept_instances = std::mem::take(&mut self.instanced_tris);
+            let shared_instances = model_instances.or_else(|| donor.as_deref().map(|d| &d.instanced_tris));
+            self.instanced = self.instanced(device, &sc.instanced, &mut kept_instances, shared_instances);
             self.hover_planned = sc.hover_planned;
             self.selected_planned = sc.selected_planned;
             self.hover_blocks = sc.hover_blocks;
             self.selected_blocks = sc.selected_blocks;
             self.recoloured = sc.recoloured;
-            self.hover_instanced = self.instanced(device, &sc.hover_instanced, donor.as_deref());
-            self.selected_instanced = self.instanced(device, &sc.selected_instanced, donor.as_deref());
+            self.hover_instanced = self.instanced(device, &sc.hover_instanced, &mut kept_instances, shared_instances);
+            self.selected_instanced = self.instanced(device, &sc.selected_instanced, &mut kept_instances, shared_instances);
             let mut kept = std::mem::take(&mut self.blocks);
             let mut order = Vec::with_capacity(sc.blocks.len());
             let mut geometry = 0;
@@ -2036,8 +2049,13 @@ impl Batches {
 
     /// The instanced meshes on the GPU: triangles uploaded once per key (kept while the key comes
     /// back with the same bytes), placements every time.
-    fn instanced(&mut self, device: &wgpu::Device, meshes: &[InstancedMesh], donor: Option<&Batches>) -> Vec<InstancedDraw> {
-        let mut kept = std::mem::take(&mut self.instanced_tris);
+    fn instanced(
+        &mut self,
+        device: &wgpu::Device,
+        meshes: &[InstancedMesh],
+        kept: &mut InstanceBuffers,
+        donor: Option<&InstanceBuffers>,
+    ) -> Vec<InstancedDraw> {
         let mut out = Vec::with_capacity(meshes.len());
         for m in meshes {
             let count = u32::try_from(m.count()).unwrap_or(u32::MAX);
@@ -2048,7 +2066,7 @@ impl Batches {
             let mut levels = Vec::with_capacity(1 + m.levels.len());
             for (i, (tris, error)) in std::iter::once((&m.tris, 0.0f32)).chain(m.levels.iter().map(|(t, e)| (t, *e))).enumerate() {
                 let key = Arc::as_ptr(tris) as usize;
-                let shared = || donor?.instanced_tris.get(&key).filter(|(b, _)| Arc::ptr_eq(b, tris)).cloned();
+                let shared = || donor?.get(&key).filter(|(b, _)| Arc::ptr_eq(b, tris)).cloned();
                 let gpu = match kept.remove(&key).or_else(|| self.instanced_tris.remove(&key)).filter(|(b, _)| Arc::ptr_eq(b, tris)).or_else(shared) {
                     Some(t) => t,
                     None => match SharedGpu::new(device, tris) {
@@ -2102,8 +2120,12 @@ impl Batches {
     /// pixels.
     fn cull(&mut self, queue: &wgpu::Queue, vp: &[[f32; 4]; 4], size: [f32; 2]) {
         self.cull_blocks(vp);
+        self.cull_instances(queue, vp, size);
+    }
+
+    fn cull_instances(&mut self, queue: &wgpu::Queue, vp: &[[f32; 4]; 4], size: [f32; 2]) {
         let f = |b: &[u8], i: usize| b.get(i..i + 4).and_then(|x| x.try_into().ok()).map_or(0.0, f32::from_le_bytes);
-        for d in &mut self.instanced {
+        for d in self.instanced.iter_mut().chain(&mut self.hover_instanced).chain(&mut self.selected_instanced) {
             let errors: Vec<f32> = d.levels.iter().map(|l| l.error).collect();
             let mut shown: Vec<(u32, u8)> = d
                 .placements
@@ -2280,6 +2302,8 @@ struct Cut {
 
 /// The viewport's pipelines and the scenes uploaded to one device, for one kind of target.
 pub struct Renderer {
+    scan: wgpu::RenderPipeline,
+    scan_sampler: wgpu::Sampler,
     /// Lazily created depth-only pipelines for feedback over a live product image.
     product_depth: Option<product_highlights::DepthPipelines>,
     /// The offscreen cache contains transparent product highlights rather than shaded colour.
@@ -2985,6 +3009,7 @@ impl Renderer {
                 cache: None,
             })
         };
+        let scan = textured::pipeline(device, &module, &image_layout, t, pushed(wgpu::CompareFunction::LessEqual, false, FACE_BIAS));
         let access_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sc_access"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -3346,6 +3371,13 @@ impl Renderer {
                 no_cache: false,
                 frame_budget: SS_BUDGET,
                 lowered: false,
+                scan,
+                scan_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("scan texture filtering"),
+                    address_mode_u: wgpu::AddressMode::Repeat, address_mode_v: wgpu::AddressMode::Repeat,
+                    mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
+                }),
                 image: image.join(),
                 image_bgl,
                 sampler,
@@ -3795,10 +3827,10 @@ impl Renderer {
         let oit = res.oit.is_some();
         if let Some(mv) = &cb.moving {
             let tess = res.tess.as_ref().map(|t| (t, &mut *encoder));
-            res.moving.take_sharing(device, queue, &res.moving_uniform, &res.uniform_bgl, mv.key, &mv.slot, tess, oit, Some(&mut res.model));
+            res.moving.take_sharing(device, queue, &res.moving_uniform, &res.uniform_bgl, mv.key, &mv.slot, tess, oit, Some(&mut res.model), None);
         }
         let tess = res.tess.as_ref().map(|t| (t, &mut *encoder));
-        res.model.take_sharing(device, queue, &res.uniform, &res.uniform_bgl, cb.key, &cb.slot, tess, oit, Some(&mut res.moving));
+        res.model.take_sharing(device, queue, &res.uniform, &res.uniform_bgl, cb.key, &cb.slot, tess, oit, Some(&mut res.moving), None);
         match &cb.moving {
             Some(mv) => {
                 res.moving.sort_glass(queue, local_direction(&mv.transform, cb.back));
@@ -3813,7 +3845,18 @@ impl Renderer {
             None => {}
         }
         res.sketch.take(device, queue, &res.uniform, &res.uniform_bgl, cb.sketch_key, &cb.sketch_slot, None, oit);
-        res.highlight.take(device, queue, &res.uniform, &res.uniform_bgl, cb.hl_key, &cb.hl_slot, None, oit);
+        res.highlight.take_sharing(
+            device,
+            queue,
+            &res.uniform,
+            &res.uniform_bgl,
+            cb.hl_key,
+            &cb.hl_slot,
+            None,
+            oit,
+            None,
+            Some(&res.model.instanced_tris),
+        );
         res.preview.take(device, queue, &res.uniform, &res.uniform_bgl, cb.pv_key, &cb.pv_slot, None, oit);
         // See-through surfaces are drawn without sorting where the device can (order-independent
         // transparency, in an offscreen frame); else their triangles are sorted for the view.
@@ -3823,6 +3866,7 @@ impl Renderer {
             res.model.sort_glass(queue, cb.back);
         }
         res.model.cull(queue, &cb.view_proj, cb.size_px);
+        res.highlight.cull_instances(queue, &cb.view_proj, cb.size_px);
         let ground_visible = res.model.ground_input.is_some_and(|ground| ground.visible_from(cb.back));
         let ground_key = (cb.key, cb.pv_key, cb.pv_hide, cb.ao_radius.to_bits(), ground_visible);
         if res.ground_ao_key != Some(ground_key) {
@@ -3850,6 +3894,8 @@ impl Renderer {
                 .flatten()
                 .collect();
         res.ao.prepare(device, encoder, cb.ao_radius, cb.size_px, res.target.reversed_depth(), &layers);
+        res.model.textured.prepare(device, queue, &res.image_bgl, &res.scan_sampler);
+        res.moving.textured.prepare(device, queue, &res.image_bgl, &res.scan_sampler);
         // Images: upload new or changed textures, drop removed ones, rebuild the quads.
         res.textures.retain(|id, _| cb.images.iter().any(|i| i.id == *id));
         res.quads.clear();
@@ -4186,6 +4232,10 @@ impl Renderer {
         for d in m.instanced.iter().filter(|d| d.look == InstanceLook::Pbr) {
             d.draw(pass, &res.pbr_instanced, &res.pbr_instanced, tally);
         }
+        // Photographs share the scan geometry depth and precede every selection overlay.
+        m.textured.draw(pass, &res.scan, tally);
+        in_moving(pass, &|pass, mv| mv.textured.draw(pass, &res.scan, tally));
+        pass.set_bind_group(1, &res.access_bind, &[]);
         // Whole-body tints first, so a face or an edge highlighted over the body (in `h.tris`
         // and `h.lines`) keeps its own colour, as it did when the body's triangles were built
         // into the same list before them.
@@ -6340,4 +6390,23 @@ mod glass_tests {
         // The opaque and PBR block triangles, then the PBR placement's one triangle.
         assert_eq!(merged.tris.len(), 2 * 3 * TRI_SIZE + 3 * TRI_SIZE, "merged drops no triangle the scene holds");
     }
+    #[test]
+    fn authored_scan_samples_image_uvs_and_vertex_colors() {
+        for (uv, color, expected) in [([0.75f32, 0.5], [255u8; 4], [0u8, 255, 0]),
+            ([0.25, 0.5], [128, 255, 255, 255], [128, 0, 0])] {
+            let mut vertices = Vec::new();
+            for p in [[-8.0f32, -8.0, 0.0], [8.0, -8.0, 0.0], [0.0, 8.0, 0.0]] {
+                for value in p.into_iter().chain(uv) { vertices.extend_from_slice(&value.to_le_bytes()); }
+                vertices.extend_from_slice(&color);
+            }
+            let mesh = Arc::new(ScanMesh { vertices, image: Arc::new(ScanImage {
+                size: [2, 1], rgba: Arc::new(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+            }) });
+            let scene = GpuScene { textured: vec![ScanPlacement { mesh,
+                rows: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]] }], ..Default::default() };
+            let Some(pixel) = middle_pixel(scene, false) else { return };
+            for channel in 0..3 { assert!(pixel[channel].abs_diff(expected[channel]) <= 2, "{pixel:?}, expected {expected:?}"); }
+        }
+    }
+
 }

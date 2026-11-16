@@ -43,6 +43,7 @@ pub mod curve_plane;
 pub mod error;
 pub mod extend;
 pub mod file;
+pub mod geometry_snap;
 pub mod label;
 pub mod measure;
 pub mod network;
@@ -52,6 +53,9 @@ pub mod pcurve;
 pub mod prism;
 pub mod provenance;
 pub mod record_check;
+pub mod scan_remesh;
+pub mod scan_surface_fit;
+pub mod scan_symmetry;
 pub mod session;
 pub mod split;
 pub mod step_assembly;
@@ -87,3 +91,6 @@ mod noisy_round_tests;
 mod test_corpus;
 #[cfg(test)]
 mod tests;
+
+/// Exact matching of trimmed fitted patches.
+pub mod surface_match;

@@ -45,6 +45,8 @@ pub const FACE_TAGS_NS: &str = "https://github.com/bherbruck/solidcraft/formats/
 /// A named triangle mesh (millimetres, counter-clockwise seen from outside).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeshObject {
+    /// Photographic texture coordinates, image materials and vertex colours.
+    pub appearance: Option<std::sync::Arc<solidcraft_geom::mesh_appearance::MeshAppearance>>,
     pub name: String,
     pub positions: Vec<Vec3>,
     pub triangles: Vec<[u32; 3]>,

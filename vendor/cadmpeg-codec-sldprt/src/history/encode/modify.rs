@@ -1,0 +1,961 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Fillet, chamfer, combine, face/body edit, dome, flex, and scale write encoders.
+
+use super::super::classify::indexed_name;
+use super::super::literals::{format_angle_rad, format_length_mm, parse_bounded_angle_rad};
+use super::super::project::modify::body_retention_mode;
+use super::format::{format_angle_like, format_length_like, format_point3_mm, format_vector3};
+use super::support::{
+    body_selection_value, edge_selection_value, face_selection_value, require_same_family,
+    resolved_boolean_op, write_native_selection,
+};
+use super::{NeutralFeatureEncoder, NeutralFeatureEncoding};
+use crate::classification::NativeClassKind;
+use crate::history::classify::{feature_family, feature_input_class, is_chamfer, is_fillet};
+use cadmpeg_core::CodecError;
+use cadmpeg_ir::features::{
+    edge_treatments::{ChamferGroup, ChamferSpec, FilletGroup, RadiusSpec},
+    AxisAngle, BodyRetentionMode, BodySelection, EdgeSelection, FaceMotion, FaceSelection,
+    FlexMode, ScaleCenter, ScaleFactors,
+};
+use cadmpeg_ir::math::{Point3, Vector3};
+
+impl NeutralFeatureEncoder<'_, '_, '_> {
+    pub(super) fn encode_fillet(
+        &self,
+        groups: &[FilletGroup],
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let [group] = groups else {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} requires exactly one fillet edge group",
+                    feature.id
+                )));
+            };
+            let edges = &group.edges;
+            let radius = &group.radius;
+            let selection = edge_selection_value(edges);
+            if selection.is_none()
+                && !(matches!(edges, EdgeSelection::Unresolved) && existing.is_some())
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported fillet semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_some_and(|record| !is_fillet(record)) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported fillet semantics",
+                    feature.id
+                )));
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            let positional_radius = parameters.contains_key("D1")
+                && !parameters.contains_key("Radius")
+                && !parameters
+                    .keys()
+                    .any(|name| indexed_name(name.as_str(), "Radius"));
+            match radius {
+                RadiusSpec::Unresolved { .. } => {
+                    if existing.is_none() {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} has an unresolved fillet radius law",
+                            feature.id
+                        )));
+                    }
+                }
+                RadiusSpec::Constant { radius } => {
+                    let radius = (*radius).into();
+
+                    parameters.retain(|name, _| {
+                        name != "Radius"
+                            && !indexed_name(name.as_str(), "Radius")
+                            && !indexed_name(name.as_str(), "Position")
+                    });
+                    let key = if positional_radius {
+                        cadmpeg_core::nonblank_literal!("D1")
+                    } else {
+                        cadmpeg_core::nonblank_literal!("Radius")
+                    };
+                    let value = format_length_like(
+                        radius,
+                        existing
+                            .and_then(|record| record.parameters.get(key.as_str()))
+                            .map(String::as_str),
+                    );
+                    parameters.insert(key, value);
+                }
+                RadiusSpec::Chordal { .. } => {
+                    return Err(CodecError::NotImplemented(format!(
+                        "SLDPRT feature {} uses a chordal fillet law",
+                        feature.id
+                    )));
+                }
+                RadiusSpec::Asymmetric { .. } => {
+                    return Err(CodecError::NotImplemented(format!(
+                        "SLDPRT feature {} uses an asymmetric fillet law",
+                        feature.id
+                    )));
+                }
+                RadiusSpec::Variable { points } => {
+                    parameters.retain(|name, _| {
+                        name != "Radius"
+                            && !indexed_name(name.as_str(), "Radius")
+                            && !indexed_name(name.as_str(), "Position")
+                    });
+                    if positional_radius {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} changes positional fillet form",
+                            feature.id
+                        )));
+                    }
+                    for (index, point) in points.as_slice().iter().enumerate() {
+                        parameters.insert(
+                            cadmpeg_core::nonblank_literal!("Position{index}"),
+                            point.parameter.get().to_string(),
+                        );
+                        parameters.insert(
+                            cadmpeg_core::nonblank_literal!("Radius{index}"),
+                            format_length_mm(point.radius.into()),
+                        );
+                    }
+                }
+            }
+            let mut properties = feature.source_properties.clone();
+            if let Some(selection) = selection {
+                write_native_selection(
+                    &mut properties,
+                    cadmpeg_core::nonblank_literal!("Edges"),
+                    &selection,
+                    existing.map_or("", |record| record.id.as_str()),
+                );
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Fillet".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_chamfer(
+        &self,
+        groups: &[ChamferGroup],
+        flip_direction: bool,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let [group] = groups else {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} requires exactly one chamfer edge group",
+                    feature.id
+                )));
+            };
+            let edges = &group.edges;
+            let spec = &group.spec;
+            if flip_direction {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} uses an unsupported reversed chamfer reference side",
+                    feature.id
+                )));
+            }
+            let selection = edge_selection_value(edges);
+            if selection.is_none()
+                && !(matches!(edges, EdgeSelection::Unresolved) && existing.is_some())
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported chamfer semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_some_and(|record| !is_chamfer(record)) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported chamfer semantics",
+                    feature.id
+                )));
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            let positional = parameters.contains_key("D1")
+                && !parameters.contains_key("Distance")
+                && !parameters.contains_key("Distance1");
+            let positional_angle = positional
+                && parameters
+                    .get("D2")
+                    .is_some_and(|value| parse_bounded_angle_rad(value).is_some());
+            match spec {
+                ChamferSpec::Unresolved { .. } => {
+                    if existing.is_none() {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} has unresolved chamfer dimensions",
+                            feature.id
+                        )));
+                    }
+                }
+                ChamferSpec::Distance { distance } => {
+                    if existing.is_some()
+                        && if positional {
+                            parameters.contains_key("D2")
+                        } else {
+                            parameters.contains_key("Distance1")
+                                || parameters.contains_key("Distance2")
+                                || parameters.contains_key("Angle")
+                        }
+                    {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} changes chamfer form",
+                            feature.id
+                        )));
+                    }
+                    let key = if positional {
+                        cadmpeg_core::nonblank_literal!("D1")
+                    } else {
+                        cadmpeg_core::nonblank_literal!("Distance")
+                    };
+                    let value = format_length_like(
+                        (*distance).into(),
+                        existing
+                            .and_then(|record| record.parameters.get(key.as_str()))
+                            .map(String::as_str),
+                    );
+                    parameters.insert(key, value);
+                }
+                ChamferSpec::TwoDistances { first, second } => {
+                    if existing.is_some()
+                        && if positional {
+                            !parameters.contains_key("D2") || positional_angle
+                        } else {
+                            !parameters.contains_key("Distance1")
+                                || !parameters.contains_key("Distance2")
+                                || parameters.contains_key("Angle")
+                        }
+                    {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} changes chamfer form",
+                            feature.id
+                        )));
+                    }
+                    let (first_key, second_key) = if positional {
+                        (
+                            cadmpeg_core::nonblank_literal!("D1"),
+                            cadmpeg_core::nonblank_literal!("D2"),
+                        )
+                    } else {
+                        (
+                            cadmpeg_core::nonblank_literal!("Distance1"),
+                            cadmpeg_core::nonblank_literal!("Distance2"),
+                        )
+                    };
+                    parameters.insert(
+                        first_key.clone(),
+                        format_length_like(
+                            (*first).into(),
+                            existing
+                                .and_then(|record| record.parameters.get(first_key.as_str()))
+                                .map(String::as_str),
+                        ),
+                    );
+                    parameters.insert(
+                        second_key.clone(),
+                        format_length_like(
+                            (*second).into(),
+                            existing
+                                .and_then(|record| record.parameters.get(second_key.as_str()))
+                                .map(String::as_str),
+                        ),
+                    );
+                }
+                ChamferSpec::DistanceAngle { distance, angle } => {
+                    if existing.is_some()
+                        && if positional {
+                            !positional_angle
+                        } else {
+                            !parameters.contains_key("Distance")
+                                || !parameters.contains_key("Angle")
+                                || parameters.contains_key("Distance1")
+                                || parameters.contains_key("Distance2")
+                        }
+                    {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} changes chamfer form",
+                            feature.id
+                        )));
+                    }
+                    let (distance_key, angle_key) = if positional {
+                        (
+                            cadmpeg_core::nonblank_literal!("D1"),
+                            cadmpeg_core::nonblank_literal!("D2"),
+                        )
+                    } else {
+                        (
+                            cadmpeg_core::nonblank_literal!("Distance"),
+                            cadmpeg_core::nonblank_literal!("Angle"),
+                        )
+                    };
+                    parameters.insert(
+                        distance_key.clone(),
+                        format_length_like(
+                            (*distance).into(),
+                            existing
+                                .and_then(|record| record.parameters.get(distance_key.as_str()))
+                                .map(String::as_str),
+                        ),
+                    );
+                    parameters.insert(
+                        angle_key.clone(),
+                        format_angle_like(
+                            (*angle).into(),
+                            existing
+                                .and_then(|record| record.parameters.get(angle_key.as_str()))
+                                .map(String::as_str),
+                        )?,
+                    );
+                }
+            }
+            let mut properties = feature.source_properties.clone();
+            if let Some(selection) = selection {
+                write_native_selection(
+                    &mut properties,
+                    cadmpeg_core::nonblank_literal!("Edges"),
+                    &selection,
+                    existing.map_or("", |record| record.id.as_str()),
+                );
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Chamfer".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_combine(
+        &self,
+        target: &BodySelection,
+        tools: &BodySelection,
+        op: cadmpeg_ir::features::BooleanKind,
+        keep_tools: bool,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            if existing.is_some_and(|record| {
+                !feature_family(record, "Combine")
+                    && !feature_input_class(record, NativeClassKind::Combine)
+            }) || keep_tools
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported combine semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_none()
+                && (body_selection_value(target).is_none() || body_selection_value(tools).is_none())
+            {
+                return Err(CodecError::malformed(format_args!(
+                    "SLDPRT feature {} has unresolved combine semantics",
+                    feature.id
+                )));
+            }
+            let mut properties = feature.source_properties.clone();
+            if let Some(target) = body_selection_value(target) {
+                properties.insert(cadmpeg_core::nonblank_literal!("Target"), target);
+            }
+            if let Some(tools) = body_selection_value(tools) {
+                properties.insert(cadmpeg_core::nonblank_literal!("Tools"), tools);
+            }
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Operation"),
+                resolved_boolean_op(op.into(), &feature.id)?.into(),
+            );
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Combine".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_cut_with_surface(
+        &self,
+        targets: &BodySelection,
+        tools: &FaceSelection,
+        reverse: Option<bool>,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            require_same_family(existing, &feature.id, &["CutWithSurface", "SurfaceCut"])?;
+            let targets = body_selection_value(targets).ok_or_else(|| {
+                CodecError::malformed(format_args!(
+                    "SLDPRT feature {} has no surface-cut target bodies",
+                    feature.id
+                ))
+            })?;
+            let tools = face_selection_value(tools).ok_or_else(|| {
+                CodecError::malformed(format_args!(
+                    "SLDPRT feature {} has no surface-cut tools",
+                    feature.id
+                ))
+            })?;
+            let mut properties = feature.source_properties.clone();
+            properties.insert(cadmpeg_core::nonblank_literal!("Targets"), targets);
+            properties.insert(cadmpeg_core::nonblank_literal!("Tools"), tools);
+            if let Some(reverse) = reverse {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Reverse"),
+                    reverse.to_string(),
+                );
+            }
+            NeutralFeatureEncoding {
+                kind: existing
+                    .map_or_else(|| "CutWithSurface".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_delete_body(
+        &self,
+        bodies: &BodySelection,
+        mode: BodyRetentionMode,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let selection = body_selection_value(bodies);
+            if existing.is_some_and(|record| body_retention_mode(record).is_none()) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported delete-body semantics",
+                    feature.id
+                )));
+            }
+            let mut properties = feature.source_properties.clone();
+            if let Some(selection) = selection {
+                if !crate::resolved_features::component_paths::is_compact_body_selection_value(
+                    &selection,
+                ) {
+                    properties.insert(cadmpeg_core::nonblank_literal!("Bodies"), selection);
+                }
+            } else if !matches!(mode, BodyRetentionMode::Unresolved) || existing.is_none() {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported delete-body semantics",
+                    feature.id
+                )));
+            }
+            match mode {
+                BodyRetentionMode::Unresolved => {
+                    let Some(record) = existing else {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} requires a retained unresolved body operation",
+                            feature.id
+                        )));
+                    };
+                    if body_retention_mode(record) != Some(BodyRetentionMode::Unresolved) {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} removes a resolved body-retention mode",
+                            feature.id
+                        )));
+                    }
+                    properties.remove("Mode");
+                }
+                BodyRetentionMode::DeleteSelected => {
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Delete".into());
+                }
+                BodyRetentionMode::KeepSelected => {
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Keep".into());
+                }
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(
+                    || match mode {
+                        BodyRetentionMode::Unresolved => "Feature".into(),
+                        BodyRetentionMode::DeleteSelected => "DeleteBody".into(),
+                        BodyRetentionMode::KeepSelected => "KeepBody".into(),
+                    },
+                    |record| record.kind.clone(),
+                ),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_delete_face(
+        &self,
+        faces: &FaceSelection,
+        heal: bool,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let unsupported = existing.is_some_and(|record| !feature_family(record, "DeleteFace"));
+            let (Some(faces), false) = (face_selection_value(faces), unsupported) else {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported delete-face semantics",
+                    feature.id
+                )));
+            };
+            let mut properties = feature.source_properties.clone();
+            properties.insert(cadmpeg_core::nonblank_literal!("Faces"), faces);
+            properties.insert(cadmpeg_core::nonblank_literal!("Heal"), heal.to_string());
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "DeleteFace".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_replace_face(
+        &self,
+        targets: &FaceSelection,
+        replacements: &FaceSelection,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let unsupported = existing.is_some_and(|record| !feature_family(record, "ReplaceFace"));
+            let (Some(targets), Some(replacements), false) = (
+                face_selection_value(targets),
+                face_selection_value(replacements),
+                unsupported,
+            ) else {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported replace-face semantics",
+                    feature.id
+                )));
+            };
+            let mut properties = feature.source_properties.clone();
+            properties.insert(cadmpeg_core::nonblank_literal!("Faces"), targets);
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("ReplacementFaces"),
+                replacements,
+            );
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "ReplaceFace".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_move_face(
+        &self,
+        faces: &FaceSelection,
+        motion: &FaceMotion,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let unsupported = existing.is_some_and(|record| !feature_family(record, "MoveFace"));
+            let (Some(faces), false) = (face_selection_value(faces), unsupported) else {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported move-face semantics",
+                    feature.id
+                )));
+            };
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            let mut properties = feature.source_properties.clone();
+            properties.insert(cadmpeg_core::nonblank_literal!("Faces"), faces);
+            parameters.remove("Distance");
+            parameters.remove("Angle");
+            properties.remove("Direction");
+            properties.remove("AxisOrigin");
+            properties.remove("AxisDirection");
+            match motion {
+                FaceMotion::Offset { distance } => {
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Offset".into());
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Distance"),
+                        format_length_mm(*distance),
+                    );
+                }
+                FaceMotion::Translate {
+                    direction,
+                    distance,
+                } => {
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Translate".into());
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("Direction"),
+                        format_vector3((*direction).into()),
+                    );
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Distance"),
+                        format_length_mm(*distance),
+                    );
+                }
+                FaceMotion::Rotate {
+                    axis_origin,
+                    axis_dir,
+                    angle,
+                } => {
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Rotate".into());
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("AxisOrigin"),
+                        format_point3_mm(*axis_origin),
+                    );
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("AxisDirection"),
+                        format_vector3((*axis_dir).into()),
+                    );
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Angle"),
+                        format_angle_rad(*angle),
+                    );
+                }
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "MoveFace".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_move_body(
+        &self,
+        bodies: &BodySelection,
+        translation: &Vector3,
+        rotation: Option<&AxisAngle>,
+        copies: u32,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let bodies = body_selection_value(bodies).ok_or_else(|| {
+                CodecError::malformed(format_args!(
+                    "SLDPRT feature {} has no body-motion selection",
+                    feature.id
+                ))
+            })?;
+            require_same_family(existing, &feature.id, &["MoveBody", "MoveCopyBody"])?;
+            let Some(translation) = cadmpeg_ir::features::FinitePoint3::new(Point3::new(
+                translation.x,
+                translation.y,
+                translation.z,
+            )) else {
+                return Err(CodecError::malformed(format_args!(
+                    "SLDPRT feature {} has a non-finite body translation",
+                    feature.id
+                )));
+            };
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            let mut properties = feature.source_properties.clone();
+            properties.insert(cadmpeg_core::nonblank_literal!("Bodies"), bodies);
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Translation"),
+                format_point3_mm(translation),
+            );
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Copies"),
+                copies.to_string(),
+            );
+            match rotation {
+                Some(rotation) => {
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("RotationOrigin"),
+                        format_point3_mm(rotation.origin),
+                    );
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("RotationAxis"),
+                        format_vector3(rotation.direction.into()),
+                    );
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Rotation"),
+                        format_angle_rad(rotation.angle),
+                    );
+                }
+                None => {
+                    properties.remove("RotationOrigin");
+                    properties.remove("RotationAxis");
+                    parameters.remove("Rotation");
+                }
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "MoveBody".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_dome(
+        &self,
+        faces: &FaceSelection,
+        height: Option<&cadmpeg_ir::scalar::PositiveLength>,
+        elliptical: Option<bool>,
+        reverse: Option<bool>,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let faces = face_selection_value(faces);
+            if existing.is_some_and(|record| !feature_family(record, "Dome")) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported dome semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_none()
+                && (faces.is_none()
+                    || height.is_none()
+                    || elliptical.is_none()
+                    || reverse.is_none())
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} has unresolved dome construction",
+                    feature.id
+                )));
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            if let Some(height) = height {
+                parameters.insert(
+                    cadmpeg_core::nonblank_literal!("Height"),
+                    format_length_mm((*height).into()),
+                );
+            }
+            let mut properties = feature.source_properties.clone();
+            if let Some(faces) = faces {
+                properties.insert(cadmpeg_core::nonblank_literal!("Faces"), faces);
+            }
+            if let Some(elliptical) = elliptical {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Elliptical"),
+                    elliptical.to_string(),
+                );
+            }
+            if let Some(reverse) = reverse {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Reverse"),
+                    reverse.to_string(),
+                );
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Dome".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_flex(
+        &self,
+        axis: Option<&cadmpeg_ir::features::FeatureDirection3>,
+        mode: &FlexMode,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            if existing.is_some_and(|record| !feature_family(record, "Flex")) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported flex semantics",
+                    feature.id
+                )));
+            }
+            if existing.is_none() && (axis.is_none() || matches!(mode, FlexMode::Unresolved { .. }))
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} has unresolved flex construction",
+                    feature.id
+                )));
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            let mut properties = feature.source_properties.clone();
+            if let Some(axis) = axis {
+                properties.insert(
+                    cadmpeg_core::nonblank_literal!("Axis"),
+                    format_vector3((*axis).into()),
+                );
+                properties.remove("AxisDirection");
+            }
+            match mode {
+                FlexMode::Unresolved { .. } => {}
+                FlexMode::Bending { angle } => {
+                    parameters.remove("Factor");
+                    parameters.remove("Distance");
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Bending".into());
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Angle"),
+                        format_angle_rad(*angle),
+                    );
+                }
+                FlexMode::Twisting { angle } => {
+                    parameters.remove("Factor");
+                    parameters.remove("Distance");
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Twisting".into());
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Angle"),
+                        format_angle_rad(*angle),
+                    );
+                }
+                FlexMode::Tapering { factor } => {
+                    parameters.remove("Angle");
+                    parameters.remove("Distance");
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Tapering".into());
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Factor"),
+                        factor.get().to_string(),
+                    );
+                }
+                FlexMode::Stretching { distance } => {
+                    parameters.remove("Angle");
+                    parameters.remove("Factor");
+                    properties.insert(cadmpeg_core::nonblank_literal!("Mode"), "Stretching".into());
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Distance"),
+                        format_length_mm(*distance),
+                    );
+                }
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Flex".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_scale(
+        &self,
+        bodies: &BodySelection,
+        center: Option<&ScaleCenter>,
+        factors: &ScaleFactors,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let selection = body_selection_value(bodies);
+            if existing.is_some_and(|record| !feature_family(record, "Scale")) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported scale semantics",
+                    feature.id
+                )));
+            }
+            let center_valid = center.as_ref().is_none_or(|center| match center {
+                ScaleCenter::Native(reference) => !reference.is_empty(),
+                ScaleCenter::Point(_) | ScaleCenter::Centroid | ScaleCenter::ModelOrigin => true,
+            });
+            let resolved_factors = factors.resolved();
+            if existing.is_none()
+                && (selection.is_none() || center.is_none() || resolved_factors.is_none())
+            {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} has unresolved scale construction",
+                    feature.id
+                )));
+            }
+            if !center_valid {
+                return Err(CodecError::malformed(format_args!(
+                    "SLDPRT feature {} has an invalid scale transform",
+                    feature.id
+                )));
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            match factors {
+                ScaleFactors::Unresolved {} => {}
+                ScaleFactors::Uniform { factor } => {
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("Factor"),
+                        factor.get().to_string(),
+                    );
+                    parameters.remove("ScaleX");
+                    parameters.remove("ScaleY");
+                    parameters.remove("ScaleZ");
+                }
+                ScaleFactors::PerAxis { factors } => {
+                    parameters.remove("Factor");
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("ScaleX"),
+                        factors[0].get().to_string(),
+                    );
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("ScaleY"),
+                        factors[1].get().to_string(),
+                    );
+                    parameters.insert(
+                        cadmpeg_core::nonblank_literal!("ScaleZ"),
+                        factors[2].get().to_string(),
+                    );
+                }
+            }
+            let mut properties = feature.source_properties.clone();
+            if let Some(selection) = selection {
+                properties.insert(cadmpeg_core::nonblank_literal!("Bodies"), selection);
+            }
+            match center {
+                Some(ScaleCenter::Centroid) => {
+                    properties.remove("Center");
+                    properties.remove("CenterRef");
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("CenterType"),
+                        "Centroid".into(),
+                    );
+                }
+                Some(ScaleCenter::ModelOrigin) => {
+                    properties.remove("Center");
+                    properties.remove("CenterRef");
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("CenterType"),
+                        "ModelOrigin".into(),
+                    );
+                }
+                Some(ScaleCenter::Point(point)) => {
+                    properties.remove("CenterRef");
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("CenterType"),
+                        "Point".into(),
+                    );
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("Center"),
+                        format_point3_mm(*point),
+                    );
+                }
+                Some(ScaleCenter::Native(reference)) => {
+                    properties.remove("Center");
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("CenterType"),
+                        "Reference".into(),
+                    );
+                    properties.insert(
+                        cadmpeg_core::nonblank_literal!("CenterRef"),
+                        reference.clone(),
+                    );
+                }
+                None => {}
+            }
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Scale".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+}

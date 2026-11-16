@@ -73,6 +73,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         r.revision = app.session.revision;
         r.result = read(app, r.sketch);
     }
+    let mut remove_spatial = None;
+    let mut edit_spatial = None;
     let title = solidcraft_ui_text::tr_label("Sketch Report");
     let (closed, action) = ui_kit::Window::new(egui::Id::unique("sc_sketch_report"), "inspect", title)
         .fields()
@@ -83,10 +85,15 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             Ok(v) => {
                 let name = v["name"].as_str().unwrap_or_default();
+                let spatial = count(v, "wires") > 0;
                 ui_kit::row(ui, solidcraft_ui_text::tr_label("Sketch"), |ui| ui_kit::text(ui, name, ui_kit::Text::Cell));
-                ui_kit::row(ui, solidcraft_ui_text::tr_label("Status"), |ui| ui_kit::text(ui, &status(v), ui_kit::Text::Cell));
+                ui_kit::row(ui, solidcraft_ui_text::tr_label(if spatial { "Planar status" } else { "Status" }), |ui| {
+                    ui_kit::text(ui, &status(v), ui_kit::Text::Cell)
+                });
                 let dof = v["dof"].as_u64().map(|d| d.to_string()).unwrap_or_else(|| v["dof"].to_string());
-                ui_kit::row(ui, solidcraft_ui_text::tr_label("Degrees of freedom"), |ui| ui_kit::text(ui, &dof, ui_kit::Text::Cell));
+                ui_kit::row(ui, solidcraft_ui_text::tr_label(if spatial { "Planar degrees of freedom" } else { "Degrees of freedom" }), |ui| {
+                    ui_kit::text(ui, &dof, ui_kit::Text::Cell)
+                });
                 let construction = v["curves"].as_array().map_or(0, |a| a.iter().filter(|c| c["construction"].as_bool() == Some(true)).count());
                 let curves =
                     if construction > 0 { format!("{} ({construction} construction)", count(v, "curves")) } else { count(v, "curves").to_string() };
@@ -94,10 +101,67 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 for (label, list) in [("Points", "points"), ("Constraints", "constraints"), ("Profiles", "profiles")] {
                     ui_kit::row(ui, solidcraft_ui_text::tr_label(label), |ui| ui_kit::text(ui, &count(v, list).to_string(), ui_kit::Text::Cell));
                 }
+                if spatial {
+                    ui_kit::row(ui, solidcraft_ui_text::tr_label("3D constraints"), |ui| {
+                        ui_kit::text(ui, &count(v, "wire_constraints").to_string(), ui_kit::Text::Cell)
+                    });
+                    let freedom = &v["spatial_freedom"];
+                    let dof =
+                        v["spatial_dof"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| solidcraft_ui_text::tr("ui.dim3.unknown").to_string());
+                    ui_kit::row(ui, solidcraft_ui_text::tr("ui.dim3.dof"), |ui| ui.label(dof));
+                    ui.add(egui::Label::new(solidcraft_ui_text::tr("ui.dim3.freedom_note")).wrap());
+                    if let Some(reason) = freedom["reason"].as_str() {
+                        ui.add(egui::Label::new(reason).wrap());
+                    }
+                    if let Some(points) = freedom["points"].as_array() {
+                        egui::ScrollArea::vertical().id_salt("spatial_free_points").max_height(180.).show(ui, |ui| {
+                            for p in points {
+                                let axes: Vec<_> = ["X", "Y", "Z"]
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, axis)| (p["free_axes"][i].as_bool() == Some(true)).then_some(*axis))
+                                    .collect();
+                                let motion = if axes.is_empty() { solidcraft_ui_text::tr("ui.dim3.fixed").to_string() } else { axes.join(" / ") };
+                                ui.label(format!("{}:{} · {}", p["wire"].as_str().unwrap_or(""), p["index"], motion));
+                            }
+                        });
+                    }
+                    if let Some(relations) = v["wire_constraints"].as_array() {
+                        for relation in relations {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!(
+                                    "{} · {} · {}:{} / {}:{}",
+                                    relation["id"].as_str().unwrap_or(""),
+                                    crate::spatial_dimensions::kind_label(relation["kind"].as_str().unwrap_or("")),
+                                    relation["a"]["wire"].as_str().unwrap_or(""),
+                                    relation["a"]["index"],
+                                    relation["b"]["wire"].as_str().unwrap_or(""),
+                                    relation["b"]["index"]
+                                ));
+                                if let Some(id) = relation["id"].as_str() {
+                                    if let Some(value) = relation["value"].as_f64() {
+                                        let angle = relation["kind"] == "angle";
+                                        ui.label(format!("{:.3} {}", if angle { value.to_degrees() } else { value }, if angle { "°" } else { "mm" }));
+                                        let edit = ui.button(solidcraft_ui_text::tr("ui.dim3.edit"));
+                                        solidcraft_ui_registry::publish_handle(&format!("spatial_constraint:edit:{id}"), edit.rect.center());
+                                        if edit.clicked() {
+                                            edit_spatial = Some(id.to_owned());
+                                        }
+                                    }
+                                    let response = ui.button(solidcraft_ui_text::tr_label("Remove"));
+                                    solidcraft_ui_registry::publish_handle(&format!("spatial_constraint:remove:{id}"), response.rect.center());
+                                    if response.clicked() {
+                                        remove_spatial = Some(id.to_owned());
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
                 let (curves, points) = (loose(v, "curves"), loose(v, "points"));
-                if curves.is_empty() && points.is_empty() {
+                if curves.is_empty() && points.is_empty() && !spatial {
                     ui_kit::text(ui, solidcraft_ui_text::tr_label("Everything is fully constrained."), ui_kit::Text::Note("all_constrained"));
-                } else {
+                } else if !curves.is_empty() || !points.is_empty() {
                     let heading = format!("{} ({})", solidcraft_ui_text::tr_label("Not fully constrained"), curves.len() + points.len());
                     ui_kit::section(ui, "sc_sketch_report_loose", &heading, true, |ui| {
                         egui::ScrollArea::vertical().max_height(ui_kit::row_height() * LIST_ROWS).show(ui, |ui| {
@@ -116,6 +180,18 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         });
     if closed || action != ui_kit::Action::None {
         return;
+    }
+    if let Some(id) = edit_spatial {
+        crate::spatial_dimensions::edit(app, &id);
+    }
+    if let Some(id) = remove_spatial {
+        let mut params = serde_json::json!({"entities":[id]});
+        if let Some(sketch) = r.sketch {
+            params["sketch"] = sketch.into();
+        }
+        if let Err(error) = app.run("sketch.delete", params) {
+            r.result = Err(error);
+        }
     }
     app.sketch_report = Some(r);
 }
@@ -165,5 +241,38 @@ mod tests {
         h.step(&json!({"click": [at.x, at.y]})).unwrap();
         h.frames(2);
         assert!(h.app.sketch_report.is_some(), "clicking the ribbon button opens the report");
+    }
+    #[test]
+    fn spatial_dimension_panel_drives_geometry_and_edits_saved_value() {
+        let mut h = Harness::new();
+        let id = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+        h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+        h.app.run("sketch.line3d", json!({"points":[[0,0,10],[10,10,20]]})).unwrap();
+        h.app.session.selection = vec![solidcraft_engine::Sel::SketchCurve { id: "w1".into(), sketch: None }];
+        h.app.start("sketch.dimension");
+        h.frames(3);
+        assert!(h.app.spatial_dimensions.is_some());
+        h.step(&json!({"click":{"handle":"dim3:value"}})).unwrap();
+        h.call("ui.key", json!({"key":"A","ctrl":true}));
+        h.call("ui.text", json!({"text":"25"}));
+        h.frames(2);
+        h.step(&json!({"click":{"handle":"dim3:apply"}})).unwrap();
+        h.frames(3);
+        let report = h.app.run("sketch.inspect", json!({})).unwrap();
+        assert_eq!(report["spatial_dof"], 5);
+        let c = report["wire_constraints"][0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(report["wire_constraints"][0]["value"], 25.);
+        h.step(&json!({"click":{"handle":format!("dim3:edit:{c}")}})).unwrap();
+        h.frames(2);
+        h.step(&json!({"click":{"handle":"dim3:value"}})).unwrap();
+        h.call("ui.key", json!({"key":"A","ctrl":true}));
+        h.call("ui.text", json!({"text":"30"}));
+        h.frames(2);
+        h.step(&json!({"click":{"handle":"dim3:apply"}})).unwrap();
+        h.frames(3);
+        let sk = h.app.session.doc.sketch(id).unwrap();
+        use solidcraft_engine::geom::prelude::*;
+        assert!((sk.wires[0].fit[0].dist(sk.wires[0].fit[1]) - 30.).abs() < 1e-6);
+        assert_eq!(sk.wire_constraints.len(), 1, "edit updates existing dimension");
     }
 }

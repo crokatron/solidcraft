@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::native::attach::feature_projection::shell_feature_definition;
+use cadmpeg_ir::features::{FaceSelection, FeatureDefinition, FeatureOperation};
+
+#[test]
+fn nx_shell_preserves_family_without_assigning_construction_roles() {
+    assert!(matches!(
+        shell_feature_definition(),
+        FeatureDefinition::Operation(FeatureOperation::Shell {
+            bodies: None,
+            removed_faces: FaceSelection::Unresolved,
+            thickness: None,
+            outward: None,
+            mode: None,
+            join: None,
+            resolve_intersections: None,
+            allow_self_intersections: None,
+        })
+    ));
+}

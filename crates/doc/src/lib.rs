@@ -73,6 +73,8 @@ pub use thread_catalog::{
 };
 mod walk;
 pub use profile_refs::{capture_profile_selection, profile_fallback_notes, profile_selection_indices, profile_selection_indices_lenient};
+mod mesh_appearance;
+pub mod mesh_edit_appearance;
 pub mod plastic;
 mod print_face;
 pub use print_face::PrintFace;
@@ -86,6 +88,9 @@ pub mod render_resources;
 pub mod render_settings;
 pub mod render_surface;
 pub mod render_texture_resources;
+mod scan_cleanup;
+mod scan_repair;
+pub mod scan_remesh;
 pub mod sheet;
 pub mod sketch_equation;
 pub mod text_params;

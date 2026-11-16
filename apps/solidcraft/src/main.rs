@@ -597,6 +597,11 @@ fn services(cc: &eframe::CreationContext<'_>, folder: &DialogFolder) -> Services
             everything.extend(["dxf", "svg"]);
             dialog = dialog.add_filter(solidcraft_ui_text::tr("file.open.drawing_filter"), &case_variants(&everything));
             for (label, exts) in io::formats::import_filters(true) {
+                let label = match label {
+                    "NX part (experimental)" => solidcraft_ui_text::tr("ui.format_nx_part_experimental"),
+                    "Parasolid (experimental)" => solidcraft_ui_text::tr("ui.format_parasolid_experimental"),
+                    other => other,
+                };
                 dialog = dialog.add_filter(label, &case_variants(&exts));
             }
             let future = dialog.add_filter("All files", &["*"]).pick_file();

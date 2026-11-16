@@ -84,6 +84,28 @@ SolidCraft changes:
   `egui_pipeline` shader compilation, #6648) returns `WgpuError::CreateRendererError` through
   eframe so startup can retry another backend instead of invoking wgpu's panic handler.
 
+## cadmpeg 0.6.12 CAD readers (Apache-2.0, cadmpeg contributors)
+
+The `cadmpeg-codec-nx`, `cadmpeg-codec-sldprt` and `cadmpeg-parasolid` source directories
+use the published 0.6.12 sources from https://github.com/cadmpeg/cadmpeg. Local changes were developed against commit
+`29248bce12224deaf5b0430221f4bb23a1564567` and rebased onto that release. Cargo manifests are normalized 0.6.12
+crate manifests. Upstream source and documentation licences are retained separately.
+
+Local changes:
+- `cadmpeg-parasolid/src/records/text.rs`: bounded schema-aware XT text transcoding.
+- `cadmpeg-parasolid/src/records/primary.rs`: bounded hostile-input record counts.
+- `cadmpeg-parasolid/src/records/primary/node.rs`: named pointer field lookup.
+- `cadmpeg-codec-nx/src/topology/primary_edges.rs`: validated named BODY/REGION ownership
+  chains for extended schemas, including reciprocal WORLD-owned body lists, with
+  synthetic tests in the existing test module.
+- `cadmpeg-codec-nx/src/parasolid/current_partition.rs`: identifies a complete latest
+  partition snapshot only when its current mark matches a fully framed, consistent
+  Deltas history. Mismatched, ambiguous and unsupported histories remain unresolved.
+- `cadmpeg-codec-sldprt/src/standalone_parasolid.rs`: standalone Parasolid adapter using
+  its neutral geometry builder; complete record termination and topology transfer checks.
+- `cadmpeg-codec-sldprt/src/brep/graph.rs`: strict standalone schema gate, preventing
+  fallback byte scanning. The host does not enable SolidWorks container import.
+
 ## winit 0.30.13 (Apache-2.0, © The winit contributors, https://github.com/rust-windowing/winit)
 
 Original package sources from the 0.30.13 release, with the upstream licence retained. Example

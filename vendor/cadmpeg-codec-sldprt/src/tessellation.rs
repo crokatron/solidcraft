@@ -1,0 +1,4295 @@
+// SPDX-License-Identifier: Apache-2.0
+//! `DisplayLists` descriptor tables.
+
+use cadmpeg_ir::math::planar::{point_segment_distance, segments_intersect};
+use cadmpeg_ir::units::FinitePoint2;
+
+use crate::brep::feature_source::FeatureSourceId;
+use crate::brep::PersistentFaceIdentity;
+use crate::container::{ContainerScan, Section};
+use cadmpeg_core::decode::{DecodeContext, View, WorkBudget};
+use cadmpeg_ir::features::{FinitePoint3, FiniteVector3};
+use cadmpeg_ir::geometry::{
+    CurveGeometry, SolvedCurveGeometry, SolvedSurfaceGeometry, SurfaceGeometry,
+};
+use cadmpeg_ir::ids::FaceId;
+use cadmpeg_ir::math::{Point2, Point3, Vector3};
+use cadmpeg_ir::report::loss::LossNote;
+use cadmpeg_ir::scalar::PositiveReal;
+use cadmpeg_ir::tessellation::{TessellationChannel, TessellationMesh};
+use cadmpeg_ir::topology::Sense;
+use cadmpeg_ir::units::OrthonormalFrame3;
+use std::collections::HashMap;
+
+use crate::layout::display_lists_compact_face_header as compact_face;
+use crate::layout::display_lists_extended_face_header as extended_face;
+use crate::layout::display_lists_extended_metadata as extended_meta;
+use crate::layout::display_lists_scene_source_binding as scene_src;
+
+const CLASS_MARKER: &[u8] = &[0xff, 0xff, 0x01, 0x00];
+const SCENE_SOURCE_MARKER: &[u8] = &scene_src::MARKER_VALUE;
+const EPS_DISPLAY_QUANTIZATION: f64 = 1.0e-9;
+const EPS_AXIS_ALIGNMENT: f64 = 1.0e-9;
+const EPS_EXTENDED_UNIT_VECTOR: f64 = 1.0e-6;
+const EXTENDED_FORM_WORDS: [u32; 4] = [0x0020_1296, 0x0020_1a96, 0x0020_1b96, 0x0020_1e96];
+const EPS_CYLINDER_ANGLE: f64 = 1.0e-12;
+const EPS_POLE_BOX_ROUNDING: f64 = 1.0e-9;
+const DISPLAY_QUANTIZATION_ULPS: f64 = 8.0;
+const MAX_PLANAR_TRIM_ARC_SEGMENTS: usize = 4096;
+const MIN_TESSELLATION_NORMAL_ALIGNMENT: f64 = 1.0 - 1.0e-4;
+/// Floor of the work one surface-owner pass may spend on trims, containment
+/// tests and vertex measures. Tables left when it runs out stay unassigned.
+const TESSELLATION_OWNER_WORK: usize = 1 << 30;
+
+/// Work the surface-owner pass may spend per row of the model, above
+/// [`TESSELLATION_OWNER_WORK`]. The rows are the model's faces and coedges
+/// and the vertices and triangles of its tessellation tables.
+const TESSELLATION_OWNER_WORK_PER_ROW: usize = 1 << 17;
+
+/// The rows that size the surface-owner work, or `None` past `usize`. Tables
+/// that face keys or persistent identities already own still count, so
+/// owning them first leaves the remaining tables the same budget.
+fn tessellation_owner_rows(model: &cadmpeg_ir::document::Model) -> Option<usize> {
+    let mut rows = model.faces.len().checked_add(model.coedges.len())?;
+    for mesh in &model.tessellations {
+        rows = rows
+            .checked_add(mesh.vertex_count())?
+            .checked_add(mesh.triangle_count())?;
+    }
+    Some(rows)
+}
+
+/// The owner work over `rows`, where `None` means past `usize`.
+fn tessellation_owner_work_limit(rows: Option<usize>) -> usize {
+    rows.and_then(|rows| rows.checked_mul(TESSELLATION_OWNER_WORK_PER_ROW))
+        .map_or(TESSELLATION_OWNER_WORK, |work| {
+            work.max(TESSELLATION_OWNER_WORK)
+        })
+}
+
+/// Charges a step over `left` × `right` items. A product past `usize` cannot
+/// be paid, so it exhausts the budget.
+fn charge_product(work: &WorkBudget, left: usize, right: usize) -> bool {
+    let Some(units) = left.checked_mul(right) else {
+        work.exhaust();
+        return false;
+    };
+    work.charge_by(units)
+}
+
+fn owner_work_capped_loss(skipped: usize, work_limit: usize) -> LossNote {
+    crate::loss::SldprtLossCode::TessellationOwnerWorkCapped.note(format!(
+        "{skipped} DisplayLists tessellation table(s) were left without a surface owner because \
+         owner assignment exceeded the local work cap TESSELLATION_OWNER_WORK ({work_limit})."
+    ))
+}
+
+fn needs_surface_owner(mesh: &cadmpeg_ir::tessellation::Tessellation) -> bool {
+    mesh.body.is_none() && mesh.faces.is_empty() && mesh.vertex_count() != 0
+}
+
+#[cfg(test)]
+thread_local! {
+    static DISPLAY_PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_display_parse_calls() {
+    DISPLAY_PARSE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn display_parse_calls() -> usize {
+    DISPLAY_PARSE_CALLS.with(std::cell::Cell::get)
+}
+
+/// The evaluation tolerance of one face in the display lane.
+///
+/// The display lane quantizes coordinates to `f32`, so a tolerance below
+/// [`EPS_DISPLAY_QUANTIZATION`] states a resolution the lane does not carry.
+/// [`FaceEvaluationTolerance::of`] is the only constructor: a stated tolerance
+/// under that bound is refused, so no stated value is floored, and a face that
+/// states no tolerance evaluates at the bound.
+#[derive(Debug, Clone, Copy)]
+struct FaceEvaluationTolerance(f64);
+
+impl FaceEvaluationTolerance {
+    /// The evaluation tolerance of `face`, or `None` when its stated
+    /// tolerance is finer than the display lane resolves. Callers validate
+    /// every face before evaluating any trim, so this `None` cannot silently
+    /// discard a source face during assignment.
+    fn of(face: &cadmpeg_ir::topology::Face) -> Option<Self> {
+        let Some(stated) = face.tolerance else {
+            return Some(Self(EPS_DISPLAY_QUANTIZATION));
+        };
+        (stated.get() >= EPS_DISPLAY_QUANTIZATION).then_some(Self(stated.get()))
+    }
+
+    /// The tolerance value.
+    fn get(self) -> f64 {
+        self.0
+    }
+}
+
+const FACE_TESSELLATION_CLASS: &[u8] = b"uoTempFaceTessData_c";
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Summary {
+    pub(crate) vertices: usize,
+    pub(crate) triangles: usize,
+    pub(crate) extended_forms: [usize; 4],
+    pub(crate) opaque_extended_tables: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Mesh {
+    mesh: TessellationMesh,
+    channels: Vec<TessellationChannel>,
+}
+
+impl Default for Mesh {
+    fn default() -> Self {
+        Self {
+            mesh: TessellationMesh::List {
+                vertices: Vec::new(),
+                triangles: Vec::new(),
+            },
+            channels: Vec::new(),
+        }
+    }
+}
+
+impl Mesh {
+    /// Number of vertices the strips span.
+    fn vertex_count(&self) -> usize {
+        self.mesh.vertex_count()
+    }
+
+    /// Number of triangles the strips expand to.
+    fn triangle_count(&self) -> usize {
+        self.mesh.triangle_count()
+    }
+
+    /// Number of strips in the mesh.
+    fn strip_count(&self) -> usize {
+        self.mesh.strip_lengths().len()
+    }
+
+    pub(crate) fn into_tessellation(
+        self,
+        id: cadmpeg_ir::tessellation::TessellationId,
+    ) -> Result<cadmpeg_ir::tessellation::Tessellation, cadmpeg_ir::tessellation::TessellationError>
+    {
+        cadmpeg_ir::tessellation::Tessellation::new(id, self.mesh, self.channels)
+    }
+}
+
+/// A nonempty-or-empty byte interval whose end never precedes its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByteRange {
+    start: usize,
+    end: usize,
+}
+
+impl ByteRange {
+    /// The interval `start..end`, when it is ordered.
+    fn new(start: usize, end: usize) -> Option<Self> {
+        (start <= end).then_some(Self { start, end })
+    }
+
+    /// First byte offset of the interval.
+    pub(crate) fn start(self) -> usize {
+        self.start
+    }
+
+    /// One past the last byte offset of the interval.
+    pub(crate) fn end(self) -> usize {
+        self.end
+    }
+
+    /// This interval truncated at `end`, empty when `end` precedes its start.
+    fn truncated(self, end: usize) -> Self {
+        Self {
+            start: self.start,
+            end: end.min(self.end).max(self.start),
+        }
+    }
+}
+
+/// One decoded `uoTempFaceTessData_c` descriptor table.
+#[derive(Debug, Clone)]
+pub(crate) struct DisplayFace {
+    pub(crate) mesh: Mesh,
+    pub(crate) table: ByteRange,
+    pub(crate) metadata: ByteRange,
+    pub(crate) surface_references: Vec<PersistentSurfaceReference>,
+}
+
+/// One framed persistent-surface reference in a display-face metadata slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PersistentSurfaceReference {
+    /// A complete identity whose optional tail is entirely numeric.
+    Complete(PersistentFaceIdentity),
+    /// A source-level reference whose trailing fields are opaque.
+    SourceOnly {
+        feature_source_id: FeatureSourceId,
+        local_surface_id: u32,
+    },
+}
+
+/// Parse status of one framed saved surface-reference string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceTokenStatus {
+    /// Every trailing field parses as a signed 32-bit value.
+    Complete,
+    /// A trailing field is not numeric, so only the source identity is kept.
+    OpaqueTail,
+    /// The string carries no usable identity: the class name, the source id,
+    /// or the local id does not parse, or the source id is absent.
+    Invalid,
+}
+
+impl PersistentSurfaceReference {
+    pub(crate) fn feature_source_id(&self) -> FeatureSourceId {
+        match self {
+            Self::Complete(identity) => identity.feature_source_id,
+            Self::SourceOnly {
+                feature_source_id, ..
+            } => *feature_source_id,
+        }
+    }
+
+    /// The parse status of this reference: complete identities parsed whole,
+    /// source-only references kept an opaque tail.
+    fn token_status(&self) -> SurfaceTokenStatus {
+        match self {
+            Self::Complete(_) => SurfaceTokenStatus::Complete,
+            Self::SourceOnly { .. } => SurfaceTokenStatus::OpaqueTail,
+        }
+    }
+}
+
+/// Agreement over one table's saved surface references. Any invalid part
+/// withholds agreement, so doubt never promotes bytes to an owned mesh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SurfaceTokenAgreement {
+    /// Every duplicate reference states the same complete identity.
+    Agree(PersistentFaceIdentity),
+    /// The references do not agree; the table keeps no persistent owner.
+    Withhold(SurfaceTokenWithhold),
+}
+
+/// The reason saved surface references withhold agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceTokenWithhold {
+    /// Identical source and local ids carry differing suffixes, or two
+    /// complete identities differ.
+    Conflicting,
+    /// A reference keeps only its source identity behind an opaque tail.
+    OpaqueTail,
+    /// No complete reference agrees: the slot is empty or carries no
+    /// complete identity.
+    Invalid,
+}
+
+impl SurfaceTokenAgreement {
+    /// The agreed identity, when the references agree.
+    #[cfg(test)]
+    pub(crate) fn identity(self) -> Option<PersistentFaceIdentity> {
+        match self {
+            Self::Agree(identity) => Some(identity),
+            Self::Withhold(_) => None,
+        }
+    }
+}
+
+/// Agree the saved surface references of one display-face table. Complete
+/// references agree only when every duplicate states the same identity;
+/// an opaque tail or a missing complete identity withholds agreement.
+pub(crate) fn agree_surface_tokens(
+    references: &[PersistentSurfaceReference],
+) -> SurfaceTokenAgreement {
+    if references
+        .iter()
+        .any(|reference| reference.token_status() == SurfaceTokenStatus::OpaqueTail)
+    {
+        return SurfaceTokenAgreement::Withhold(SurfaceTokenWithhold::OpaqueTail);
+    }
+    let mut identities = references.iter().filter_map(|reference| match reference {
+        PersistentSurfaceReference::Complete(identity) => Some(identity),
+        PersistentSurfaceReference::SourceOnly { .. } => None,
+    });
+    let Some(first) = identities.next() else {
+        return SurfaceTokenAgreement::Withhold(SurfaceTokenWithhold::Invalid);
+    };
+    if identities.all(|identity| identity == first) {
+        SurfaceTokenAgreement::Agree(first.clone())
+    } else {
+        SurfaceTokenAgreement::Withhold(SurfaceTokenWithhold::Conflicting)
+    }
+}
+
+/// Verdict over the reused class tags standing before one known
+/// display-face table. A tag candidate is the u16 at a byte offset the
+/// table's gap holds, followed by the two u32 counts of that table's mesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReusedTagVerdict {
+    /// No tag candidate stands before the table.
+    Absent,
+    /// Exactly one tag candidate survives validation.
+    Admit(u16),
+    /// Several candidates survive; the reuse is ambiguous.
+    Withhold,
+}
+
+/// Length of one reused-tag probe: the u16 tag and the two u32 counts.
+const REUSED_TAG_PROBE_LEN: usize = 10;
+
+/// Family bit of a u16 class reference. Tags without it are not classes.
+const CLASS_TAG_FAMILY_BIT: u16 = 0x8000;
+
+/// Absent wire values, which never name a class.
+const CLASS_TAG_ABSENT_HIGH: u16 = 0xffff;
+/// Absent wire values, which never name a class.
+const CLASS_TAG_ABSENT_LOW: u16 = 0x8000;
+
+/// Admit the reused class tag before `face` only when exactly one tag
+/// candidate survives validation: the family bit set, neither absent value,
+/// the two counts after the tag agreeing with the table's mesh, and the tag
+/// offset contained in a face-tessellation class interval. Any ambiguity
+/// withholds, so doubt never promotes bytes to an owned mesh.
+pub(crate) fn admit_reused_face_tag(
+    payload: &[u8],
+    face: &DisplayFace,
+    previous_table_end: usize,
+    classes: &[ClassInterval],
+) -> ReusedTagVerdict {
+    let table_start = face.table.start();
+    let Some(probe_last) = table_start.checked_sub(REUSED_TAG_PROBE_LEN) else {
+        return ReusedTagVerdict::Absent;
+    };
+    let mut survivor = None;
+    for at in previous_table_end..=probe_last {
+        let Some(tag) = View::u16_le_at(payload, at) else {
+            continue;
+        };
+        if tag & CLASS_TAG_FAMILY_BIT == 0
+            || tag == CLASS_TAG_ABSENT_HIGH
+            || tag == CLASS_TAG_ABSENT_LOW
+        {
+            continue;
+        }
+        let (Some(triangle_count), Some(strip_count)) = (
+            View::u32_le_at(payload, at + 2),
+            View::u32_le_at(payload, at + 6),
+        ) else {
+            continue;
+        };
+        if cadmpeg_core::decode::index_from_u32(triangle_count) != face.mesh.triangle_count()
+            || cadmpeg_core::decode::index_from_u32(strip_count) != face.mesh.strip_count()
+        {
+            continue;
+        }
+        let contained = classes.iter().any(|class| {
+            class.name == "uoTempFaceTessData_c"
+                && class.content.start() <= at
+                && at < class.content.end()
+        });
+        if !contained {
+            continue;
+        }
+        if survivor.is_some() {
+            return ReusedTagVerdict::Withhold;
+        }
+        survivor = Some(tag);
+    }
+    match survivor {
+        Some(tag) => ReusedTagVerdict::Admit(tag),
+        None => ReusedTagVerdict::Absent,
+    }
+}
+
+/// Advisory verdict over joining one display-face table to a persistent
+/// identity. The verdict only withholds joins; the geometric and identity
+/// evidence that owns a mesh is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PersistentJoinVerdict {
+    /// The saved references agree and no reused tag disputes the table.
+    Admit(PersistentFaceIdentity),
+    /// Doubt withholds the join; the table keeps no persistent owner.
+    Withhold(PersistentJoinWithhold),
+}
+
+/// The reason a persistent join is withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistentJoinWithhold {
+    /// Duplicate complete identities disagree.
+    ConflictingTokens,
+    /// A reference keeps only its source identity behind an opaque tail.
+    OpaqueTokenTail,
+    /// The slot carries no agreeing complete identity.
+    InvalidTokens,
+    /// Several reused-tag candidates survive before the table.
+    AmbiguousReusedTag,
+}
+
+/// Join one display-face table to its persistent identity only when its
+/// saved references agree and at most one reused tag stands before it.
+pub(crate) fn persistent_join_verdict(
+    payload: &[u8],
+    faces: &[DisplayFace],
+    index: usize,
+    classes: &[ClassInterval],
+) -> PersistentJoinVerdict {
+    let Some(face) = faces.get(index) else {
+        return PersistentJoinVerdict::Withhold(PersistentJoinWithhold::InvalidTokens);
+    };
+    let identity = match agree_surface_tokens(&face.surface_references) {
+        SurfaceTokenAgreement::Agree(identity) => identity,
+        SurfaceTokenAgreement::Withhold(SurfaceTokenWithhold::Conflicting) => {
+            return PersistentJoinVerdict::Withhold(PersistentJoinWithhold::ConflictingTokens);
+        }
+        SurfaceTokenAgreement::Withhold(SurfaceTokenWithhold::OpaqueTail) => {
+            return PersistentJoinVerdict::Withhold(PersistentJoinWithhold::OpaqueTokenTail);
+        }
+        SurfaceTokenAgreement::Withhold(SurfaceTokenWithhold::Invalid) => {
+            return PersistentJoinVerdict::Withhold(PersistentJoinWithhold::InvalidTokens);
+        }
+    };
+    let previous_table_end = index
+        .checked_sub(1)
+        .and_then(|previous| faces.get(previous))
+        .map_or(face.table.start(), |previous| previous.table.end());
+    match admit_reused_face_tag(payload, face, previous_table_end, classes) {
+        ReusedTagVerdict::Absent | ReusedTagVerdict::Admit(_) => {
+            PersistentJoinVerdict::Admit(identity)
+        }
+        ReusedTagVerdict::Withhold => {
+            PersistentJoinVerdict::Withhold(PersistentJoinWithhold::AmbiguousReusedTag)
+        }
+    }
+}
+
+/// One `DisplayLists` table whose persistent surface identity can bind a B-rep face.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistentFaceBinding {
+    pub(crate) tessellation: String,
+    pub(crate) identity: PersistentFaceIdentity,
+}
+
+/// One `DisplayLists` table whose face key can bind a B-rep face.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FaceKeyBinding {
+    pub(crate) tessellation: String,
+    pub(crate) key: u32,
+}
+
+impl DisplayFace {
+    /// Return the source ID only when all duplicated references agree.
+    pub(crate) fn feature_source_id(&self) -> Option<FeatureSourceId> {
+        let mut sources = self
+            .surface_references
+            .iter()
+            .map(PersistentSurfaceReference::feature_source_id);
+        let source = sources.next()?;
+        sources
+            .all(|candidate| candidate == source)
+            .then_some(source)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClassInterval {
+    pub(crate) name: String,
+    pub(crate) class_offset: usize,
+    pub(crate) content: ByteRange,
+    source_ids: Vec<u32>,
+}
+
+pub(crate) fn class_intervals(payload: &[u8]) -> Vec<ClassInterval> {
+    let mut declarations = Vec::new();
+    for (offset, marker) in payload.windows(CLASS_MARKER.len()).enumerate() {
+        if marker != CLASS_MARKER {
+            continue;
+        }
+        let Some(length) = View::u16_le_at(payload, offset + 4).map(usize::from) else {
+            continue;
+        };
+        if !(1..=128).contains(&length) {
+            continue;
+        }
+        let Some(name_bytes) = payload.get(offset + 6..offset + 6 + length) else {
+            continue;
+        };
+        if !name_bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            continue;
+        }
+        let Ok(name_text) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+        let name = name_text.to_owned();
+        declarations.push((offset, name));
+    }
+    let mut declarations = declarations.into_iter().peekable();
+    let mut intervals = Vec::new();
+    while let Some((offset, name)) = declarations.next() {
+        let start = offset + 6 + name.len();
+        let end = declarations.peek().map_or(payload.len(), |(next, _)| *next);
+        let Some(content) = ByteRange::new(start, end) else {
+            continue;
+        };
+        let Some(records) = payload.get(start..end) else {
+            continue;
+        };
+        let mut source_ids = Vec::new();
+        for window in records.windows(scene_src::LEN) {
+            let Some(source) = window
+                .starts_with(SCENE_SOURCE_MARKER)
+                .then(|| View::u32_le_at(window, scene_src::SOURCE_ID))
+                .flatten()
+                .filter(|source| *source != 0)
+            else {
+                continue;
+            };
+            source_ids.push(source);
+        }
+        intervals.push(ClassInterval {
+            name,
+            class_offset: offset,
+            content,
+            source_ids,
+        });
+    }
+    intervals
+}
+
+fn scene_classes(payload: &[u8]) -> Vec<(u32, String)> {
+    let mut classes = Vec::new();
+    for class in class_intervals(payload) {
+        if !matches!(
+            crate::classification::native_object_class(&class.name).tree_node(),
+            Some(
+                cadmpeg_ir::features::FeatureTreeNodeRole::AmbientLight
+                    | cadmpeg_ir::features::FeatureTreeNodeRole::DirectionalLight
+                    | cadmpeg_ir::features::FeatureTreeNodeRole::PointLight
+                    | cadmpeg_ir::features::FeatureTreeNodeRole::SpotLight
+            )
+        ) {
+            continue;
+        }
+        for source in class.source_ids {
+            classes.push((source, class.name.clone()));
+        }
+    }
+    classes
+}
+
+pub(crate) fn scene_feature_classes(scan: &ContainerScan) -> HashMap<u32, String> {
+    let mut candidates = HashMap::<u32, Option<String>>::new();
+    for section in scan.sections() {
+        for (source, class) in scene_classes(section.payload()) {
+            candidates
+                .entry(source)
+                .and_modify(|existing| {
+                    if existing.as_deref() != Some(class.as_str()) {
+                        *existing = None;
+                    }
+                })
+                .or_insert_with(|| Some(class));
+        }
+    }
+    let mut resolved = HashMap::new();
+    for (source, class) in candidates {
+        if let Some(class) = class {
+            resolved.insert(source, class);
+        }
+    }
+    resolved
+}
+
+pub(crate) fn auxiliary_channels_are_consistent(
+    strips: &[usize],
+    channels: &[TessellationChannel],
+) -> bool {
+    let [b, c, d] = channels else { return false };
+    if (b.item_size(), b.kind(), b.flags()) != (4, 8, 2)
+        || (c.item_size(), c.kind(), c.flags()) != (4, 8, 2)
+        || (d.item_size(), d.kind(), d.flags()) != (1, 8, 2)
+    {
+        return false;
+    }
+    auxiliary_lanes_are_consistent(
+        strips,
+        [
+            (usize::try_from(b.count()).ok(), b.data()),
+            (usize::try_from(c.count()).ok(), c.data()),
+            (usize::try_from(d.count()).ok(), d.data()),
+        ],
+    )
+}
+
+/// Whether the three auxiliary lanes, each a count and its data, agree with the
+/// strip lengths.
+fn auxiliary_lanes_are_consistent(
+    strips: &[usize],
+    [b, c, d]: [(Option<usize>, &[u8]); 3],
+) -> bool {
+    let Some(endpoint_count) = strips.iter().try_fold(0usize, |total, length| {
+        total.checked_add(length.checked_mul(2)?.checked_sub(2)?)
+    }) else {
+        return false;
+    };
+    let stored_list_c_matches = c.1.chunks_exact(4).len() == strips.len()
+        && c.1.chunks_exact(4).zip(strips).all(|(bytes, length)| {
+            length.checked_mul(2).and_then(|count| count.checked_sub(2))
+                == View::u32_le_at(bytes, 0).and_then(|count| usize::try_from(count).ok())
+        });
+    let counts = (b.0, d.0);
+    (counts == (Some(0), Some(0)) || counts == (Some(endpoint_count), Some(endpoint_count)))
+        && c.0 == Some(strips.len())
+        && stored_list_c_matches
+        && b.1
+            .chunks_exact(4)
+            .all(|bytes| View::f32_le_at(bytes, 0).is_some_and(f32::is_finite))
+}
+
+/// The six descriptor channels of one display-list table, read as lanes.
+struct ProbedTable {
+    strips: Vec<usize>,
+    vertices: Vec<Point3>,
+    normals: Vec<Vector3>,
+    channels: Vec<TessellationChannel>,
+}
+
+/// The `(item_size, kind, flags)` of the six descriptors of a display-list
+/// table, in order (`sldprt.md` §8).
+const TABLE_DESCRIPTORS: [(usize, u32, u32); 6] = [
+    (4, 8, 2),
+    (12, 100, 2),
+    (12, 100, 2),
+    (4, 8, 2),
+    (4, 8, 2),
+    (1, 8, 2),
+];
+
+/// Read the six descriptors at `at` as display-list lanes.
+///
+/// `None` is a probe miss: the descriptors at this byte position do not state
+/// the display-list grammar. Channel bytes are charged only after the six
+/// descriptors match, the strip and position lanes are not empty and the
+/// auxiliary lanes agree with the strips.
+fn probe_table(
+    ctx: &DecodeContext<'_>,
+    bytes: &[u8],
+    mut at: usize,
+) -> Result<Option<(ProbedTable, usize)>, cadmpeg_core::CodecError> {
+    let mut strips = Vec::new();
+    let mut vertices = Vec::new();
+    let mut normals = Vec::new();
+    let mut ranges = [(0_usize, 0_usize, 0_u32, 0_usize); 6];
+    for (index, &(expected_size, expected_kind, expected_flags)) in
+        TABLE_DESCRIPTORS.iter().enumerate()
+    {
+        let Some(item_size_field) = View::u32_le_at(bytes, at) else {
+            return Ok(None);
+        };
+        let item_size = cadmpeg_core::decode::index_from_u32(item_size_field);
+        let Some(kind) = View::u32_le_at(bytes, at + 4) else {
+            return Ok(None);
+        };
+        let Some(flags) = View::u32_le_at(bytes, at + 8) else {
+            return Ok(None);
+        };
+        if (item_size, kind, flags) != (expected_size, expected_kind, expected_flags) {
+            return Ok(None);
+        }
+        let Some(count) = View::u32_le_at(bytes, at + 12).map(cadmpeg_core::decode::index_from_u32)
+        else {
+            return Ok(None);
+        };
+        let data = at + 16;
+        let Some(end) = item_size
+            .checked_mul(count)
+            .and_then(|size| data.checked_add(size))
+        else {
+            return Ok(None);
+        };
+        if end > bytes.len() {
+            return Ok(None);
+        }
+        ranges[index] = (data, end, item_size_field, count);
+        if index == 0 {
+            for i in 0..count {
+                let Some(length) = View::u32_le_at(bytes, data + i * 4) else {
+                    return Ok(None);
+                };
+                strips.push(cadmpeg_core::decode::index_from_u32(length));
+            }
+        } else if index == 1 {
+            for i in 0..count {
+                let p = data + i * 12;
+                let read = |at| {
+                    View::f32_le_at(bytes, at)
+                        .map(f64::from)
+                        .filter(|value| value.is_finite())
+                };
+                let (Some(x), Some(y), Some(z)) = (read(p), read(p + 4), read(p + 8)) else {
+                    return Ok(None);
+                };
+                vertices.push(Point3::new(x * 1000.0, y * 1000.0, z * 1000.0));
+            }
+        } else if index == 2 {
+            for i in 0..count {
+                let p = data + i * 12;
+                let read = |at| {
+                    View::f32_le_at(bytes, at)
+                        .map(f64::from)
+                        .filter(|value| value.is_finite())
+                };
+                let (Some(x), Some(y), Some(z)) = (read(p), read(p + 4), read(p + 8)) else {
+                    return Ok(None);
+                };
+                normals.push(Vector3::new(x, y, z));
+            }
+        }
+        at = end;
+    }
+    if strips.is_empty() || vertices.is_empty() {
+        return Ok(None);
+    }
+    let lane = |index: usize| {
+        let (data, end, _, count) = ranges[index];
+        (Some(count), &bytes[data..end])
+    };
+    if !auxiliary_lanes_are_consistent(&strips, [lane(3), lane(4), lane(5)]) {
+        return Ok(None);
+    }
+    let Some(channel_bytes) = ranges
+        .iter()
+        .try_fold(0_usize, |total, &(data, end, _, _)| {
+            total.checked_add(end - data)
+        })
+    else {
+        return Ok(None);
+    };
+    ctx.retain_bytes(
+        cadmpeg_core::decode::u64_from_index(channel_bytes),
+        "copy display-list channel bytes",
+    )?;
+    let mut channels = Vec::with_capacity(TABLE_DESCRIPTORS.len());
+    for (&(data, end, item_size_field, _), &(_, kind, flags)) in
+        ranges.iter().zip(&TABLE_DESCRIPTORS)
+    {
+        let Ok(channel) = TessellationChannel::new(
+            cadmpeg_ir::tessellation::ChannelAddressing::Vertex {},
+            item_size_field,
+            kind,
+            flags,
+            bytes[data..end].to_vec(),
+        ) else {
+            return Ok(None);
+        };
+        channels.push(channel);
+    }
+    Ok(Some((
+        ProbedTable {
+            strips,
+            vertices,
+            normals,
+            channels,
+        },
+        at,
+    )))
+}
+
+/// Pair one display-list table's lanes into mesh rows.
+///
+/// `Ok(None)` is a probe miss and nothing else: the descriptors at this byte
+/// position do not state the display-list grammar. The descriptor is the record
+/// boundary, so once `probe_table` answers, the region is a table and every
+/// lane disagreement inside it is a `CodecError` naming the table's byte
+/// offset — a nonempty normal lane that does not cover the vertices, and strip
+/// spans that do not cut the vertex lane, alike. An empty native normal channel
+/// supplies an unshaded mesh while its descriptor and bytes remain retained.
+fn parse_table(
+    ctx: &DecodeContext<'_>,
+    bytes: &[u8],
+    at: usize,
+) -> Result<Option<(Mesh, usize)>, cadmpeg_core::CodecError> {
+    let Some((
+        ProbedTable {
+            strips,
+            vertices,
+            normals,
+            channels,
+        },
+        end,
+    )) = probe_table(ctx, bytes, at)?
+    else {
+        return Ok(None);
+    };
+    let mut spans = Vec::new();
+    for length in strips {
+        spans.push(u32::try_from(length).map_err(|_| {
+            cadmpeg_core::CodecError::malformed("display-list strip length exceeds 32 bits")
+        })?);
+    }
+    let shading = (!normals.is_empty()).then_some(normals);
+    match TessellationMesh::from_strip_lanes(vertices, shading, &spans) {
+        Ok(mesh) => Ok(Some((Mesh { mesh, channels }, end))),
+        Err(error) => Err(cadmpeg_core::CodecError::malformed(format_args!(
+            "sldprt display-list table at byte {at}: {error}"
+        ))),
+    }
+}
+
+pub(crate) fn section_display_faces(
+    ctx: &DecodeContext<'_>,
+    section: Section<'_>,
+) -> Result<Vec<DisplayFace>, cadmpeg_core::CodecError> {
+    #[cfg(test)]
+    DISPLAY_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let payload = section.payload();
+    let mut markers = payload
+        .windows(FACE_TESSELLATION_CLASS.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == FACE_TESSELLATION_CLASS).then_some(offset))
+        .peekable();
+    let mut faces = Vec::new();
+    while let Some(marker) = markers.next() {
+        let header = marker + FACE_TESSELLATION_CLASS.len();
+        let (Some(triangle_count), Some(strip_count)) = (
+            View::u32_le_at(payload, header + compact_face::TRIANGLE_COUNT),
+            View::u32_le_at(payload, header + compact_face::STRIP_COUNT),
+        ) else {
+            continue;
+        };
+        // `uoBodyPropInfo_c` declarations separate body-property groups, but
+        // face descriptor tables continue after them without repeating the
+        // `uoTempFaceTessData_c` declaration. Only another face declaration
+        // starts a new sequence.
+        let limit = markers.peek().copied().unwrap_or(payload.len());
+        let start = header + descriptor_table_offset(payload, header);
+        let Some(tables) = parse_table_sequence(ctx, payload, start, limit)? else {
+            continue;
+        };
+        // The face header states the mesh of its first table when it states a
+        // mesh at all. Two zero counts state none: the primary writes that
+        // header over a face whose descriptor table still holds a mesh, and
+        // the marker then states no display face -- the disposition this
+        // decoder has always given it. A stated, positive count that disagrees
+        // with the table below it is a different thing: a contradiction inside
+        // bytes that are present, which takes the same disposition as a lane
+        // disagreement inside the same table.
+        let [(table_start, _, first_mesh), ..] = tables.as_slice() else {
+            return Err(cadmpeg_core::CodecError::malformed(format_args!(
+                "sldprt display-face header at byte {header} states no table"
+            )));
+        };
+        let Some((triangle_count, strip_count)) =
+            (triangle_count != 0 || strip_count != 0).then_some((triangle_count, strip_count))
+        else {
+            // The header states no mesh, so the tables below it are not the
+            // ones it describes and this marker states no display face.
+            continue;
+        };
+        let parsed_triangles = first_mesh.triangle_count();
+        let parsed_strips = first_mesh.strip_count();
+        if usize::try_from(triangle_count).ok() != Some(parsed_triangles)
+            || usize::try_from(strip_count).ok() != Some(parsed_strips)
+        {
+            return Err(cadmpeg_core::CodecError::malformed(format_args!(
+                "sldprt display-face table at byte {table_start}: header states \
+                 {triangle_count} triangle(s) and {strip_count} strip(s); the parsed mesh has \
+                 {parsed_triangles} triangle(s) and {parsed_strips} strip(s)"
+            )));
+        }
+        for (start, end, mesh) in tables {
+            let (Some(table), Some(metadata)) =
+                (ByteRange::new(start, end), ByteRange::new(end, limit))
+            else {
+                continue;
+            };
+            faces.push(DisplayFace {
+                mesh,
+                table,
+                metadata,
+                surface_references: Vec::new(),
+            });
+        }
+    }
+    faces.sort_by_key(|face| face.table.start());
+    for index in 0..faces.len() {
+        let metadata_end = faces
+            .get(index + 1)
+            .map_or(faces[index].metadata.end(), |next| next.table.start());
+        faces[index].metadata = faces[index].metadata.truncated(metadata_end);
+        faces[index].surface_references =
+            persistent_surface_references(ctx, payload, faces[index].metadata)?;
+    }
+    Ok(faces)
+}
+
+/// Offset of the first descriptor after a face-tessellation class name.
+///
+/// Both forms begin with two u32 cells. The extended form then carries a
+/// fixed 32-byte extension. A compact table begins with item
+/// size 4 at the same position, so it cannot satisfy the extension grammar.
+fn descriptor_table_offset(payload: &[u8], at: usize) -> usize {
+    let extended = View::u32_le_at(payload, at + extended_face::FORM) == Some(1)
+        && View::u32_le_at(payload, at + extended_face::ZERO_AT_12) == Some(0)
+        && View::u32_le_at(payload, at + extended_face::ZERO_AT_16) == Some(0)
+        && View::u32_le_at(payload, at + extended_face::FORM_TOKEN).is_some_and(|token| token != 0)
+        && payload
+            .get(at + extended_face::ZERO_TAIL..at + extended_face::LEN)
+            .is_some_and(|tail| tail.iter().all(|byte| *byte == 0));
+    if extended {
+        extended_face::LEN
+    } else {
+        compact_face::LEN
+    }
+}
+
+/// One display-list table: the byte range it spans and the mesh it states.
+type TableSpan = (usize, usize, Mesh);
+
+fn parse_table_sequence(
+    ctx: &DecodeContext<'_>,
+    payload: &[u8],
+    at: usize,
+    limit: usize,
+) -> Result<Option<Vec<TableSpan>>, cadmpeg_core::CodecError> {
+    let first_start = at;
+    let Some((mesh, mut at)) = parse_table(ctx, payload, at)? else {
+        return Ok(None);
+    };
+    if at > limit {
+        return Ok(None);
+    }
+    if mesh.vertex_count() == 0 {
+        return Ok(None);
+    }
+    let mut meshes = Vec::new();
+    meshes.push((first_start, at, mesh));
+    while at + 16 <= limit {
+        let Some(relative) = payload[at..limit]
+            .windows(4)
+            .position(|window| window == [4, 0, 0, 0])
+        else {
+            break;
+        };
+        at += relative;
+        let start = at;
+        if let Some((next, end)) = parse_table(ctx, payload, at)? {
+            if end <= limit && next.vertex_count() > 0 {
+                meshes.push((start, end, next));
+                at = end;
+            } else {
+                at += 4;
+            }
+        } else {
+            at += 4;
+        }
+    }
+    Ok(Some(meshes))
+}
+
+/// Classify one framed saved surface-reference string. Complete strings
+/// state a whole identity; strings with an opaque tail keep only their
+/// source identity; anything else carries no usable identity.
+fn classify_surface_token(text: &str) -> Result<PersistentSurfaceReference, SurfaceTokenStatus> {
+    let mut fields = text.trim().split(',');
+    let Some(_class_name) = fields
+        .next()
+        .filter(|name| name.starts_with("mo") && name.ends_with("SurfIdRep_c"))
+    else {
+        return Err(SurfaceTokenStatus::Invalid);
+    };
+    let (Some(feature_source_id), Some(local_surface_id)) = (
+        fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .and_then(|source| FeatureSourceId::try_from(source).ok()),
+        fields.next().and_then(|field| field.parse::<u32>().ok()),
+    ) else {
+        return Err(SurfaceTokenStatus::Invalid);
+    };
+    let mut trailing_fields = Vec::new();
+    for field in fields {
+        trailing_fields.push(field);
+    }
+    if trailing_fields
+        .last()
+        .is_some_and(|field| field.trim().is_empty())
+    {
+        trailing_fields.pop();
+    }
+    let mut numeric_fields = Some(Vec::new());
+    for field in trailing_fields {
+        let Ok(value) = field.parse::<i32>() else {
+            numeric_fields = None;
+            break;
+        };
+        if let Some(values) = &mut numeric_fields {
+            values.push(u32::from_ne_bytes(value.to_ne_bytes()));
+        }
+    }
+    Ok(match numeric_fields {
+        Some(trailing_fields) => PersistentSurfaceReference::Complete(PersistentFaceIdentity {
+            feature_source_id,
+            local_id: local_surface_id,
+            trailing_fields,
+        }),
+        None => PersistentSurfaceReference::SourceOnly {
+            feature_source_id,
+            local_surface_id,
+        },
+    })
+}
+
+fn persistent_surface_references(
+    ctx: &DecodeContext<'_>,
+    payload: &[u8],
+    range: ByteRange,
+) -> Result<Vec<PersistentSurfaceReference>, cadmpeg_core::CodecError> {
+    const MARKER: &[u8] = &[0xff, 0xfe, 0xff];
+    let mut references = Vec::new();
+    let mut at = range.start();
+    while at + 4 <= range.end() && at + 4 <= payload.len() {
+        if payload.get(at..at + MARKER.len()) != Some(MARKER) {
+            at += 1;
+            continue;
+        }
+        let count = usize::from(payload[at + 3]);
+        let start = at + 4;
+        let Some(end) = count
+            .checked_mul(2)
+            .and_then(|length| start.checked_add(length))
+            .filter(|end| *end <= range.end())
+        else {
+            at += 1;
+            continue;
+        };
+        let Some(raw) = payload.get(start..end) else {
+            at += 1;
+            continue;
+        };
+        let text = match ctx.utf16le_text(raw, count, false, "decode display-list reference text") {
+            Ok(text) => text,
+            Err(cadmpeg_core::CodecError::Malformed(_)) => {
+                at = end;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Ok(reference) = classify_surface_token(&text) {
+            references.push(reference);
+        }
+        at = end;
+    }
+    Ok(references)
+}
+
+fn table_counts_match(payload: &[u8], at: usize, face: &DisplayFace) -> bool {
+    View::u32_le_at(payload, at + compact_face::TRIANGLE_COUNT)
+        .map(cadmpeg_core::decode::index_from_u32)
+        == Some(face.mesh.triangle_count())
+        && View::u32_le_at(payload, at + compact_face::STRIP_COUNT)
+            .map(cadmpeg_core::decode::index_from_u32)
+            == Some(face.mesh.strip_count())
+}
+
+fn extended_header_word(payload: &[u8], face: &DisplayFace) -> Option<u32> {
+    let header = face.table.start().checked_sub(extended_face::LEN)?;
+    (descriptor_table_offset(payload, header) == extended_face::LEN)
+        .then(|| View::u32_le_at(payload, header + extended_face::FORM_TOKEN))?
+}
+
+fn table_header_start(payload: &[u8], face: &DisplayFace) -> usize {
+    if extended_header_word(payload, face).is_some() {
+        return face.table.start() - extended_face::LEN;
+    }
+    face.table
+        .start()
+        .checked_sub(compact_face::LEN)
+        .filter(|header| table_counts_match(payload, *header, face))
+        .unwrap_or(face.table.start())
+}
+
+fn known_extended_form(
+    payload: &[u8],
+    face: &DisplayFace,
+    word: u32,
+    metadata_end: usize,
+) -> Option<usize> {
+    let header = face.table.start().checked_sub(extended_face::LEN)?;
+    if !table_counts_match(payload, header, face) {
+        return None;
+    }
+    let start = face.metadata.start();
+    let end = start.checked_add(extended_meta::LEN)?;
+    if end > metadata_end {
+        return None;
+    }
+    let bytes = payload.get(start..end)?;
+    if View::u32_le_at(bytes, extended_meta::ONE) != Some(extended_meta::ONE_VALUE) {
+        return None;
+    }
+    let flag_a = View::u32_le_at(bytes, extended_meta::A)?;
+    let flag_b = View::u32_le_at(bytes, extended_meta::B)?;
+    let flag_c = View::u32_le_at(bytes, extended_meta::C)?;
+    let index = match (flag_a, flag_b, flag_c) {
+        (0, 0, 0) => 0,
+        (0, 0, 1) => 1,
+        (1, 0, 1) => 2,
+        (0, 1, 1) => 3,
+        _ => return None,
+    };
+    if EXTENDED_FORM_WORDS[index] != word {
+        return None;
+    }
+    let normals = face.mesh.channels.get(2)?.data();
+    let first = normals.get(..12)?;
+    let constant = normals.chunks_exact(12).all(|normal| normal == first);
+    if (flag_a == 1) != constant {
+        return None;
+    }
+    let tuple = bytes.get(extended_meta::TUPLE..)?;
+    if flag_b == 0 {
+        return tuple.iter().all(|byte| *byte == 0).then_some(index);
+    }
+    let [scalar, x, y, z] =
+        [0, 4, 8, 12].map(|offset| View::f32_le_at(tuple, offset).map(f64::from));
+    let (scalar, x, y, z) = (scalar?, x?, y?, z?);
+    ([scalar, x, y, z].iter().all(|value| value.is_finite())
+        && scalar > 0.0
+        && ((x * x + y * y + z * z).sqrt() - 1.0).abs() <= EPS_EXTENDED_UNIT_VECTOR)
+        .then_some(index)
+}
+
+/// End of the metadata interval of `face`, before the header of the `next` table.
+fn bounded_metadata_end(payload: &[u8], face: &DisplayFace, next: Option<&DisplayFace>) -> usize {
+    next.map_or(face.metadata.end(), |next| {
+        face.metadata.end().min(table_header_start(payload, next))
+    })
+}
+
+/// The nonzero face key `K` at `M+0x64` of table `index`, in either header form (spec §8).
+pub(crate) fn display_face_key(payload: &[u8], faces: &[DisplayFace], index: usize) -> Option<u32> {
+    let face = faces.get(index)?;
+    let start = face.metadata.start();
+    let key_end = start
+        .checked_add(extended_meta::FACE_KEY)?
+        .checked_add(std::mem::size_of::<u32>())?;
+    if key_end > bounded_metadata_end(payload, face, faces.get(index + 1)) {
+        return None;
+    }
+    if View::u32_le_at(payload, start + extended_meta::ONE) != Some(extended_meta::ONE_VALUE) {
+        return None;
+    }
+    View::u32_le_at(payload, start + extended_meta::FACE_KEY).filter(|key| *key != 0)
+}
+
+pub(crate) fn summary_for_faces(payload: &[u8], faces: &[DisplayFace]) -> Summary {
+    let mut summary = Summary::default();
+    for (index, face) in faces.iter().enumerate() {
+        summary.vertices += face.mesh.vertex_count();
+        summary.triangles += face.mesh.triangle_count();
+        let Some(word) = extended_header_word(payload, face) else {
+            continue;
+        };
+        let metadata_end = bounded_metadata_end(payload, face, faces.get(index + 1));
+        if let Some(form) = known_extended_form(payload, face, word, metadata_end) {
+            summary.extended_forms[form] += 1;
+        } else {
+            summary.opaque_extended_tables += 1;
+        }
+    }
+    summary
+}
+
+struct SurfaceCandidate<'a> {
+    face: &'a FaceId,
+    body: &'a cadmpeg_ir::ids::BodyId,
+    surface: &'a SurfaceGeometry,
+    tolerance: f64,
+    inverse: cadmpeg_ir::transform::Transform,
+    /// Whether `inverse` is the identity.
+    identity_inverse: bool,
+    trim: Option<AnalyticTrim>,
+}
+
+impl SurfaceCandidate<'_> {
+    /// `point` in the candidate's body frame, as `inverse.apply_point` maps it.
+    fn local_point(&self, point: FinitePoint3) -> Option<Point3> {
+        if self.identity_inverse {
+            return Some(identity_point(point));
+        }
+        Some(self.inverse.apply_point(point.get())?.get())
+    }
+}
+
+/// The identity transform's image of a finite point: the point, with each
+/// negative zero made positive, which is what adding zero does.
+fn identity_point(point: FinitePoint3) -> Point3 {
+    let point = point.get();
+    Point3::new(point.x + 0.0, point.y + 0.0, point.z + 0.0)
+}
+
+/// A mesh's positions, shading normals and triangles, which its accessors
+/// copy out of the stored layout. Every owner test against the mesh reads
+/// this one copy.
+struct MeshSamples {
+    vertices: Vec<FinitePoint3>,
+    normals: Vec<FiniteVector3>,
+    triangles: Vec<[u32; 3]>,
+}
+
+impl MeshSamples {
+    fn of(mesh: &cadmpeg_ir::tessellation::Tessellation) -> Self {
+        Self {
+            vertices: mesh.vertices(),
+            normals: mesh.vertex_normals(),
+            triangles: mesh.triangles(),
+        }
+    }
+}
+
+/// Bind a face-tessellation table when its vertices select one surface face.
+///
+/// Display coordinates are stored as f32, while the B-rep carriers are f64.
+/// The relative tolerance below covers that quantization. Complete analytic
+/// trims can distinguish faces on a shared analytic carrier. A NURBS support
+/// must provide a forward-evaluated parameter witness within the face or
+/// display quantization tolerance; an unconstrained nearest-support fit is
+/// not an ownership witness.
+///
+/// The pass spends at most [`TESSELLATION_OWNER_WORK_PER_ROW`] per row it
+/// walks, and never less than [`TESSELLATION_OWNER_WORK`]. Once spent, the
+/// remaining tables stay unassigned and one loss counts them.
+pub(crate) fn assign_unique_surface_owners(
+    ctx: &DecodeContext<'_>,
+    model: &mut cadmpeg_ir::document::Model,
+    losses: &mut Vec<LossNote>,
+) -> Result<Vec<String>, cadmpeg_core::CodecError> {
+    let work_limit = tessellation_owner_work_limit(tessellation_owner_rows(model));
+    assign_unique_surface_owners_within(ctx, model, losses, work_limit)
+}
+
+fn assign_unique_surface_owners_within(
+    ctx: &DecodeContext<'_>,
+    model: &mut cadmpeg_ir::document::Model,
+    losses: &mut Vec<LossNote>,
+    work_limit: usize,
+) -> Result<Vec<String>, cadmpeg_core::CodecError> {
+    for face in &model.faces {
+        if let Some(stated) = face.tolerance {
+            if stated.get() < EPS_DISPLAY_QUANTIZATION {
+                return Err(cadmpeg_core::CodecError::malformed(format_args!(
+                    "sldprt face {} evaluation tolerance {} is below display quantization floor {}",
+                    face.id,
+                    stated.get(),
+                    EPS_DISPLAY_QUANTIZATION
+                )));
+            }
+        }
+    }
+    if !model.tessellations.iter().any(needs_surface_owner) {
+        return Ok(Vec::new());
+    }
+    let surfaces = model
+        .surfaces
+        .iter()
+        .map(|surface| (&surface.id, &surface.geometry))
+        .collect::<HashMap<_, _>>();
+    let regions = model
+        .regions
+        .iter()
+        .map(|region| (&region.id, &region.body))
+        .collect::<HashMap<_, _>>();
+    let shell_bodies = model
+        .shells
+        .iter()
+        .filter_map(|shell| Some((&shell.id, *regions.get(&shell.region)?)))
+        .collect::<HashMap<_, _>>();
+    let body_transforms = model
+        .bodies
+        .iter()
+        .map(|body| (&body.id, body.transform))
+        .collect::<HashMap<_, _>>();
+    let loops = model
+        .loops
+        .iter()
+        .map(|loop_| (&loop_.id, loop_))
+        .collect::<HashMap<_, _>>();
+    let coedges = model
+        .coedges
+        .iter()
+        .map(|coedge| (&coedge.id, coedge))
+        .collect::<HashMap<_, _>>();
+    let edges = model
+        .edges
+        .iter()
+        .map(|edge| (&edge.id, edge))
+        .collect::<HashMap<_, _>>();
+    let vertices = model
+        .vertices
+        .iter()
+        .map(|vertex| (&vertex.id, vertex))
+        .collect::<HashMap<_, _>>();
+    let points = model
+        .points
+        .iter()
+        .map(|point| (&point.id, point.position().get()))
+        .collect::<HashMap<_, _>>();
+    let curves = model
+        .curves
+        .iter()
+        .map(|curve| (&curve.id, &curve.geometry))
+        .collect::<HashMap<_, _>>();
+    let topology = TrimTopology {
+        loops: &loops,
+        coedges: &coedges,
+        edges: &edges,
+        vertices: &vertices,
+        points: &points,
+        curves: &curves,
+        coordinate_scale: trim_coordinate_scale(&points),
+    };
+    let work = WorkBudget::new(work_limit);
+    let mut candidates = Vec::new();
+    for face in &model.faces {
+        let candidate = (|| {
+            let body = *shell_bodies.get(&face.shell)?;
+            let inverse = match body_transforms.get(body).copied().flatten() {
+                Some(transform) if transform.is_proper_rigid() => {
+                    transform.try_inverse_affine().ok()?
+                }
+                Some(_) => return None,
+                None => cadmpeg_ir::transform::Transform::identity(),
+            };
+            Some(SurfaceCandidate {
+                face: &face.id,
+                body,
+                surface: *surfaces.get(&face.surface)?,
+                tolerance: face
+                    .tolerance
+                    .map_or(0.0, cadmpeg_ir::scalar::PositiveReal::get),
+                inverse,
+                identity_inverse: inverse == cadmpeg_ir::transform::Transform::identity(),
+                trim: None,
+            })
+        })();
+        if let Some(mut candidate) = candidate {
+            candidate.trim = analytic_trim(face, candidate.surface, &topology, &work);
+            candidates.push(candidate);
+        }
+    }
+
+    let mut assigned = Vec::new();
+    let mut capped = 0usize;
+    for mesh in &mut model.tessellations {
+        if !needs_surface_owner(mesh) {
+            continue;
+        }
+        // A trim or containment test cut short by the budget is not an
+        // ownership answer, so an exhausted pass assigns nothing further.
+        if work.exhausted() {
+            capped += 1;
+            continue;
+        }
+        let samples = MeshSamples::of(mesh);
+        let coordinate_scale = samples
+            .vertices
+            .iter()
+            .flat_map(|point| [point.x.abs(), point.y.abs(), point.z.abs()])
+            .fold(1.0_f64, f64::max);
+        let quantization_tolerance =
+            coordinate_scale * f64::from(f32::EPSILON) * DISPLAY_QUANTIZATION_ULPS
+                + EPS_DISPLAY_QUANTIZATION;
+        let mut owners = Vec::new();
+        for candidate in &candidates {
+            if !work.charge() {
+                break;
+            }
+            let tolerance = candidate.tolerance.max(quantization_tolerance);
+            let Some(surface) = candidate.surface.solved() else {
+                continue;
+            };
+            let mut fits = true;
+            for point in &samples.vertices {
+                if !work.charge() {
+                    fits = false;
+                    break;
+                }
+                let Some(local) = candidate.local_point(*point) else {
+                    fits = false;
+                    break;
+                };
+                let Some(residual) = surface_residual(ctx, surface, local, tolerance)? else {
+                    fits = false;
+                    break;
+                };
+                if residual > tolerance {
+                    fits = false;
+                    break;
+                }
+            }
+            if fits
+                && candidate.trim.as_ref().is_none_or(|trim| {
+                    trim.contains_mesh(&samples, candidate.inverse, tolerance, &work)
+                })
+            {
+                owners.push(candidate);
+            }
+        }
+        if work.exhausted() {
+            capped += 1;
+            continue;
+        }
+        let (face, body, chordal_deflection) = match owners.as_slice() {
+            [owner] => (owner.face, owner.body, None),
+            _ => {
+                if owners.iter().any(|candidate| {
+                    candidate
+                        .surface
+                        .solved()
+                        .is_some_and(contains_nurbs_surface)
+                }) {
+                    continue;
+                }
+                let approximate = approximate_surface_owner(
+                    ctx,
+                    &samples,
+                    &candidates,
+                    quantization_tolerance,
+                    &work,
+                )?;
+                if work.exhausted() {
+                    capped += 1;
+                    continue;
+                }
+                let Some((index, deflection)) = approximate else {
+                    continue;
+                };
+                let owner = &candidates[index];
+                (owner.face, owner.body, Some(deflection))
+            }
+        };
+        let assigned_id = mesh.id.as_str().to_owned();
+        mesh.faces.push(face.clone());
+        mesh.body = Some(body.clone());
+        if let Some(deflection) = chordal_deflection {
+            mesh.set_chordal_deflection(Some(deflection))
+                .map_err(|error| {
+                    cadmpeg_core::CodecError::malformed(format_args!(
+                        "invalid tessellation deflection: {error}"
+                    ))
+                })?;
+        }
+        assigned.push(assigned_id);
+    }
+    if capped > 0 {
+        losses.push(owner_work_capped_loss(capped, work_limit));
+    }
+    Ok(assigned)
+}
+
+fn approximate_surface_owner(
+    ctx: &DecodeContext<'_>,
+    mesh: &MeshSamples,
+    candidates: &[SurfaceCandidate<'_>],
+    quantization_tolerance: f64,
+    work: &WorkBudget,
+) -> Result<Option<(usize, f64)>, cadmpeg_core::CodecError> {
+    if mesh.normals.len() != mesh.vertices.len() || mesh.normals.is_empty() {
+        return Ok(None);
+    }
+    let mut fits = Vec::new();
+    let identity_normals = mesh
+        .normals
+        .iter()
+        .map(|_| std::cell::OnceCell::new())
+        .collect::<Vec<_>>();
+    for outcome in candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let mut max_residual = 0.0_f64;
+            for ((point, normal), identity_normal) in mesh
+                .vertices
+                .iter()
+                .zip(&mesh.normals)
+                .zip(&identity_normals)
+            {
+                if !work.charge() {
+                    return None;
+                }
+                let local_point = candidate.local_point(*point)?;
+                let measure =
+                    match surface_measure(ctx, candidate.surface.solved()?, local_point, None) {
+                        Ok(Some(measure)) => measure,
+                        Ok(None) => return None,
+                        Err(limit) => return Some(Err(limit)),
+                    };
+                let residual = measure.residual;
+                let surface_normal = measure.normal?;
+                let local_normal = || candidate.inverse.apply_vector(normal.get())?.unit();
+                let mesh_normal = if candidate.identity_inverse {
+                    (*identity_normal.get_or_init(local_normal))?
+                } else {
+                    local_normal()?
+                };
+                if surface_normal.dot(mesh_normal).abs() < MIN_TESSELLATION_NORMAL_ALIGNMENT {
+                    return None;
+                }
+                max_residual = max_residual.max(residual);
+            }
+            if is_planar_surface(candidate.surface.solved()?)
+                && max_residual > quantization_tolerance
+            {
+                return None;
+            }
+            Some(Ok((index, max_residual)))
+        })
+    {
+        let fit = outcome?;
+        fits.push(fit);
+    }
+    if fits.is_empty() {
+        return approximate_trimmed_surface_owner(
+            ctx,
+            mesh,
+            candidates,
+            quantization_tolerance,
+            work,
+        );
+    }
+    fits.sort_by(|left, right| left.1.total_cmp(&right.1));
+    let best_deflection = fits[0].1;
+    fits.retain(|(_, deflection)| *deflection <= best_deflection + quantization_tolerance);
+    fits.retain(|(index, _)| {
+        let candidate = &candidates[*index];
+        candidate.trim.as_ref().is_none_or(|trim| {
+            trim.contains_mesh(mesh, candidate.inverse, quantization_tolerance, work)
+        })
+    });
+    let [(index, deflection), rest @ ..] = fits.as_slice() else {
+        return Ok(None);
+    };
+    if rest
+        .first()
+        .is_some_and(|(_, next, ..)| *next <= *deflection + quantization_tolerance)
+    {
+        return Ok(None);
+    }
+    Ok(Some((*index, *deflection)))
+}
+
+/// Use a unique analytic trim as an ownership witness when stored display
+/// normals are absent or inconsistent. This path requires a bounded trim, so
+/// geometric coincidence on an unbounded analytic carrier cannot fabricate an
+/// owner without the normal agreement required above.
+fn approximate_trimmed_surface_owner(
+    ctx: &DecodeContext<'_>,
+    mesh: &MeshSamples,
+    candidates: &[SurfaceCandidate<'_>],
+    quantization_tolerance: f64,
+    work: &WorkBudget,
+) -> Result<Option<(usize, f64)>, cadmpeg_core::CodecError> {
+    let mut fits = Vec::new();
+    for outcome in candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let trim = candidate.trim.as_ref()?;
+            let mut max_residual = 0.0_f64;
+            for point in &mesh.vertices {
+                if !work.charge() {
+                    return None;
+                }
+                let residual = match surface_measure_with(
+                    ctx,
+                    candidate.surface.solved()?,
+                    candidate.local_point(*point)?,
+                    None,
+                    false,
+                ) {
+                    Ok(Some(measure)) => measure.residual,
+                    Ok(None) => return None,
+                    Err(limit) => return Some(Err(limit)),
+                };
+                max_residual = max_residual.max(residual);
+            }
+            if is_planar_surface(candidate.surface.solved()?)
+                && max_residual > quantization_tolerance
+            {
+                return None;
+            }
+            trim.contains_mesh(mesh, candidate.inverse, quantization_tolerance, work)
+                .then_some(Ok((index, max_residual)))
+        })
+    {
+        let fit = outcome?;
+        fits.push(fit);
+    }
+    fits.sort_by(|left, right| left.1.total_cmp(&right.1));
+    let Some(first) = fits.first() else {
+        return Ok(None);
+    };
+    let best_deflection = first.1;
+    fits.retain(|(_, deflection)| *deflection <= best_deflection + quantization_tolerance);
+    let [(index, deflection)] = fits.as_slice() else {
+        return Ok(None);
+    };
+    Ok(Some((*index, *deflection)))
+}
+
+fn is_planar_surface(surface: &SolvedSurfaceGeometry) -> bool {
+    match surface {
+        SolvedSurfaceGeometry::Plane(_) => true,
+        SolvedSurfaceGeometry::Transformed(placed) => is_planar_surface(placed.basis()),
+        _ => false,
+    }
+}
+
+fn contains_nurbs_surface(surface: &SolvedSurfaceGeometry) -> bool {
+    match surface {
+        SolvedSurfaceGeometry::Nurbs(_) => true,
+        SolvedSurfaceGeometry::Transformed(placed) => contains_nurbs_surface(placed.basis()),
+        _ => false,
+    }
+}
+
+/// Bind `DisplayLists` tables to faces through their complete persistent identity.
+///
+/// The identity is a source-declared face key, so it is stronger than a
+/// geometric coincidence test. A repeated key with different B-rep targets or
+/// repeated table IDs with different identities is rejected as ambiguous.
+pub(crate) fn assign_persistent_owners(
+    model: &mut cadmpeg_ir::document::Model,
+    face_identities: &[(FaceId, PersistentFaceIdentity)],
+    bindings: &[PersistentFaceBinding],
+) -> Vec<String> {
+    let mut faces_by_identity = HashMap::<&PersistentFaceIdentity, Option<&FaceId>>::new();
+    for (target, identity) in face_identities {
+        match faces_by_identity.entry(identity) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(target));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref().is_some_and(|face| face != &target) {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+    }
+
+    let face_bodies = face_bodies(model);
+
+    let mut bindings_by_mesh = HashMap::<&str, Option<&PersistentFaceIdentity>>::new();
+    for binding in bindings {
+        let key = binding.tessellation.as_str();
+        let identity = &binding.identity;
+        match bindings_by_mesh.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(identity));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get() != &Some(identity) {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+    }
+
+    let mut assigned = Vec::new();
+    for mesh in &mut model.tessellations {
+        if mesh.body.is_some() || !mesh.faces.is_empty() {
+            continue;
+        }
+        let Some(Some(identity)) = bindings_by_mesh.get(mesh.id.as_str()) else {
+            continue;
+        };
+        let Some(Some(face)) = faces_by_identity.get(identity) else {
+            continue;
+        };
+        let Some(body) = face_bodies.get(*face) else {
+            continue;
+        };
+        let assigned_id = mesh.id.as_str().to_owned();
+        mesh.faces.push((*face).clone());
+        mesh.body = Some(body.clone());
+        assigned.push(assigned_id);
+    }
+    assigned
+}
+
+/// Bind `DisplayLists` tables to faces through the face key at `M+0x64`.
+///
+/// A key binds only when exactly one table and exactly one emitted face carry
+/// it, so a repeated key on either side binds nothing.
+pub(crate) fn assign_face_key_owners(
+    model: &mut cadmpeg_ir::document::Model,
+    face_keys: &[(FaceId, u32)],
+    bindings: &[FaceKeyBinding],
+) -> Vec<String> {
+    let faces_by_key = unique_by_key(face_keys.iter().map(|(face, key)| (*key, face)));
+    let tables_by_key = unique_by_key(
+        bindings
+            .iter()
+            .map(|binding| (binding.key, binding.tessellation.as_str())),
+    );
+    let face_bodies = face_bodies(model);
+    let mut owners = HashMap::new();
+    for (key, table) in &tables_by_key {
+        let (Some(table), Some(Some(face))) = (table, faces_by_key.get(key)) else {
+            continue;
+        };
+        if let Some(body) = face_bodies.get(*face) {
+            owners.insert(*table, (*face, body));
+        }
+    }
+    let mut assigned = Vec::new();
+    for mesh in &mut model.tessellations {
+        if mesh.body.is_some() || !mesh.faces.is_empty() {
+            continue;
+        }
+        let Some((face, body)) = owners.get(mesh.id.as_str()) else {
+            continue;
+        };
+        mesh.faces.push((*face).clone());
+        mesh.body = Some((*body).clone());
+        assigned.push(mesh.id.as_str().to_owned());
+    }
+    assigned
+}
+
+/// Each key's value, or `None` when the key occurs with two different values.
+fn unique_by_key<K: Eq + std::hash::Hash, V: PartialEq>(
+    pairs: impl IntoIterator<Item = (K, V)>,
+) -> HashMap<K, Option<V>> {
+    let mut found = HashMap::<K, Option<V>>::new();
+    for (key, value) in pairs {
+        match found.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(value));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry
+                    .get()
+                    .as_ref()
+                    .is_some_and(|previous| *previous != value)
+                {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The body of every face whose shell and region resolve.
+fn face_bodies(model: &cadmpeg_ir::document::Model) -> HashMap<FaceId, cadmpeg_ir::ids::BodyId> {
+    let regions = model
+        .regions
+        .iter()
+        .map(|region| (&region.id, &region.body))
+        .collect::<HashMap<_, _>>();
+    let shell_bodies = model
+        .shells
+        .iter()
+        .filter_map(|shell| Some((&shell.id, *regions.get(&shell.region)?)))
+        .collect::<HashMap<_, _>>();
+    model
+        .faces
+        .iter()
+        .filter_map(|face| Some((face.id.clone(), (*shell_bodies.get(&face.shell)?).clone())))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlaneFrame {
+    origin: FinitePoint3,
+    normal: Vector3,
+    u_axis: Vector3,
+}
+
+impl PlaneFrame {
+    fn new(origin: FinitePoint3, normal: Vector3, u_axis: Vector3) -> Option<Self> {
+        let normal = normal.unit()?;
+        let u_axis = (u_axis - normal.scale(u_axis.dot(normal))).unit()?;
+        Some(Self {
+            origin,
+            normal,
+            u_axis,
+        })
+    }
+
+    fn v_axis(self) -> Vector3 {
+        let axis = self.normal.cross(self.u_axis);
+        let length = axis.norm();
+        Vector3::new(axis.x / length, axis.y / length, axis.z / length)
+    }
+
+    fn project(self, point: Point3) -> Point2 {
+        let delta = point.vector_from(self.origin.get());
+        Point2::new(delta.dot(self.u_axis), delta.dot(self.v_axis()))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CircularHole {
+    center: Point2,
+    radius: f64,
+}
+
+#[derive(Debug, Clone)]
+enum AnalyticTrim {
+    Planar(PlanarTrim),
+    Cylindrical(CylindricalTrim),
+    Conical(ConicalTrim),
+}
+
+impl AnalyticTrim {
+    fn contains_mesh(
+        &self,
+        mesh: &MeshSamples,
+        inverse_body: cadmpeg_ir::transform::Transform,
+        tolerance: f64,
+        work: &WorkBudget,
+    ) -> bool {
+        match self {
+            Self::Planar(trim) => trim.contains_mesh(mesh, inverse_body, tolerance, work),
+            Self::Cylindrical(trim) => {
+                work.charge_by(mesh.vertices.len())
+                    && trim.contains_mesh(mesh, inverse_body, tolerance)
+            }
+            Self::Conical(trim) => {
+                work.charge_by(mesh.vertices.len())
+                    && trim.contains_mesh(mesh, inverse_body, tolerance)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PlanarOuter {
+    Polygon(TrimPolygon),
+    Circle(CircularHole),
+}
+
+#[derive(Debug, Clone)]
+enum PlanarHole {
+    Polygon {
+        boundary: TrimPolygon,
+        triangles: Vec<[Point2; 3]>,
+    },
+    Circle(CircularHole),
+}
+
+impl PlanarHole {
+    fn polygon(boundary: Vec<Point2>, tolerance: f64, work: &WorkBudget) -> Option<Self> {
+        let triangles = triangulate_polygon(&boundary, tolerance, work)?;
+        Some(Self::Polygon {
+            boundary: TrimPolygon::new(boundary),
+            triangles,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlanarTrim {
+    frame: PlaneFrame,
+    outer: Option<PlanarOuter>,
+    holes: Vec<PlanarHole>,
+    boundary_tolerance: f64,
+}
+
+enum HoleConstraint<'a> {
+    Polygon {
+        boundary: &'a TrimPolygon,
+        triangles: &'a [[Point2; 3]],
+    },
+    Circle {
+        exclusion: CircularHole,
+        boundary: CircularHole,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CylindricalTrim {
+    origin: Point3,
+    frame: OrthonormalFrame3,
+    radius: f64,
+    min_axial: f64,
+    max_axial: f64,
+    angular_start: f64,
+    angular_span: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConicalTrim {
+    origin: Point3,
+    frame: OrthonormalFrame3,
+    radius: f64,
+    ratio: PositiveReal,
+    slope: f64,
+    min_axial: f64,
+    max_axial: f64,
+    angular_start: f64,
+    angular_span: f64,
+}
+
+impl CylindricalTrim {
+    fn contains_mesh(
+        self,
+        mesh: &MeshSamples,
+        inverse_body: cadmpeg_ir::transform::Transform,
+        tolerance: f64,
+    ) -> bool {
+        mesh.vertices.iter().all(|point| {
+            let Some(point) = inverse_body.apply_point(point.get()) else {
+                return false;
+            };
+            let point = point.get();
+            let axial = point
+                .vector_from(self.origin)
+                .dot(*self.frame.axis().as_raw());
+            let angular = cylinder_angle(point, self.origin, &self.frame);
+            axial.is_finite()
+                && axial >= self.min_axial - tolerance
+                && axial <= self.max_axial + tolerance
+                && angular.is_some_and(|angular| {
+                    self.angular_span >= std::f64::consts::TAU - EPS_CYLINDER_ANGLE
+                        || circular_interval_contains(
+                            self.angular_start,
+                            self.angular_span,
+                            angular,
+                            tolerance / self.radius,
+                        )
+                })
+        })
+    }
+}
+
+impl ConicalTrim {
+    fn contains_mesh(
+        self,
+        mesh: &MeshSamples,
+        inverse_body: cadmpeg_ir::transform::Transform,
+        tolerance: f64,
+    ) -> bool {
+        mesh.vertices.iter().all(|point| {
+            let Some(point) = inverse_body.apply_point(point.get()) else {
+                return false;
+            };
+            let point = point.get();
+            let axial = point
+                .vector_from(self.origin)
+                .dot(*self.frame.axis().as_raw());
+            let local_radius = self.radius + axial * self.slope;
+            let angular = cone_angle(point, self.origin, &self.frame, self.ratio);
+            axial.is_finite()
+                && local_radius.is_finite()
+                && axial >= self.min_axial - tolerance
+                && axial <= self.max_axial + tolerance
+                && angular.is_some_and(|angular| {
+                    self.angular_span >= std::f64::consts::TAU - EPS_CYLINDER_ANGLE
+                        || circular_interval_contains(
+                            self.angular_start,
+                            self.angular_span,
+                            angular,
+                            tolerance
+                                / (local_radius.abs() * self.ratio.get().min(1.0))
+                                    .max(EPS_DISPLAY_QUANTIZATION),
+                        )
+                })
+        })
+    }
+}
+
+impl PlanarTrim {
+    fn contains_mesh(
+        &self,
+        mesh: &MeshSamples,
+        inverse_body: cadmpeg_ir::transform::Transform,
+        tolerance: f64,
+        work: &WorkBudget,
+    ) -> bool {
+        let tolerance = tolerance + self.boundary_tolerance;
+        let outer_edges = match &self.outer {
+            Some(PlanarOuter::Polygon(boundary)) => boundary.points.len(),
+            Some(PlanarOuter::Circle(_)) | None => 1,
+        };
+        let point_edges = self.holes.iter().try_fold(outer_edges, |total, hole| {
+            total.checked_add(match hole {
+                PlanarHole::Polygon { boundary, .. } => boundary.points.len(),
+                PlanarHole::Circle(_) => 1,
+            })
+        });
+        let Some(point_edges) = point_edges else {
+            work.exhaust();
+            return false;
+        };
+        if !charge_product(work, mesh.vertices.len(), point_edges) {
+            return false;
+        }
+        let mut projected = Vec::new();
+        for point in &mesh.vertices {
+            let Some(point) = inverse_body.apply_point(point.get()) else {
+                return false;
+            };
+            projected.push(self.frame.project(point.get()));
+        }
+        let mut holes = Vec::new();
+        for hole in &self.holes {
+            let constraint = match hole {
+                PlanarHole::Polygon {
+                    boundary,
+                    triangles,
+                } => HoleConstraint::Polygon {
+                    boundary,
+                    triangles,
+                },
+                PlanarHole::Circle(hole) => {
+                    let Some((exclusion, boundary)) =
+                        chordal_hole_constraint(*hole, &projected, tolerance)
+                    else {
+                        return false;
+                    };
+                    HoleConstraint::Circle {
+                        exclusion,
+                        boundary,
+                    }
+                }
+            };
+            holes.push(constraint);
+        }
+        if projected.iter().any(|point| {
+            self.outer.as_ref().is_some_and(|outer| !match outer {
+                PlanarOuter::Polygon(outer) => outer.contains(*point, tolerance),
+                PlanarOuter::Circle(outer) => {
+                    point_distance(*point, outer.center) <= outer.radius + tolerance
+                }
+            }) || holes
+                .iter()
+                .any(|hole| hole.contains_interior(*point, tolerance))
+        }) {
+            return false;
+        }
+        let outer_polygon = if mesh.triangles.is_empty() {
+            None
+        } else if let Some(PlanarOuter::Polygon(boundary)) = &self.outer {
+            let Some(polygon) = CheckedPlanarPolygon::new(boundary, tolerance, work) else {
+                return false;
+            };
+            Some(polygon)
+        } else {
+            None
+        };
+        let hole_triangles = self.holes.iter().try_fold(0usize, |total, hole| {
+            total.checked_add(match hole {
+                PlanarHole::Polygon { triangles, .. } => triangles.len(),
+                PlanarHole::Circle(_) => 1,
+            })
+        });
+        let Some(hole_triangles) = hole_triangles else {
+            work.exhaust();
+            return false;
+        };
+        if !charge_product(work, mesh.triangles.len(), hole_triangles) {
+            return false;
+        }
+        for triangle in &mesh.triangles {
+            let [Some(a), Some(b), Some(c)] = triangle.map(|index| {
+                projected
+                    .get(cadmpeg_core::decode::index_from_u32(index))
+                    .copied()
+            }) else {
+                return false;
+            };
+            if let Some(polygon) = &outer_polygon {
+                if !polygon.contains_triangle([a, b, c]) {
+                    return false;
+                }
+            }
+            if holes
+                .iter()
+                .any(|hole| hole.crosses_triangle([a, b, c], tolerance))
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl HoleConstraint<'_> {
+    fn contains_interior(&self, point: Point2, tolerance: f64) -> bool {
+        match self {
+            Self::Polygon { boundary, .. } => boundary.strictly_contains(point, tolerance),
+            Self::Circle { exclusion, .. } => {
+                point_distance(point, exclusion.center) < exclusion.radius - tolerance
+            }
+        }
+    }
+
+    fn crosses_triangle(&self, triangle: [Point2; 3], tolerance: f64) -> bool {
+        match self {
+            Self::Polygon { triangles, .. } => triangles.iter().any(|hole_triangle| {
+                triangles_have_positive_overlap(triangle, *hole_triangle, tolerance)
+            }),
+            Self::Circle {
+                exclusion,
+                boundary,
+            } => triangle_crosses_hole(triangle, *exclusion, *boundary, tolerance),
+        }
+    }
+}
+
+/// The indexed topology and curve maps that every trim grammar reads.
+#[derive(Clone, Copy)]
+struct TrimTopology<'a> {
+    loops: &'a HashMap<&'a cadmpeg_ir::ids::LoopId, &'a cadmpeg_ir::topology::Loop>,
+    coedges: &'a HashMap<&'a cadmpeg_ir::ids::CoedgeId, &'a cadmpeg_ir::topology::Coedge>,
+    edges: &'a HashMap<&'a cadmpeg_ir::ids::EdgeId, &'a cadmpeg_ir::topology::Edge>,
+    vertices: &'a HashMap<&'a cadmpeg_ir::ids::VertexId, &'a cadmpeg_ir::topology::Vertex>,
+    points: &'a HashMap<&'a cadmpeg_ir::ids::PointId, Point3>,
+    curves: &'a HashMap<&'a cadmpeg_ir::ids::CurveId, &'a CurveGeometry>,
+    /// Largest absolute coordinate over `points`, at least one.
+    coordinate_scale: f64,
+}
+
+fn trim_coordinate_scale(points: &HashMap<&cadmpeg_ir::ids::PointId, Point3>) -> f64 {
+    points
+        .values()
+        .flat_map(|point| [point.x.abs(), point.y.abs(), point.z.abs()])
+        .fold(1.0_f64, f64::max)
+}
+
+fn closed_planar_circle(
+    loop_: &cadmpeg_ir::topology::Loop,
+    surface: &SurfaceGeometry,
+    frame: PlaneFrame,
+    tolerance: f64,
+    topology: &TrimTopology<'_>,
+) -> Option<CircularHole> {
+    let TrimTopology {
+        coedges,
+        edges,
+        vertices,
+        points,
+        curves,
+        ..
+    } = *topology;
+    let coedge = *coedges.get(&loop_.coedges()[0])?;
+    let edge = *edges.get(&coedge.edge)?;
+    if coedge.owner_loop != loop_.id || loop_.coedges().len() != 1 {
+        return None;
+    }
+    let CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve)) =
+        *curves.get(edge.curve()?)?
+    else {
+        return None;
+    };
+    let center = circle_curve.center().get();
+    let axis = *circle_curve.frame().axis().as_raw();
+    let radius = circle_curve.radius().get();
+    let boundary_point = *points.get(&vertices.get(&edge.start)?.point)?;
+    let end_point = *points.get(&vertices.get(&edge.end)?.point)?;
+    if radius <= tolerance
+        || axis.dot(frame.normal).abs() < 1.0 - EPS_AXIS_ALIGNMENT
+        || analytic_surface_residual(surface.solved()?, center)? > tolerance
+        || analytic_surface_residual(surface.solved()?, boundary_point)? > tolerance
+        || boundary_point.distance(end_point) > tolerance
+        || (boundary_point.distance(center) - radius).abs() > tolerance
+    {
+        return None;
+    }
+    Some(CircularHole {
+        center: frame.project(center),
+        radius,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct BoundaryTolerance {
+    tolerance: f64,
+    sampling_tolerance: f64,
+}
+
+fn planar_boundary_samples(
+    curve: &CurveGeometry,
+    start: Point3,
+    end: Point3,
+    surface: &SurfaceGeometry,
+    frame: PlaneFrame,
+    limits: BoundaryTolerance,
+) -> Option<(Vec<Point2>, f64)> {
+    let BoundaryTolerance {
+        tolerance,
+        sampling_tolerance,
+    } = limits;
+    match curve {
+        CurveGeometry::Solved(SolvedCurveGeometry::Line(_)) => {
+            Some((vec![frame.project(start)], 0.0))
+        }
+        CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve)) => {
+            let center = circle_curve.center().get();
+            let axis = *circle_curve.frame().axis().as_raw();
+            let (reference, transverse) = perpendicular_basis(circle_curve.frame());
+            let radius = circle_curve.radius().get();
+            if axis.dot(frame.normal).abs() < 1.0 - EPS_AXIS_ALIGNMENT
+                || radius <= tolerance
+                || analytic_surface_residual(surface.solved()?, center)? > tolerance
+            {
+                return None;
+            }
+            let endpoint_tolerance = tolerance.max(sampling_tolerance);
+            let start_parameter = ellipse_parameter(
+                start,
+                center,
+                reference,
+                transverse,
+                radius,
+                radius,
+                endpoint_tolerance,
+            );
+            let start_parameter = start_parameter?;
+            let end_parameter = ellipse_parameter(
+                end,
+                center,
+                reference,
+                transverse,
+                radius,
+                radius,
+                endpoint_tolerance,
+            );
+            let end_parameter = end_parameter?;
+            let span = shortest_arc_span(start_parameter, end_parameter)?;
+            PlanarArc {
+                center,
+                first_direction: reference,
+                second_direction: transverse,
+                first_radius: radius,
+                second_radius: radius,
+            }
+            .samples(
+                start_parameter,
+                span,
+                surface,
+                frame,
+                BoundaryTolerance {
+                    tolerance,
+                    sampling_tolerance,
+                },
+            )
+        }
+        CurveGeometry::Solved(SolvedCurveGeometry::Ellipse(ellipse_curve)) => {
+            let center = ellipse_curve.center().get();
+            let axis = *ellipse_curve.frame().axis().as_raw();
+            let major_direction = *ellipse_curve.frame().reference().as_raw();
+            let minor_direction = *ellipse_curve.frame().binormal().as_raw();
+            let major_radius = ellipse_curve.major_radius().get();
+            let minor_radius = ellipse_curve.minor_radius().get();
+            if axis.dot(frame.normal).abs() < 1.0 - EPS_AXIS_ALIGNMENT
+                || major_radius <= tolerance
+                || minor_radius <= tolerance
+                || analytic_surface_residual(surface.solved()?, center)? > tolerance
+            {
+                return None;
+            }
+            let endpoint_tolerance = tolerance.max(sampling_tolerance);
+            let start_parameter = ellipse_parameter(
+                start,
+                center,
+                major_direction,
+                minor_direction,
+                major_radius,
+                minor_radius,
+                endpoint_tolerance,
+            );
+            let start_parameter = start_parameter?;
+            let end_parameter = ellipse_parameter(
+                end,
+                center,
+                major_direction,
+                minor_direction,
+                major_radius,
+                minor_radius,
+                endpoint_tolerance,
+            );
+            let end_parameter = end_parameter?;
+            let span = shortest_arc_span(start_parameter, end_parameter)?;
+            PlanarArc {
+                center,
+                first_direction: major_direction,
+                second_direction: minor_direction,
+                first_radius: major_radius,
+                second_radius: minor_radius,
+            }
+            .samples(
+                start_parameter,
+                span,
+                surface,
+                frame,
+                BoundaryTolerance {
+                    tolerance,
+                    sampling_tolerance,
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PlanarArc {
+    center: Point3,
+    first_direction: Vector3,
+    second_direction: Vector3,
+    first_radius: f64,
+    second_radius: f64,
+}
+
+impl PlanarArc {
+    fn samples(
+        self,
+        start_parameter: f64,
+        span: f64,
+        surface: &SurfaceGeometry,
+        frame: PlaneFrame,
+        limits: BoundaryTolerance,
+    ) -> Option<(Vec<Point2>, f64)> {
+        let BoundaryTolerance {
+            tolerance,
+            sampling_tolerance,
+        } = limits;
+        let radius = self.first_radius.max(self.second_radius);
+        let (segments, boundary_tolerance) = planar_arc_segments(span, radius, sampling_tolerance)?;
+        let solved_surface = surface.solved()?;
+        let mut points = Vec::new();
+        for index in 0..segments {
+            let (Some(index_value), Some(segment_value)) = (
+                cadmpeg_core::convert::f64_from_index(index),
+                cadmpeg_core::convert::f64_from_index(segments),
+            ) else {
+                return None;
+            };
+            let parameter = start_parameter + span * index_value / segment_value;
+            let point = self
+                .center
+                .translated(self.first_direction, self.first_radius * parameter.cos())
+                .translated(self.second_direction, self.second_radius * parameter.sin());
+            if analytic_surface_residual(solved_surface, point)
+                .is_none_or(|residual| residual > tolerance)
+            {
+                return None;
+            }
+            points.push(frame.project(point));
+        }
+        Some((points, boundary_tolerance))
+    }
+}
+
+fn ellipse_parameter(
+    point: Point3,
+    center: Point3,
+    major_direction: Vector3,
+    minor_direction: Vector3,
+    major_radius: f64,
+    minor_radius: f64,
+    tolerance: f64,
+) -> Option<f64> {
+    let delta = point.vector_from(center);
+    let cosine = delta.dot(major_direction) / major_radius;
+    let sine = delta.dot(minor_direction) / minor_radius;
+    let normalization = cosine.hypot(sine);
+    (normalization.is_finite()
+        && (normalization - 1.0).abs() <= tolerance / major_radius.min(minor_radius))
+    .then_some(sine.atan2(cosine).rem_euclid(std::f64::consts::TAU))
+}
+
+fn shortest_arc_span(start: f64, end: f64) -> Option<f64> {
+    let forward = (end - start).rem_euclid(std::f64::consts::TAU);
+    let span = if forward <= std::f64::consts::PI {
+        forward
+    } else {
+        forward - std::f64::consts::TAU
+    };
+    (span.abs() > EPS_CYLINDER_ANGLE && span.abs() < std::f64::consts::PI - EPS_CYLINDER_ANGLE)
+        .then_some(span)
+}
+
+/// Answer the segment count and the sagitta the chords leave.
+///
+/// A chord whose sagitta is `tolerance` subtends `2 * asin(half_chord)` with
+/// `half_chord = sqrt(tolerance / (2 * radius))`, the sine of the quarter
+/// span. `radius` is a positive IR radius and `tolerance` is a positive
+/// sampling tolerance, so the ratio is positive. It reaches one at a tolerance
+/// of twice the radius, which is not an error: the sagitta of the complete
+/// circle is the diameter, so a tolerance at or beyond it admits the whole
+/// circle in one segment, and the sine of the quarter span stays at one.
+///
+/// A request above `MAX_PLANAR_TRIM_ARC_SEGMENTS` gets that many segments, and
+/// the returned sagitta is the larger error those coarser chords leave, so the
+/// trim keeps an honest boundary tolerance.
+///
+/// `None` when the span is not finite or the segment count has no exact
+/// floating-point value.
+fn planar_arc_segments(span: f64, radius: f64, tolerance: f64) -> Option<(usize, f64)> {
+    if !span.is_finite() {
+        return None;
+    }
+    let half_chord = (0.5 * (tolerance / radius)).min(1.0).sqrt();
+    let maximum_span = 4.0 * half_chord.asin();
+    let requested = if maximum_span.is_finite() && maximum_span > EPS_CYLINDER_ANGLE {
+        cadmpeg_core::convert::truncate_f64_to_usize((span.abs() / maximum_span).ceil())
+            .unwrap_or(MAX_PLANAR_TRIM_ARC_SEGMENTS)
+    } else {
+        MAX_PLANAR_TRIM_ARC_SEGMENTS
+    };
+    let segments = requested.clamp(1, MAX_PLANAR_TRIM_ARC_SEGMENTS);
+    let actual_span = span.abs() / cadmpeg_core::convert::f64_from_index(segments)?;
+    let sine = (actual_span / 4.0).sin();
+    Some((segments, (radius * sine) * (2.0 * sine)))
+}
+
+fn planar_trim(
+    face: &cadmpeg_ir::topology::Face,
+    surface: &SurfaceGeometry,
+    topology: &TrimTopology<'_>,
+    work: &WorkBudget,
+) -> Option<PlanarTrim> {
+    let TrimTopology {
+        loops,
+        coedges,
+        edges,
+        vertices,
+        points,
+        curves,
+        coordinate_scale,
+    } = *topology;
+    let frame = plane_frame(surface.solved()?)?;
+    let tolerance = FaceEvaluationTolerance::of(face)?.get();
+    let sampling_tolerance = tolerance.max(
+        coordinate_scale * f64::from(f32::EPSILON) * DISPLAY_QUANTIZATION_ULPS
+            + EPS_DISPLAY_QUANTIZATION,
+    );
+    let mut polygons = Vec::new();
+    let mut circles = Vec::new();
+    let mut boundary_tolerance = 0.0_f64;
+    for loop_id in &face.loops {
+        let loop_ = *loops.get(loop_id)?;
+        if loop_.face != face.id || loop_.coedges().is_empty() || loop_.vertices().next().is_some()
+        {
+            return None;
+        }
+        if loop_.coedges().len() == 1 {
+            let circle = closed_planar_circle(loop_, surface, frame, tolerance, topology)?;
+            circles.push(circle);
+            continue;
+        }
+
+        let mut polygon = Vec::new();
+        let mut first_start = None;
+        let mut previous_end = None;
+        for coedge_id in loop_.coedges() {
+            let coedge = *coedges.get(coedge_id)?;
+            let edge = *edges.get(&coedge.edge)?;
+            if coedge.owner_loop != loop_.id {
+                return None;
+            }
+            let (start, end) = match coedge.sense {
+                Sense::Forward => (&edge.start, &edge.end),
+                Sense::Reversed => (&edge.end, &edge.start),
+            };
+            let start = *points.get(&vertices.get(start)?.point)?;
+            let end = *points.get(&vertices.get(end)?.point)?;
+            if analytic_surface_residual(surface.solved()?, start)? > tolerance
+                || analytic_surface_residual(surface.solved()?, end)? > tolerance
+                || previous_end.is_some_and(|previous: Point3| previous.distance(start) > tolerance)
+            {
+                return None;
+            }
+            let (samples, sample_tolerance) = planar_boundary_samples(
+                curves.get(edge.curve()?)?,
+                start,
+                end,
+                surface,
+                frame,
+                crate::tessellation::BoundaryTolerance {
+                    tolerance,
+                    sampling_tolerance,
+                },
+            )?;
+            polygon.extend(samples);
+            boundary_tolerance = boundary_tolerance.max(sample_tolerance);
+            first_start.get_or_insert(start);
+            previous_end = Some(end);
+        }
+        if previous_end?.distance(first_start?) > tolerance {
+            return None;
+        }
+        polygons.push(polygon);
+    }
+    let (outer, holes) = if polygons.is_empty() {
+        if circles.is_empty() {
+            return None;
+        }
+        if !charge_product(work, circles.len(), circles.len()) {
+            return None;
+        }
+        let (outer, holes) = circular_outer_and_holes(&circles, tolerance)?;
+        let mut planar_holes = Vec::new();
+        for hole in holes {
+            planar_holes.push(PlanarHole::Circle(hole));
+        }
+        (PlanarOuter::Circle(outer), planar_holes)
+    } else {
+        // Every polygon participates in a containment pair when more than
+        // one is present. Establish simplicity once before testing pairs.
+        if polygons.len() > 1
+            && !polygons.iter().all(|polygon| {
+                charge_product(work, polygon.len(), polygon.len())
+                    && is_simple_polygon(polygon, sampling_tolerance)
+            })
+        {
+            return None;
+        }
+        let mut outer_index = None;
+        for (index, outer) in polygons.iter().enumerate() {
+            let mut contains_all = true;
+            for (inner_index, inner) in polygons.iter().enumerate() {
+                if index == inner_index {
+                    continue;
+                }
+                if !charge_product(work, inner.len(), outer.len()) {
+                    return None;
+                }
+                if !polygon_inside_polygon(inner, outer, sampling_tolerance) {
+                    contains_all = false;
+                    break;
+                }
+            }
+            if contains_all {
+                for circle in &circles {
+                    if !work.charge_by(outer.len()) {
+                        return None;
+                    }
+                    if !circle_inside_polygon(outer, *circle, sampling_tolerance) {
+                        contains_all = false;
+                        break;
+                    }
+                }
+            }
+            if contains_all && outer_index.replace(index).is_some() {
+                return None;
+            }
+        }
+        let outer_index = outer_index?;
+        let outer_polygon = &polygons[outer_index];
+        let mut polygon_holes = Vec::new();
+        for (index, polygon) in polygons.iter().enumerate() {
+            if index != outer_index {
+                polygon_holes.push(polygon);
+            }
+        }
+        for (index, left) in polygon_holes.iter().enumerate() {
+            for right in &polygon_holes[index + 1..] {
+                if !charge_product(work, left.len(), right.len())
+                    || polygons_overlap(left, right, sampling_tolerance)
+                {
+                    return None;
+                }
+            }
+            for circle in &circles {
+                if !work.charge_by(left.len())
+                    || circle_overlaps_polygon(*circle, left, sampling_tolerance)
+                {
+                    return None;
+                }
+            }
+        }
+        for (index, left) in circles.iter().enumerate() {
+            if !work.charge_by(circles.len()) {
+                return None;
+            }
+            for right in &circles[index + 1..] {
+                if point_distance(left.center, right.center)
+                    < left.radius + right.radius - sampling_tolerance
+                {
+                    return None;
+                }
+            }
+        }
+        let mut holes = Vec::new();
+        for circle in circles {
+            holes.push(PlanarHole::Circle(circle));
+        }
+        for polygon in polygon_holes {
+            let mut boundary = Vec::new();
+            boundary.extend_from_slice(polygon);
+            let hole = PlanarHole::polygon(boundary, sampling_tolerance, work)?;
+            holes.push(hole);
+        }
+        let mut outer = Vec::new();
+        outer.extend_from_slice(outer_polygon);
+        (PlanarOuter::Polygon(TrimPolygon::new(outer)), holes)
+    };
+    Some(PlanarTrim {
+        frame,
+        outer: Some(outer),
+        holes,
+        boundary_tolerance,
+    })
+}
+
+fn planar_hole_trim(
+    face: &cadmpeg_ir::topology::Face,
+    surface: &SurfaceGeometry,
+    topology: &TrimTopology<'_>,
+) -> Option<PlanarTrim> {
+    let loops = topology.loops;
+    let frame = plane_frame(surface.solved()?)?;
+    let tolerance = FaceEvaluationTolerance::of(face)?.get();
+    let mut has_polygon_loop = false;
+    for loop_id in &face.loops {
+        let loop_ = loops.get(loop_id)?;
+        has_polygon_loop |= loop_.coedges().len() > 1;
+    }
+    if !has_polygon_loop {
+        return None;
+    }
+    let mut holes = Vec::new();
+    for loop_id in &face.loops {
+        let loop_ = loops.get(loop_id)?;
+        if loop_.face == face.id && loop_.coedges().len() == 1 && loop_.vertices().next().is_none()
+        {
+            if let Some(circle) = closed_planar_circle(loop_, surface, frame, tolerance, topology) {
+                holes.push(PlanarHole::Circle(circle));
+            }
+        }
+    }
+    (!holes.is_empty()).then_some(PlanarTrim {
+        frame,
+        outer: None,
+        holes,
+        boundary_tolerance: 0.0,
+    })
+}
+
+fn cylindrical_trim(
+    face: &cadmpeg_ir::topology::Face,
+    surface: &SurfaceGeometry,
+    topology: &TrimTopology<'_>,
+) -> Option<CylindricalTrim> {
+    let TrimTopology {
+        loops,
+        coedges,
+        edges,
+        vertices,
+        points,
+        curves,
+        ..
+    } = *topology;
+    let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(cylinder_surface)) = surface else {
+        return None;
+    };
+    let origin = cylinder_surface.origin().get();
+    let frame = *cylinder_surface.frame();
+    let axis = *frame.axis().as_raw();
+    let radius = cylinder_surface.radius().get();
+    if radius <= EPS_DISPLAY_QUANTIZATION {
+        return None;
+    }
+    if face.loops.len() != 1 {
+        return None;
+    }
+    let loop_id = face.loops.iter().next()?;
+    let loop_ = *loops.get(loop_id)?;
+    if loop_.face != face.id || loop_.coedges().is_empty() || loop_.vertices().next().is_some() {
+        return None;
+    }
+    let tolerance = FaceEvaluationTolerance::of(face)?.get();
+    let mut axial_bounds = None::<(f64, f64)>;
+    for coedge_id in loop_.coedges() {
+        let coedge = *coedges.get(coedge_id)?;
+        if coedge.owner_loop != loop_.id {
+            return None;
+        }
+        let edge = *edges.get(&coedge.edge)?;
+        let curve = curves.get(edge.curve()?)?;
+        match curve {
+            CurveGeometry::Solved(SolvedCurveGeometry::Line(line_curve)) => {
+                let direction = *line_curve.direction().as_raw();
+                if direction.dot(axis).abs() < 1.0 - EPS_AXIS_ALIGNMENT {
+                    return None;
+                }
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve)) => {
+                let curve_axis = circle_curve.frame().axis().as_raw();
+                let curve_radius = circle_curve.radius().get();
+                if curve_axis.dot(axis).abs() < 1.0 - EPS_AXIS_ALIGNMENT
+                    || (curve_radius - radius).abs() > tolerance
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        for vertex_id in [&edge.start, &edge.end] {
+            let vertex = vertices.get(vertex_id)?;
+            let point = *points.get(&vertex.point)?;
+            if analytic_surface_residual(surface.solved()?, point)? > tolerance {
+                return None;
+            }
+            let axial = point.vector_from(origin).dot(axis);
+            if !axial.is_finite() {
+                return None;
+            }
+            axial_bounds = Some(match axial_bounds {
+                Some((min_axial, max_axial)) => (min_axial.min(axial), max_axial.max(axial)),
+                None => (axial, axial),
+            });
+        }
+    }
+    let (min_axial, max_axial) = axial_bounds?;
+    let mut angles = Vec::new();
+    for coedge_id in loop_.coedges() {
+        let coedge = coedges.get(coedge_id)?;
+        let edge = edges.get(&coedge.edge)?;
+        for vertex_id in [&edge.start, &edge.end] {
+            let vertex = vertices.get(vertex_id)?;
+            let point = *points.get(&vertex.point)?;
+            let angle = cylinder_angle(point, origin, &frame)?;
+            angles.push(angle);
+        }
+    }
+    let (angular_start, angular_span) = circular_interval(&mut angles)?;
+    (max_axial - min_axial > tolerance).then_some(CylindricalTrim {
+        origin,
+        frame,
+        radius,
+        min_axial,
+        max_axial,
+        angular_start,
+        angular_span,
+    })
+}
+
+fn conical_trim(
+    face: &cadmpeg_ir::topology::Face,
+    surface: &SurfaceGeometry,
+    topology: &TrimTopology<'_>,
+) -> Option<ConicalTrim> {
+    let TrimTopology {
+        loops,
+        coedges,
+        edges,
+        vertices,
+        points,
+        curves,
+        ..
+    } = *topology;
+    let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(cone_surface)) = surface else {
+        return None;
+    };
+    let origin = cone_surface.origin().get();
+    let frame = *cone_surface.frame();
+    let axis = *frame.axis().as_raw();
+    let radius = cone_surface.radius().get();
+    let ratio = cone_surface.ratio();
+    let half_angle = cone_surface.half_angle().get();
+    let slope = half_angle.tan();
+    if radius <= EPS_DISPLAY_QUANTIZATION || !slope.is_finite() {
+        return None;
+    }
+    if face.loops.len() != 1 {
+        return None;
+    }
+    let loop_id = face.loops.iter().next()?;
+    let loop_ = *loops.get(loop_id)?;
+    if loop_.face != face.id || loop_.coedges().is_empty() || loop_.vertices().next().is_some() {
+        return None;
+    }
+    let tolerance = FaceEvaluationTolerance::of(face)?.get();
+    let mut axial_bounds = None::<(f64, f64)>;
+    let mut angles = Vec::new();
+    for coedge_id in loop_.coedges() {
+        let coedge = *coedges.get(coedge_id)?;
+        if coedge.owner_loop != loop_.id {
+            return None;
+        }
+        let edge = *edges.get(&coedge.edge)?;
+        let curve = curves.get(edge.curve()?)?;
+        match curve {
+            CurveGeometry::Solved(SolvedCurveGeometry::Line(line_curve)) => {
+                let direction = *line_curve.direction().as_raw();
+                if direction.dot(axis).abs() < 1.0 - EPS_AXIS_ALIGNMENT {
+                    return None;
+                }
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(nurbs)) => {
+                if nurbs.degree() != 1
+                    || nurbs.periodic()
+                    || nurbs.pole_rows().count() != 2
+                    || nurbs.control_points().iter().any(|point| {
+                        surface.solved().is_none_or(|surface| {
+                            analytic_surface_residual(surface, point.get())
+                                .is_none_or(|residual| residual > tolerance)
+                        })
+                    })
+                {
+                    return None;
+                }
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Ellipse(ellipse_curve)) => {
+                let center = ellipse_curve.center().get();
+                let curve_axis = ellipse_curve.frame().axis().as_raw();
+                let major_direction = *ellipse_curve.frame().reference().as_raw();
+                let major_radius = ellipse_curve.major_radius().get();
+                let minor_radius = ellipse_curve.minor_radius().get();
+                let (reference, transverse) = perpendicular_basis(&frame);
+                let center_delta = center.vector_from(origin);
+                let center_axial = center_delta.dot(axis);
+                let center_radial = center_delta - axis.scale(center_axial);
+                let expected_radius = (radius + center_axial * slope).abs();
+                let reference_aligned = major_direction.dot(reference).abs();
+                let transverse_aligned = major_direction.dot(transverse).abs();
+                let aligned_radii = if reference_aligned >= 1.0 - EPS_AXIS_ALIGNMENT {
+                    (major_radius - expected_radius).abs() <= tolerance
+                        && (minor_radius - expected_radius * ratio.get()).abs() <= tolerance
+                } else if transverse_aligned >= 1.0 - EPS_AXIS_ALIGNMENT {
+                    (major_radius - expected_radius * ratio.get()).abs() <= tolerance
+                        && (minor_radius - expected_radius).abs() <= tolerance
+                } else {
+                    false
+                };
+                if curve_axis.dot(axis).abs() < 1.0 - EPS_AXIS_ALIGNMENT
+                    || major_radius <= tolerance
+                    || minor_radius <= tolerance
+                    || center_radial.norm() > tolerance
+                    || !aligned_radii
+                {
+                    return None;
+                }
+            }
+            CurveGeometry::Solved(SolvedCurveGeometry::Circle(circle_curve)) => {
+                let center = circle_curve.center().get();
+                let curve_axis = circle_curve.frame().axis().as_raw();
+                let curve_radius = circle_curve.radius().get();
+                if (ratio.get() - 1.0).abs() > EPS_AXIS_ALIGNMENT
+                    || curve_axis.dot(axis).abs() < 1.0 - EPS_AXIS_ALIGNMENT
+                {
+                    return None;
+                }
+                let center_delta = center.vector_from(origin);
+                let center_axial = center_delta.dot(axis);
+                let center_radial = center_delta - axis.scale(center_axial);
+                let expected_radius = (radius + center_axial * slope).abs();
+                if center_radial.norm() > tolerance
+                    || (curve_radius - expected_radius).abs() > tolerance
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        for vertex_id in [&edge.start, &edge.end] {
+            let vertex = vertices.get(vertex_id)?;
+            let point = *points.get(&vertex.point)?;
+            if analytic_surface_residual(surface.solved()?, point)? > tolerance {
+                return None;
+            }
+            let axial = point.vector_from(origin).dot(axis);
+            let angle = cone_angle(point, origin, &frame, ratio)?;
+            if !axial.is_finite() || !angle.is_finite() {
+                return None;
+            }
+            axial_bounds = Some(match axial_bounds {
+                Some((min_axial, max_axial)) => (min_axial.min(axial), max_axial.max(axial)),
+                None => (axial, axial),
+            });
+            angles.push(angle);
+        }
+    }
+    let (min_axial, max_axial) = axial_bounds?;
+    let (angular_start, angular_span) = circular_interval(&mut angles)?;
+    (max_axial - min_axial > tolerance).then_some(ConicalTrim {
+        origin,
+        frame,
+        radius,
+        ratio,
+        slope,
+        min_axial,
+        max_axial,
+        angular_start,
+        angular_span,
+    })
+}
+
+/// The reference of `frame` minus its component along the axis, and the axis
+/// cross that projection, each divided by its length.
+///
+/// The frame holds unit directions perpendicular within `1e-9`, so each length
+/// is within about `2e-9` of one, and the two results are unit length and
+/// perpendicular to the axis and to each other to rounding.
+fn perpendicular_basis(frame: &OrthonormalFrame3) -> (Vector3, Vector3) {
+    let divided = |vector: Vector3| {
+        let length = vector.norm();
+        Vector3::new(vector.x / length, vector.y / length, vector.z / length)
+    };
+    let axis = *frame.axis().as_raw();
+    let reference = *frame.reference().as_raw();
+    let reference = divided(reference - axis.scale(reference.dot(axis)));
+    (reference, divided(axis.cross(reference)))
+}
+
+fn cylinder_angle(point: Point3, origin: Point3, frame: &OrthonormalFrame3) -> Option<f64> {
+    let (reference, transverse) = perpendicular_basis(frame);
+    let delta = point.vector_from(origin);
+    let angle = delta.dot(transverse).atan2(delta.dot(reference));
+    angle
+        .is_finite()
+        .then_some(angle.rem_euclid(std::f64::consts::TAU))
+}
+
+fn cone_angle(
+    point: Point3,
+    origin: Point3,
+    frame: &OrthonormalFrame3,
+    ratio: PositiveReal,
+) -> Option<f64> {
+    let (reference, transverse) = perpendicular_basis(frame);
+    let delta = point.vector_from(origin);
+    let major = delta.dot(reference);
+    let minor = delta.dot(transverse);
+    let angle = (minor / ratio.get()).atan2(major);
+    angle
+        .is_finite()
+        .then_some(angle.rem_euclid(std::f64::consts::TAU))
+}
+
+fn circular_interval(angles: &mut Vec<f64>) -> Option<(f64, f64)> {
+    angles.retain(|angle| angle.is_finite());
+    if angles.is_empty() {
+        return None;
+    }
+    angles.sort_by(f64::total_cmp);
+    angles.dedup_by(|left, right| (*left - *right).abs() <= EPS_CYLINDER_ANGLE);
+    if angles.len() == 1 {
+        return Some((angles[0], std::f64::consts::TAU));
+    }
+    let (largest_gap_index, largest_gap) = (0..angles.len())
+        .map(|index| {
+            let next = angles[(index + 1) % angles.len()];
+            let gap = if index + 1 == angles.len() {
+                next + std::f64::consts::TAU - angles[index]
+            } else {
+                next - angles[index]
+            };
+            (index, gap)
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))?;
+    let start = angles[(largest_gap_index + 1) % angles.len()];
+    Some((start, std::f64::consts::TAU - largest_gap))
+}
+
+fn circular_interval_contains(start: f64, span: f64, angle: f64, tolerance: f64) -> bool {
+    let distance = (angle - start).rem_euclid(std::f64::consts::TAU);
+    // Quantized display-list angles can fall just before the start boundary.
+    // The wrapped distance is then near TAU, rather than near zero.
+    distance <= span + tolerance || distance + tolerance >= std::f64::consts::TAU
+}
+
+// The trim grammars share the same indexed topology maps.
+fn analytic_trim(
+    face: &cadmpeg_ir::topology::Face,
+    surface: &SurfaceGeometry,
+    topology: &TrimTopology<'_>,
+    work: &WorkBudget,
+) -> Option<AnalyticTrim> {
+    match surface {
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(_)) => {
+            planar_trim(face, surface, topology, work)
+                .or_else(|| planar_hole_trim(face, surface, topology))
+                .map(AnalyticTrim::Planar)
+        }
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(_)) => {
+            cylindrical_trim(face, surface, topology).map(AnalyticTrim::Cylindrical)
+        }
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(_)) => {
+            conical_trim(face, surface, topology).map(AnalyticTrim::Conical)
+        }
+        _ => None,
+    }
+}
+
+fn plane_frame(surface: &SolvedSurfaceGeometry) -> Option<PlaneFrame> {
+    let (origin, normal, u_axis) = match surface {
+        SolvedSurfaceGeometry::Plane(plane_surface) => {
+            let origin = plane_surface.origin();
+            let normal = plane_surface.frame().axis().as_raw();
+            let u_axis = plane_surface.frame().reference().as_raw();
+            (origin, *normal, *u_axis)
+        }
+        SolvedSurfaceGeometry::Transformed(placed) if placed.transform().is_proper_rigid() => {
+            let basis = plane_frame(placed.basis())?;
+            let transform = placed.transform();
+            (
+                transform.apply_point(basis.origin.get())?,
+                transform.apply_vector(basis.normal)?.get(),
+                transform.apply_vector(basis.u_axis)?.get(),
+            )
+        }
+        _ => return None,
+    };
+    PlaneFrame::new(origin, normal, u_axis)
+}
+
+fn point_distance(left: Point2, right: Point2) -> f64 {
+    (left.u - right.u).hypot(left.v - right.v)
+}
+
+fn signed_area_twice(left: Point2, middle: Point2, right: Point2) -> f64 {
+    (middle.u - left.u) * (right.v - middle.v) - (middle.v - left.v) * (right.u - middle.u)
+}
+
+fn is_simple_polygon(polygon: &[Point2], tolerance: f64) -> bool {
+    simple_polygon_area_twice(polygon, tolerance).is_some()
+}
+
+/// Twice the signed area of a simple polygon: at least three vertices, an
+/// area above the squared tolerance, and no two non-adjacent edges that
+/// meet.
+fn simple_polygon_area_twice(
+    polygon: &[Point2],
+    tolerance: f64,
+) -> Option<cadmpeg_ir::scalar::FiniteReal> {
+    if polygon.len() < 3 {
+        return None;
+    }
+    let area = cadmpeg_ir::math::planar::polygon_area_twice(polygon)?;
+    if area.get().abs() <= tolerance * tolerance {
+        return None;
+    }
+    for left in 0..polygon.len() {
+        for right in left + 1..polygon.len() {
+            if right == left + 1 || (left == 0 && right + 1 == polygon.len()) {
+                continue;
+            }
+            if segments_intersect(
+                polygon[left],
+                polygon[(left + 1) % polygon.len()],
+                polygon[right],
+                polygon[(right + 1) % polygon.len()],
+                tolerance,
+            ) {
+                return None;
+            }
+        }
+    }
+    Some(area)
+}
+
+fn triangulate_polygon(
+    polygon: &[Point2],
+    tolerance: f64,
+    work: &WorkBudget,
+) -> Option<Vec<[Point2; 3]>> {
+    if !charge_product(work, polygon.len(), polygon.len()) {
+        return None;
+    }
+    // The area admits only a polygon of finite vertices.
+    let orientation = simple_polygon_area_twice(polygon, tolerance)?
+        .get()
+        .signum();
+    let mut remaining = Vec::new();
+    remaining.extend(0..polygon.len());
+    let mut triangles = Vec::new();
+    while remaining.len() > 3 {
+        let mut ear_position = None;
+        'ears: for position in 0..remaining.len() {
+            if !work.charge() {
+                return None;
+            }
+            let previous_position = (position + remaining.len() - 1) % remaining.len();
+            let next_position = (position + 1) % remaining.len();
+            let previous = polygon[remaining[previous_position]];
+            let current = polygon[remaining[position]];
+            let next = polygon[remaining[next_position]];
+            let scale = point_distance(previous, current).max(point_distance(current, next));
+            let cross = signed_area_twice(previous, current, next);
+            if !cross.is_finite() || orientation * cross <= tolerance * scale {
+                continue;
+            }
+            if !charge_product(work, 2, remaining.len()) {
+                return None;
+            }
+            for edge_position in 0..remaining.len() {
+                let edge_next_position = (edge_position + 1) % remaining.len();
+                if edge_position == previous_position
+                    || edge_position == position
+                    || edge_position == next_position
+                    || edge_next_position == previous_position
+                    || edge_next_position == position
+                    || edge_next_position == next_position
+                {
+                    continue;
+                }
+                if segments_intersect(
+                    previous,
+                    next,
+                    polygon[remaining[edge_position]],
+                    polygon[remaining[edge_next_position]],
+                    tolerance,
+                ) {
+                    continue 'ears;
+                }
+            }
+            let triangle = [previous, current, next];
+            let triangle_box = PolygonBox::new(&triangle, tolerance);
+            for (other_position, index) in remaining.iter().enumerate() {
+                let point = polygon[*index];
+                if other_position != previous_position
+                    && other_position != position
+                    && other_position != next_position
+                    && !triangle_box
+                        .as_ref()
+                        .is_some_and(|bounds| bounds.excludes(point))
+                    && polygon_strictly_contains(&triangle, point, tolerance)
+                {
+                    continue 'ears;
+                }
+            }
+            ear_position = Some(position);
+            break;
+        }
+        let position = ear_position?;
+        let previous_position = (position + remaining.len() - 1) % remaining.len();
+        let next_position = (position + 1) % remaining.len();
+        triangles.push([
+            polygon[remaining[previous_position]],
+            polygon[remaining[position]],
+            polygon[remaining[next_position]],
+        ]);
+        remaining.remove(position);
+    }
+    let [first, second, third] = remaining.as_slice() else {
+        return None;
+    };
+    let [first, second, third] = [polygon[*first], polygon[*second], polygon[*third]];
+    let scale = point_distance(first, second)
+        .max(point_distance(second, third))
+        .max(point_distance(third, first));
+    if signed_area_twice(first, second, third)
+        .abs()
+        .partial_cmp(&(tolerance * scale))
+        != Some(std::cmp::Ordering::Greater)
+    {
+        return None;
+    }
+    triangles.push([first, second, third]);
+    Some(triangles)
+}
+
+/// The margin, relative to the largest coordinate, by which a point outside an
+/// edge's box must clear the tolerance before the edge is not measured. It is
+/// millions of times the few ulps by which [`point_segment_distance`] can fall
+/// below the true distance.
+const SEGMENT_BOX_MARGIN: f64 = 1.0e-9;
+
+/// Whether `point` lies within `tolerance` of an edge of `polygon`, as
+/// [`point_segment_distance`] measures it. A point or edge end that is not
+/// finite has no distance to measure.
+///
+/// A point outside an edge's box, widened by the tolerance and the margin, is
+/// farther from the edge than the tolerance by more than the measure's
+/// rounding, so the measure would refuse it too and the edge is not measured.
+fn polygon_boundary_within(polygon: &[Point2], point: Point2, tolerance: f64) -> bool {
+    edges_within(polygon, 0..polygon.len(), point, tolerance)
+}
+
+/// [`polygon_boundary_within`] over the edges of `polygon` that start at
+/// `edges`.
+fn edges_within(
+    polygon: &[Point2],
+    edges: impl IntoIterator<Item = usize>,
+    point: Point2,
+    tolerance: f64,
+) -> bool {
+    edges.into_iter().any(|index| {
+        let start = polygon[index];
+        let end = polygon[(index + 1) % polygon.len()];
+        match [point, start, end].map(FinitePoint2::new) {
+            [Some(finite_point), Some(finite_start), Some(finite_end)] => {
+                !segment_box_excludes(point, start, end, tolerance)
+                    && point_segment_distance(finite_point, finite_start, finite_end) <= tolerance
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Whether finite `point` lies beyond the box of the finite segment
+/// `start`-`end` on some axis by more than `tolerance` and the margin.
+fn segment_box_excludes(point: Point2, start: Point2, end: Point2, tolerance: f64) -> bool {
+    let scale = [point.u, point.v, start.u, start.v, end.u, end.v]
+        .into_iter()
+        .fold(tolerance.abs(), |scale, value| scale.max(value.abs()));
+    let reach = tolerance + SEGMENT_BOX_MARGIN * scale;
+    point.u - start.u.max(end.u) > reach
+        || start.u.min(end.u) - point.u > reach
+        || point.v - start.v.max(end.v) > reach
+        || start.v.min(end.v) - point.v > reach
+}
+
+fn polygon_contains(polygon: &[Point2], point: Point2, tolerance: f64) -> bool {
+    polygon_boundary_within(polygon, point, tolerance)
+        || crossings_odd(polygon, 0..polygon.len(), point)
+}
+
+/// Whether a ray from `point` toward positive `u` crosses an odd number of
+/// the edges of `polygon` that start at `edges`.
+fn crossings_odd(
+    polygon: &[Point2],
+    edges: impl IntoIterator<Item = usize>,
+    point: Point2,
+) -> bool {
+    let mut inside = false;
+    for index in edges {
+        let start = polygon[index];
+        let end = polygon[(index + 1) % polygon.len()];
+        if (start.v > point.v) == (end.v > point.v) {
+            continue;
+        }
+        let crossing = start.u + (point.v - start.v) * (end.u - start.u) / (end.v - start.v);
+        if crossing > point.u {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Polygons with fewer edges are scanned whole.
+const MIN_BANDED_POLYGON_EDGES: usize = 16;
+/// Band listings per edge past which [`EdgeBands`] tries fewer bands.
+const MAX_BAND_LISTINGS_PER_EDGE: usize = 8;
+/// Fewest bands worth keeping; a polygon that needs fewer is scanned whole.
+const MIN_EDGE_BANDS: usize = 4;
+/// Polygons whose coordinates are all smaller than this are neither banded
+/// nor boxed, so the reach of [`EdgeBands::near`] and [`PolygonBox::excludes`]
+/// stays a normal number.
+const MIN_INDEXED_POLYGON_SCALE: f64 = 1.0e-200;
+
+/// A planar trim boundary, with its edges indexed by `v` when that pays.
+#[derive(Debug, Clone)]
+struct TrimPolygon {
+    points: Vec<Point2>,
+    bands: Option<EdgeBands>,
+    /// The last tolerance whose simplicity was tested, and the answer.
+    simple_at: std::cell::Cell<Option<(u64, bool)>>,
+}
+
+impl TrimPolygon {
+    fn new(points: Vec<Point2>) -> Self {
+        Self {
+            bands: EdgeBands::new(&points),
+            points,
+            simple_at: std::cell::Cell::new(None),
+        }
+    }
+
+    fn is_simple(&self, tolerance: f64) -> bool {
+        let key = tolerance.to_bits();
+        if let Some((tested, simple)) = self.simple_at.get() {
+            if tested == key {
+                return simple;
+            }
+        }
+        let simple = is_simple_polygon(&self.points, tolerance);
+        self.simple_at.set(Some((key, simple)));
+        simple
+    }
+
+    /// [`polygon_boundary_within`] over this polygon.
+    fn boundary_within(&self, point: Point2, tolerance: f64) -> bool {
+        match self
+            .bands
+            .as_ref()
+            .and_then(|bands| bands.near(point, tolerance))
+        {
+            Some(edges) => edges_within(&self.points, edges, point, tolerance),
+            None => polygon_boundary_within(&self.points, point, tolerance),
+        }
+    }
+
+    /// [`polygon_contains`] over this polygon.
+    fn contains(&self, point: Point2, tolerance: f64) -> bool {
+        self.boundary_within(point, tolerance) || self.crossings_odd(point)
+    }
+
+    /// [`polygon_strictly_contains`] over this polygon.
+    fn strictly_contains(&self, point: Point2, tolerance: f64) -> bool {
+        !self.boundary_within(point, tolerance) && self.crossings_odd(point)
+    }
+
+    fn crossings_odd(&self, point: Point2) -> bool {
+        match self.bands.as_ref().and_then(|bands| bands.at(point)) {
+            Some(edges) => crossings_odd(&self.points, edges.iter().copied(), point),
+            None => crossings_odd(&self.points, 0..self.points.len(), point),
+        }
+    }
+}
+
+/// Polygons whose coordinates reach this are not boxed, so no product in
+/// [`crossings_odd`] overflows.
+const MAX_BOXED_POLYGON_SCALE: f64 = 1.0e150;
+
+/// A finite polygon's box. A point beyond it by more than the reach of
+/// [`segment_box_excludes`], doubled to absorb rounding, is excluded by every
+/// edge's box. A ray from it toward positive `u` crosses no edge, or crosses
+/// each edge whose `v` range holds it, and a closed polygon has an even number
+/// of those. So the polygon does not contain it.
+struct PolygonBox {
+    minimum: Point2,
+    maximum: Point2,
+    scale: f64,
+    tolerance: f64,
+}
+
+impl PolygonBox {
+    /// `None` when a vertex or `tolerance` is not finite, or the coordinates
+    /// are too small or too large for the margin argument.
+    fn new(polygon: &[Point2], tolerance: f64) -> Option<Self> {
+        let (minimum, maximum) = polygon_bounds(polygon)?;
+        let scale = [minimum.u, minimum.v, maximum.u, maximum.v]
+            .into_iter()
+            .fold(tolerance.abs(), |scale, value| scale.max(value.abs()));
+        (tolerance.is_finite()
+            && (MIN_INDEXED_POLYGON_SCALE..MAX_BOXED_POLYGON_SCALE).contains(&scale))
+        .then_some(Self {
+            minimum,
+            maximum,
+            scale,
+            tolerance,
+        })
+    }
+
+    /// Whether `point` lies beyond the box, so the polygon neither contains
+    /// it nor has an edge within the tolerance of it.
+    fn excludes(&self, point: Point2) -> bool {
+        let scale = self.scale.max(point.u.abs()).max(point.v.abs());
+        if !point.is_finite() || scale >= MAX_BOXED_POLYGON_SCALE {
+            return false;
+        }
+        let reach = self.tolerance.abs() + 2.0 * SEGMENT_BOX_MARGIN * scale;
+        point.u > self.maximum.u + reach
+            || point.u < self.minimum.u - reach
+            || point.v > self.maximum.v + reach
+            || point.v < self.minimum.v - reach
+    }
+}
+
+/// The edges of a polygon of finite vertices, listed by equal bands of `v`.
+/// An edge is listed in every band from the band of its lower end to the band
+/// of its upper end, and [`EdgeBands::band`] never decreases as `v` grows, so
+/// an edge whose `v` range holds a value is listed in that value's band.
+#[derive(Debug, Clone)]
+struct EdgeBands {
+    v_min: f64,
+    band_height: f64,
+    /// The largest absolute vertex coordinate.
+    scale: f64,
+    last_band: usize,
+    /// Band `b` lists the edges `edges[starts[b]..starts[b + 1]]`.
+    starts: Vec<usize>,
+    /// Edges by the index of their start vertex.
+    edges: Vec<usize>,
+}
+
+impl EdgeBands {
+    /// One band per edge, or a quarter as many bands at a time while the edges
+    /// would take too many listings; `None` for a polygon that is small, has a
+    /// vertex that is not finite, is flat in `v`, or has too many long edges
+    /// for even [`MIN_EDGE_BANDS`] bands.
+    fn new(polygon: &[Point2]) -> Option<Self> {
+        let count = polygon.len();
+        if count < MIN_BANDED_POLYGON_EDGES {
+            return None;
+        }
+        let (minimum, maximum) = polygon_bounds(polygon)?;
+        let scale = [minimum.u, minimum.v, maximum.u, maximum.v]
+            .into_iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        if scale < MIN_INDEXED_POLYGON_SCALE {
+            return None;
+        }
+        let listing_limit = count.checked_mul(MAX_BAND_LISTINGS_PER_EDGE)?;
+        let mut band_count = count;
+        while band_count >= MIN_EDGE_BANDS {
+            let band_height =
+                (maximum.v - minimum.v) / cadmpeg_core::convert::f64_from_index(band_count)?;
+            if !band_height.is_normal() {
+                return None;
+            }
+            let bands = Self {
+                v_min: minimum.v,
+                band_height,
+                scale,
+                last_band: band_count - 1,
+                starts: Vec::new(),
+                edges: Vec::new(),
+            };
+            if let Some(bands) = bands.list(polygon, listing_limit) {
+                return Some(bands);
+            }
+            band_count /= 4;
+        }
+        None
+    }
+
+    /// These bands with the edges of `polygon` listed, unless that takes
+    /// more than `listing_limit` listings.
+    fn list(mut self, polygon: &[Point2], listing_limit: usize) -> Option<Self> {
+        let mut listings = Vec::new();
+        for index in 0..polygon.len() {
+            let (low, high) = self.edge_span(polygon, index);
+            if listings.len() + (high - low + 1) > listing_limit {
+                return None;
+            }
+            listings.extend((low..=high).map(|band| (band, index)));
+        }
+        listings.sort_unstable();
+        self.starts = (0..=self.last_band + 1)
+            .map(|band| listings.partition_point(|&(listed, _)| listed < band))
+            .collect();
+        self.edges = listings.into_iter().map(|(_, index)| index).collect();
+        Some(self)
+    }
+
+    fn edge_span(&self, polygon: &[Point2], index: usize) -> (usize, usize) {
+        let start = polygon[index].v;
+        let end = polygon[(index + 1) % polygon.len()].v;
+        (self.band(start.min(end)), self.band(start.max(end)))
+    }
+
+    /// The whole band heights from the lowest vertex to `v`, clamped to the
+    /// bands. Every step is monotone, so the band never decreases as `v`
+    /// grows.
+    fn band(&self, v: f64) -> usize {
+        let last = self.last_band;
+        let position = ((v - self.v_min) / self.band_height).floor();
+        if position.is_nan() || position <= 0.0 {
+            return 0;
+        }
+        cadmpeg_core::convert::truncate_f64_to_usize(position).map_or(last, |band| band.min(last))
+    }
+
+    /// The edges listed in the band of `point`: every edge whose `v` range
+    /// holds `point.v`, which are the only edges a ray toward positive `u`
+    /// can cross. `None` when `point` is not finite.
+    fn at(&self, point: Point2) -> Option<&[usize]> {
+        if !point.is_finite() {
+            return None;
+        }
+        let band = self.band(point.v);
+        Some(&self.edges[self.starts[band]..self.starts[band + 1]])
+    }
+
+    /// Edges, some more than once, among them every edge that
+    /// [`segment_box_excludes`] does not exclude for `point` and `tolerance`.
+    /// The reach doubles that test's margin, which leaves room for rounding
+    /// millions of times larger than its few ulps. `None` when `point` or
+    /// `tolerance` is not finite.
+    fn near(&self, point: Point2, tolerance: f64) -> Option<impl Iterator<Item = usize> + '_> {
+        if !point.is_finite() || !tolerance.is_finite() {
+            return None;
+        }
+        let scale = [point.u, point.v]
+            .into_iter()
+            .fold(self.scale.max(tolerance.abs()), |scale, value| {
+                scale.max(value.abs())
+            });
+        let reach = tolerance.abs() + 2.0 * SEGMENT_BOX_MARGIN * scale;
+        let first = self.starts[self.band(point.v - reach)];
+        let last = self.starts[self.band(point.v + reach) + 1];
+        Some(self.edges[first..last].iter().copied())
+    }
+}
+
+/// Checks each triangle edge interval between polygon boundary intersections.
+/// A simple polygon that contains the complete triangle boundary contains its interior.
+/// A test the work budget cuts short answers false.
+struct CheckedPlanarPolygon<'a> {
+    boundary: &'a TrimPolygon,
+    tolerance: f64,
+    convex: bool,
+    work: &'a WorkBudget,
+}
+
+impl<'a> CheckedPlanarPolygon<'a> {
+    fn new(boundary: &'a TrimPolygon, tolerance: f64, work: &'a WorkBudget) -> Option<Self> {
+        let length = boundary.points.len();
+        if !charge_product(work, length, length) {
+            return None;
+        }
+        boundary.is_simple(tolerance).then(|| Self {
+            boundary,
+            tolerance,
+            convex: polygon_is_convex(&boundary.points),
+            work,
+        })
+    }
+
+    fn contains_triangle(&self, triangle: [Point2; 3]) -> bool {
+        let Self {
+            boundary,
+            tolerance,
+            convex,
+            work,
+        } = *self;
+        if triangle
+            .iter()
+            .any(|point| FinitePoint2::new(*point).is_none())
+        {
+            return false;
+        }
+        let points = &boundary.points;
+        if convex {
+            return charge_product(work, 3, points.len())
+                && triangle
+                    .iter()
+                    .all(|point| boundary.contains(*point, tolerance));
+        }
+        for edge in 0..3 {
+            let start = triangle[edge];
+            let end = triangle[(edge + 1) % 3];
+            let du = end.u - start.u;
+            let dv = end.v - start.v;
+            let length_squared = du * du + dv * dv;
+            if !length_squared.is_finite() {
+                return false;
+            }
+            if length_squared == 0.0 {
+                continue;
+            }
+            if !work.charge_by(points.len()) {
+                return false;
+            }
+            let mut cuts = vec![0.0_f64, 1.0];
+            for (index, point) in points.iter().enumerate() {
+                let next = points[(index + 1) % points.len()];
+                let pu = point.u - start.u;
+                let pv = point.v - start.v;
+                let projected = (pu * du + pv * dv) / length_squared;
+                if !projected.is_finite() {
+                    return false;
+                }
+                if (0.0..=1.0).contains(&projected) {
+                    cuts.push(projected);
+                }
+                let eu = next.u - point.u;
+                let ev = next.v - point.v;
+                let denominator = du * ev - dv * eu;
+                if !denominator.is_finite() {
+                    return false;
+                }
+                if denominator == 0.0 {
+                    continue;
+                }
+                let along_triangle = (pu * ev - pv * eu) / denominator;
+                let along_boundary = (pu * dv - pv * du) / denominator;
+                if !along_triangle.is_finite() || !along_boundary.is_finite() {
+                    return false;
+                }
+                if (0.0..=1.0).contains(&along_triangle) && (0.0..=1.0).contains(&along_boundary) {
+                    cuts.push(along_triangle);
+                }
+            }
+            cuts.sort_by(f64::total_cmp);
+            if !charge_product(work, cuts.len(), points.len()) {
+                return false;
+            }
+            for interval in cuts.windows(2) {
+                let parameter = interval[0] + (interval[1] - interval[0]) / 2.0;
+                if !boundary.contains(
+                    Point2::new(start.u + parameter * du, start.v + parameter * dv),
+                    tolerance,
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+fn polygon_contains_triangle(boundary: &[Point2], triangle: [Point2; 3], tolerance: f64) -> bool {
+    let work = WorkBudget::new(usize::MAX);
+    let boundary = TrimPolygon::new(boundary.to_vec());
+    CheckedPlanarPolygon::new(&boundary, tolerance, &work)
+        .is_some_and(|polygon| polygon.contains_triangle(triangle))
+}
+
+/// [`polygon_contains`] without the boundary band.
+fn polygon_strictly_contains(polygon: &[Point2], point: Point2, tolerance: f64) -> bool {
+    !polygon_boundary_within(polygon, point, tolerance)
+        && crossings_odd(polygon, 0..polygon.len(), point)
+}
+
+/// Convexity of an already simple polygon.
+fn polygon_is_convex(boundary: &[Point2]) -> bool {
+    let mut orientation = 0.0;
+    for index in 0..boundary.len() {
+        let turn = signed_area_twice(
+            boundary[index],
+            boundary[(index + 1) % boundary.len()],
+            boundary[(index + 2) % boundary.len()],
+        );
+        if !turn.is_finite() {
+            return false;
+        }
+        if turn != 0.0 {
+            if orientation != 0.0 && orientation * turn < 0.0 {
+                return false;
+            }
+            orientation = turn.signum();
+        }
+    }
+    orientation != 0.0
+}
+
+fn polygon_bounds(polygon: &[Point2]) -> Option<(Point2, Point2)> {
+    let mut minimum = *polygon.first()?;
+    let mut maximum = minimum;
+    for point in polygon {
+        if !point.is_finite() {
+            return None;
+        }
+        minimum.u = minimum.u.min(point.u);
+        minimum.v = minimum.v.min(point.v);
+        maximum.u = maximum.u.max(point.u);
+        maximum.v = maximum.v.max(point.v);
+    }
+    Some((minimum, maximum))
+}
+
+/// Both polygons passed the owning trim's simplicity check.
+fn polygon_inside_polygon(inner: &[Point2], outer: &[Point2], tolerance: f64) -> bool {
+    let Some(first) = inner.first() else {
+        return true;
+    };
+    if !polygon_contains(outer, *first, tolerance) {
+        return false;
+    }
+    if tolerance.is_finite() && tolerance >= 0.0 && polygon_is_convex(outer) {
+        if let Some((minimum, maximum)) = polygon_bounds(inner) {
+            let corners = [
+                minimum,
+                Point2::new(minimum.u, maximum.v),
+                maximum,
+                Point2::new(maximum.u, minimum.v),
+            ];
+            let mut contained = true;
+            for corner in corners {
+                if !polygon_strictly_contains(outer, corner, tolerance) {
+                    contained = false;
+                    break;
+                }
+            }
+            // Convexity and strict containment of the box exclude boundary contact.
+            if contained {
+                return true;
+            }
+        }
+    }
+    for point in &inner[1..] {
+        if !polygon_contains(outer, *point, tolerance) {
+            return false;
+        }
+    }
+    for (left_index, left) in inner.iter().enumerate() {
+        for (right_index, right) in outer.iter().enumerate() {
+            if segments_intersect(
+                *left,
+                inner[(left_index + 1) % inner.len()],
+                *right,
+                outer[(right_index + 1) % outer.len()],
+                tolerance,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn polygons_overlap(first: &[Point2], second: &[Point2], tolerance: f64) -> bool {
+    // Preserve the first-pair early exit before the linear bounds pass.
+    if let Some((first_start, second_start)) = first.first().zip(second.first()) {
+        if segments_intersect(
+            *first_start,
+            first[1 % first.len()],
+            *second_start,
+            second[1 % second.len()],
+            tolerance,
+        ) {
+            return true;
+        }
+    }
+    if tolerance.is_finite() && tolerance >= 0.0 {
+        if let Some(((first_min, first_max), (second_min, second_max))) =
+            polygon_bounds(first).zip(polygon_bounds(second))
+        {
+            if first_max.u + tolerance < second_min.u
+                || second_max.u + tolerance < first_min.u
+                || first_max.v + tolerance < second_min.v
+                || second_max.v + tolerance < first_min.v
+            {
+                return false;
+            }
+        }
+    }
+    for (first_index, first_start) in first.iter().enumerate() {
+        for (second_index, second_start) in second.iter().enumerate() {
+            if first_index == 0 && second_index == 0 {
+                continue;
+            }
+            if segments_intersect(
+                *first_start,
+                first[(first_index + 1) % first.len()],
+                *second_start,
+                second[(second_index + 1) % second.len()],
+                tolerance,
+            ) {
+                return true;
+            }
+        }
+    }
+    for (points, boundary) in [(first, second), (second, first)] {
+        for point in points {
+            if polygon_strictly_contains(boundary, *point, tolerance) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn triangles_have_positive_overlap(
+    first: [Point2; 3],
+    second: [Point2; 3],
+    tolerance: f64,
+) -> bool {
+    for triangle in [first, second] {
+        for index in 0..triangle.len() {
+            let start = triangle[index];
+            let end = triangle[(index + 1) % triangle.len()];
+            let length = point_distance(start, end);
+            if !length.is_finite() || length <= f64::EPSILON {
+                return false;
+            }
+            let axis = Point2::new((start.v - end.v) / length, (end.u - start.u) / length);
+            let first_projection = triangle_projection(first, axis);
+            let second_projection = triangle_projection(second, axis);
+            let overlap = first_projection.1.min(second_projection.1)
+                - first_projection.0.max(second_projection.0);
+            if !overlap.is_finite() || overlap <= tolerance {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn triangle_projection(triangle: [Point2; 3], axis: Point2) -> (f64, f64) {
+    triangle
+        .into_iter()
+        .map(|point| point.u * axis.u + point.v * axis.v)
+        .fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+        )
+}
+
+fn convex_polygon_contains(polygon: &[Point2], point: Point2, tolerance: f64) -> bool {
+    let mut sign = 0.0_f64;
+    for index in 0..polygon.len() {
+        let start = polygon[index];
+        let end = polygon[(index + 1) % polygon.len()];
+        let cross = signed_area_twice(start, end, point);
+        if match [point, start, end].map(FinitePoint2::new) {
+            [Some(point), Some(start), Some(end)] => {
+                point_segment_distance(point, start, end) <= tolerance
+            }
+            _ => false,
+        } {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+fn circle_inside_polygon(polygon: &[Point2], hole: CircularHole, tolerance: f64) -> bool {
+    polygon_contains(polygon, hole.center, tolerance)
+        && (0..polygon.len()).all(|index| {
+            match [
+                hole.center,
+                polygon[index],
+                polygon[(index + 1) % polygon.len()],
+            ]
+            .map(FinitePoint2::new)
+            {
+                [Some(point), Some(start), Some(end)] => {
+                    point_segment_distance(point, start, end) >= hole.radius - tolerance
+                }
+                _ => false,
+            }
+        })
+}
+
+fn circle_inside_circle(outer: CircularHole, inner: CircularHole, tolerance: f64) -> bool {
+    point_distance(outer.center, inner.center) + inner.radius <= outer.radius + tolerance
+}
+
+fn circular_outer_and_holes(
+    circles: &[CircularHole],
+    tolerance: f64,
+) -> Option<(CircularHole, Vec<CircularHole>)> {
+    let mut outer_index = None;
+    for (index, outer) in circles.iter().enumerate() {
+        if circles.iter().enumerate().all(|(inner_index, inner)| {
+            index == inner_index || circle_inside_circle(*outer, *inner, tolerance)
+        }) && outer_index.replace(index).is_some()
+        {
+            return None;
+        }
+    }
+    let outer_index = outer_index?;
+    let mut holes = Vec::new();
+    for (index, hole) in circles.iter().enumerate() {
+        if index != outer_index {
+            holes.push(*hole);
+        }
+    }
+    if holes.iter().enumerate().any(|(index, left)| {
+        holes[index + 1..].iter().any(|right| {
+            point_distance(left.center, right.center) < left.radius + right.radius - tolerance
+        })
+    }) {
+        return None;
+    }
+    Some((circles[outer_index], holes))
+}
+
+fn chordal_hole_constraint(
+    hole: CircularHole,
+    points: &[Point2],
+    tolerance: f64,
+) -> Option<(CircularHole, CircularHole)> {
+    let mut minimum = None::<f64>;
+    for point in points {
+        let distance = point_distance(*point, hole.center);
+        minimum = Some(minimum.map_or(distance, |current| current.min(distance)));
+    }
+    let minimum = minimum?;
+    if minimum >= hole.radius - tolerance {
+        return Some((hole, hole));
+    }
+
+    let mut boundary_angles = Vec::new();
+    for point in points {
+        let distance = point_distance(*point, hole.center);
+        if (distance - hole.radius).abs() <= tolerance {
+            boundary_angles.push((point.v - hole.center.v).atan2(point.u - hole.center.u));
+        }
+    }
+    boundary_angles.sort_by(f64::total_cmp);
+    boundary_angles.dedup_by(|left, right| (*left - *right).abs() <= tolerance / hole.radius);
+    if boundary_angles.len() < 3 {
+        return None;
+    }
+    let last = boundary_angles.last()?;
+    let wrap_gap = boundary_angles[0] + std::f64::consts::TAU - *last;
+    let maximum_gap = boundary_angles
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .chain(std::iter::once(wrap_gap))
+        .reduce(f64::max)?;
+    if maximum_gap > std::f64::consts::PI {
+        return None;
+    }
+    let maximum_sagitta = hole.radius * (1.0 - (maximum_gap / 2.0).cos());
+    let inward_deflection = hole.radius - minimum;
+    if inward_deflection > maximum_sagitta + tolerance {
+        return None;
+    }
+    Some((
+        CircularHole {
+            radius: hole.radius - maximum_sagitta,
+            ..hole
+        },
+        hole,
+    ))
+}
+
+fn triangle_crosses_hole(
+    triangle: [Point2; 3],
+    exclusion: CircularHole,
+    boundary: CircularHole,
+    tolerance: f64,
+) -> bool {
+    if convex_polygon_contains(&triangle, exclusion.center, tolerance) {
+        return true;
+    }
+    (0..3).any(|index| {
+        let start = triangle[index];
+        let end = triangle[(index + 1) % 3];
+        let near = match [exclusion.center, start, end].map(FinitePoint2::new) {
+            [Some(point), Some(start), Some(end)] => {
+                point_segment_distance(point, start, end) < exclusion.radius - tolerance
+            }
+            _ => false,
+        };
+        near && ![start, end].iter().all(|point| {
+            (point_distance(*point, boundary.center) - boundary.radius).abs() <= tolerance
+        })
+    })
+}
+
+fn circle_overlaps_polygon(circle: CircularHole, polygon: &[Point2], tolerance: f64) -> bool {
+    polygon_strictly_contains(polygon, circle.center, tolerance)
+        || polygon
+            .iter()
+            .any(|point| point_distance(*point, circle.center) < circle.radius + tolerance)
+        || (0..polygon.len()).any(|index| {
+            match [
+                circle.center,
+                polygon[index],
+                polygon[(index + 1) % polygon.len()],
+            ]
+            .map(FinitePoint2::new)
+            {
+                [Some(point), Some(start), Some(end)] => {
+                    point_segment_distance(point, start, end) < circle.radius + tolerance
+                }
+                _ => false,
+            }
+        })
+}
+
+fn analytic_surface_normal(surface: &SolvedSurfaceGeometry, point: Point3) -> Option<Vector3> {
+    let subtract = |left: Point3, right: Point3| {
+        Vector3::new(left.x - right.x, left.y - right.y, left.z - right.z)
+    };
+    match surface {
+        SolvedSurfaceGeometry::Plane(plane_surface) => Some(*plane_surface.frame().axis().as_raw()),
+        SolvedSurfaceGeometry::Cylinder(cylinder_surface) => {
+            let origin = cylinder_surface.origin().get();
+            let axis = *cylinder_surface.frame().axis().as_raw();
+            let delta = subtract(point, origin);
+            let radial = delta - axis.scale(delta.dot(axis));
+            radial.unit()
+        }
+        SolvedSurfaceGeometry::Sphere(sphere_surface) => {
+            let center = sphere_surface.center().get();
+            subtract(point, center).unit()
+        }
+        SolvedSurfaceGeometry::Torus(torus_surface) => {
+            let center = torus_surface.center().get();
+            let axis = *torus_surface.frame().axis().as_raw();
+            let major_radius = torus_surface.major_radius().get();
+            let delta = subtract(point, center);
+            let axial = delta.dot(axis);
+            let radial = delta - axis.scale(axial);
+            let radial_unit = radial.unit()?;
+            (radial_unit.scale(radial.norm() - major_radius) + axis.scale(axial)).unit()
+        }
+        SolvedSurfaceGeometry::Cone(cone_surface) => {
+            let origin = cone_surface.origin().get();
+            let axis = *cone_surface.frame().axis().as_raw();
+            let (reference, transverse) = perpendicular_basis(cone_surface.frame());
+            let radius = cone_surface.radius().get();
+            let ratio = cone_surface.ratio().get();
+            let half_angle = cone_surface.half_angle().get();
+            let slope = half_angle.tan();
+            if !slope.is_finite() {
+                return None;
+            }
+            let delta = point.vector_from(origin);
+            let axial = delta.dot(axis);
+            let major = delta.dot(reference);
+            let minor = delta.dot(transverse);
+            let elliptical_radius = major.hypot(minor / ratio);
+            if elliptical_radius <= f64::EPSILON {
+                return None;
+            }
+            let local_radius = radius + axial * slope;
+            (reference.scale(major / elliptical_radius)
+                + transverse.scale(minor / (ratio * ratio * elliptical_radius))
+                - axis.scale(slope * local_radius.signum()))
+            .unit()
+        }
+        SolvedSurfaceGeometry::Transformed(placed) if placed.transform().is_proper_rigid() => {
+            let transform = placed.transform();
+            transform
+                .apply_vector(analytic_surface_normal(
+                    placed.basis(),
+                    transform
+                        .try_inverse_affine()
+                        .ok()?
+                        .apply_point(point)?
+                        .get(),
+                )?)?
+                .unit()
+        }
+        SolvedSurfaceGeometry::Nurbs(_)
+        | SolvedSurfaceGeometry::Polygonal(_)
+        | SolvedSurfaceGeometry::Transformed(_)
+        | SolvedSurfaceGeometry::Unknown { .. } => None,
+    }
+}
+
+fn analytic_surface_residual(surface: &SolvedSurfaceGeometry, point: Point3) -> Option<f64> {
+    let subtract = |left: Point3, right: Point3| {
+        Vector3::new(left.x - right.x, left.y - right.y, left.z - right.z)
+    };
+    match surface {
+        SolvedSurfaceGeometry::Plane(plane_surface) => {
+            let origin = plane_surface.origin().get();
+            let normal = plane_surface.frame().axis().as_raw();
+            Some(subtract(point, origin).dot(*normal).abs())
+        }
+        SolvedSurfaceGeometry::Cylinder(cylinder_surface) => {
+            let origin = cylinder_surface.origin().get();
+            let axis = *cylinder_surface.frame().axis().as_raw();
+            let radius = cylinder_surface.radius().get();
+            let delta = subtract(point, origin);
+            let radial = delta - axis.scale(delta.dot(axis));
+            Some((radial.norm() - radius).abs())
+        }
+        SolvedSurfaceGeometry::Sphere(sphere_surface) => {
+            let center = sphere_surface.center().get();
+            let radius = sphere_surface.radius().get();
+            Some((subtract(point, center).norm() - radius).abs())
+        }
+        SolvedSurfaceGeometry::Torus(torus_surface) => {
+            let center = torus_surface.center().get();
+            let axis = *torus_surface.frame().axis().as_raw();
+            let major_radius = torus_surface.major_radius().get();
+            let minor_radius = torus_surface.minor_radius().get();
+            let delta = subtract(point, center);
+            let axial = delta.dot(axis);
+            let radial = delta - axis.scale(axial);
+            Some(
+                (((radial.norm() - major_radius).powi(2) + axial.powi(2)).sqrt() - minor_radius)
+                    .abs(),
+            )
+        }
+        SolvedSurfaceGeometry::Cone(cone_surface) => {
+            let origin = cone_surface.origin().get();
+            let axis = *cone_surface.frame().axis().as_raw();
+            let (reference, transverse) = perpendicular_basis(cone_surface.frame());
+            let radius = cone_surface.radius().get();
+            let ratio = cone_surface.ratio().get();
+            let half_angle = cone_surface.half_angle().get();
+            let slope = half_angle.tan();
+            if !slope.is_finite() {
+                return None;
+            }
+            let delta = subtract(point, origin);
+            let axial = delta.dot(axis);
+            let major = delta.dot(reference);
+            let minor = delta.dot(transverse);
+            let local_radius = radius + axial * slope;
+            let elliptical_radius = major.hypot(minor / ratio);
+            Some((elliptical_radius - local_radius.abs()).abs())
+        }
+        SolvedSurfaceGeometry::Transformed(placed) if placed.transform().is_proper_rigid() => {
+            analytic_surface_residual(
+                placed.basis(),
+                placed
+                    .transform()
+                    .try_inverse_affine()
+                    .ok()?
+                    .apply_point(point)?
+                    .get(),
+            )
+        }
+        SolvedSurfaceGeometry::Nurbs(_)
+        | SolvedSurfaceGeometry::Polygonal(_)
+        | SolvedSurfaceGeometry::Transformed(_)
+        | SolvedSurfaceGeometry::Unknown { .. } => None,
+    }
+    .filter(|residual| residual.is_finite())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SurfaceMeasure {
+    residual: f64,
+    normal: Option<Vector3>,
+}
+
+/// Whether `point` lies more than `tolerance` outside the box of `nurbs`'s
+/// poles on some axis, so that no point of the surface fits it.
+///
+/// Over its knot domain a surface whose weights are all positive lies in the
+/// convex hull of its poles. An evaluated point leaves that hull by rounding
+/// only, far less than [`EPS_POLE_BOX_ROUNDING`] of the coordinate scale. A
+/// weight of zero or less gives no such bound, so the answer is then `false`.
+fn outside_pole_box(
+    nurbs: &cadmpeg_ir::geometry::nurbs::NurbsSurface,
+    point: Point3,
+    tolerance: f64,
+) -> bool {
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    let mut include = |pole: &FinitePoint3| {
+        for (axis, value) in [pole.x, pole.y, pole.z].into_iter().enumerate() {
+            low[axis] = low[axis].min(value);
+            high[axis] = high[axis].max(value);
+        }
+    };
+    match nurbs.pole_grid() {
+        cadmpeg_ir::geometry::nurbs::NurbsPoleGrid::Polynomial { rows } => {
+            rows.iter().flatten().for_each(&mut include);
+        }
+        cadmpeg_ir::geometry::nurbs::NurbsPoleGrid::Rational { rows } => {
+            for pole in rows.iter().flatten() {
+                if pole.weight.get() <= 0.0 {
+                    return false;
+                }
+                include(&pole.point);
+            }
+        }
+    }
+    let coordinates = [point.x, point.y, point.z];
+    let scale = low
+        .iter()
+        .chain(&high)
+        .chain(&coordinates)
+        .filter(|value| value.is_finite())
+        .fold(1.0_f64, |scale, value| scale.max(value.abs()));
+    let margin = tolerance + EPS_POLE_BOX_ROUNDING * scale;
+    coordinates
+        .into_iter()
+        .zip(low.into_iter().zip(high))
+        .any(|(value, (low, high))| value < low - margin || value > high + margin)
+}
+
+fn surface_measure(
+    ctx: &DecodeContext<'_>,
+    surface: &SolvedSurfaceGeometry,
+    point: Point3,
+    fit_tolerance: Option<f64>,
+) -> Result<Option<SurfaceMeasure>, cadmpeg_core::CodecError> {
+    surface_measure_with(ctx, surface, point, fit_tolerance, true)
+}
+
+/// The residual [`surface_measure`] states, without its normal.
+fn surface_residual(
+    ctx: &DecodeContext<'_>,
+    surface: &SolvedSurfaceGeometry,
+    point: Point3,
+    fit_tolerance: f64,
+) -> Result<Option<f64>, cadmpeg_core::CodecError> {
+    Ok(
+        surface_measure_with(ctx, surface, point, Some(fit_tolerance), false)?
+            .map(|measure| measure.residual),
+    )
+}
+
+/// The measure of `point` against `surface`; its normal is absent unless
+/// `with_normal` is set. Whether a measure exists, and its residual, do not
+/// depend on `with_normal`.
+fn surface_measure_with(
+    ctx: &DecodeContext<'_>,
+    surface: &SolvedSurfaceGeometry,
+    point: Point3,
+    fit_tolerance: Option<f64>,
+    with_normal: bool,
+) -> Result<Option<SurfaceMeasure>, cadmpeg_core::CodecError> {
+    if let SolvedSurfaceGeometry::Nurbs(nurbs) = surface {
+        let Some(tolerance) = fit_tolerance else {
+            return Ok(None);
+        };
+        if outside_pole_box(nurbs, point, tolerance) {
+            return Ok(None);
+        }
+        let Some(parameters) =
+            crate::brep::evaluation::nurbs_surface_parameter_near_point(ctx, nurbs, point, None)?
+        else {
+            return Ok(None);
+        };
+        let Some(partials) = crate::brep::evaluation::nurbs_surface_partials(
+            ctx,
+            nurbs,
+            parameters.u,
+            parameters.v,
+        )?
+        else {
+            return Ok(None);
+        };
+        let residual = point.distance(partials.point.get());
+        if residual > tolerance {
+            return Ok(None);
+        }
+        return Ok(Some(SurfaceMeasure {
+            residual,
+            normal: with_normal
+                .then(|| partials.du.cross(partials.dv.get()).unit())
+                .flatten(),
+        })
+        .filter(|measure| measure.residual.is_finite()));
+    }
+    if let SolvedSurfaceGeometry::Transformed(placed) = surface {
+        let _depth = ctx.enter_nested("measure SLDPRT placed surface")?;
+        let transform = placed.transform();
+        if transform.is_proper_rigid() {
+            let Some(inverse) = transform.try_inverse_affine().ok() else {
+                return Ok(None);
+            };
+            let Some(local_point) = inverse.apply_point(point) else {
+                return Ok(None);
+            };
+            let Some(mut measure) = surface_measure_with(
+                ctx,
+                placed.basis(),
+                local_point.get(),
+                fit_tolerance,
+                with_normal,
+            )?
+            else {
+                return Ok(None);
+            };
+            measure.normal = measure
+                .normal
+                .and_then(|normal| transform.apply_vector(normal)?.unit());
+            return Ok(Some(measure));
+        }
+    }
+    let Some(residual) = analytic_surface_residual(surface, point) else {
+        return Ok(None);
+    };
+    Ok(Some(SurfaceMeasure {
+        residual,
+        normal: with_normal
+            .then(|| analytic_surface_normal(surface, point))
+            .flatten(),
+    }))
+}
+
+#[cfg(test)]
+mod tests;

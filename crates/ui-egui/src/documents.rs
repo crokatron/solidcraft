@@ -515,6 +515,9 @@ pub fn switch(app: &mut SolveApp, i: usize) {
     };
     crate::linked_source::note_unread(app);
     let fit = incoming.fit;
+    app.mesh_report = None;
+    app.live_slice = None;
+    app.mesh_region_colors = None;
     let out = swap_in(app, incoming);
     if fit {
         app.fit_view();

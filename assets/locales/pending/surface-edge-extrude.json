@@ -1,0 +1,17 @@
+{
+  "en": {
+    "ui.edge_extrude_profiles_curves_or_edges": "Profiles, curves or edges",
+    "ui.edge_extrude_edge_method": "Edge method",
+    "ui.edge_extrude_face_normal": "Face Normal",
+    "ui.edge_extrude_custom_vector": "Custom Vector",
+    "ui.edge_extrude_extend_face": "Extend Face",
+    "ui.edge_extrude_support_face": "Support face",
+    "ui.edge_extrude_direction_x": "Direction X",
+    "ui.edge_extrude_direction_y": "Direction Y",
+    "ui.edge_extrude_direction_z": "Direction Z",
+    "ui.edge_extrude_reverse_direction": "Reverse direction",
+    "cmd.surface.extrude_edge": "Extrude Surface Edge",
+    "help.surface.extrude_edge": "Build a surface from a selected edge along a vector or the adjacent face normal, or extend that face at its boundary.",
+    "ui.edge_extrude_rotation_hint": "Click an axis or drag a rotation ring."
+  }
+}

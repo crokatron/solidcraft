@@ -20,7 +20,7 @@ use crate::schema::surface::{
     ThickenParams, UnstitchParams, UntrimParams,
 };
 use crate::schema::surface_blend::BlendParams;
-use crate::schema::surface_ruled::SurfaceRuledParams;
+use crate::schema::surface_ruled::{EdgeExtrudeParams, SurfaceRuledParams};
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{Result, Session};
 
@@ -39,7 +39,15 @@ const SURFACE_LOFT_CONTRACT: TypedContract<SurfaceLoftParams> = TypedContract::n
 const BLEND_CONTRACT: TypedContract<BlendParams> = TypedContract::new();
 const SURFACE_RULED_CONTRACT: TypedContract<SurfaceRuledParams> = TypedContract::new();
 
+const EDGE_EXTRUDE_CONTRACT: TypedContract<EdgeExtrudeParams> = TypedContract::new();
+
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("surface.extrude_edge", "Extrude Edge", crate::checked!("surface.extrude_edge", extrude_edge))
+        .at("SURFACE", "CREATE")
+        .icon("surface_extrude")
+        .contract(&EDGE_EXTRUDE_CONTRACT)
+        .output(output_schema_for::<FeatureResult>)
+        .params("body, edges: points in world coordinates on a connected edge chain, distance: length expression, mode?: normal|direction|extend. Normal follows the adjacent face (face?: point), direction follows a world vector (direction: [x,y,z]); flip?: bool. Both create a new surface. Extend grows an exterior edge on its underlying surface in place."),
     CommandSpec::new("surface.patch", "Patch", crate::checked!("surface.patch", patch))
         .at("SURFACE", "CREATE")
         .icon("surface_patch")
@@ -533,10 +541,49 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
     add_feature(s, p, kind)
 }
 
+fn extrude_edge(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "surface.extrude_edge";
+    let mode = str_(p, "mode").unwrap_or("normal");
+    if !matches!(mode, "direction" | "normal" | "extend") {
+        return Err(bad(cmd, "choose normal, direction or extend"));
+    }
+    if mode != "direction" && p.get("direction").is_some_and(|v| !v.is_null()) {
+        return Err(bad(cmd, "a custom direction applies only in direction mode"));
+    }
+    if mode != "normal" && p.get("face").is_some_and(|v| !v.is_null()) {
+        return Err(bad(cmd, "a support face applies only in normal mode"));
+    }
+    if mode != "extend" {
+        return ruled(s, p);
+    }
+    if bool_(p, "flip").unwrap_or(false) {
+        return Err(bad(cmd, "a natural extension grows outwards from a boundary edge"));
+    }
+    let body = str_(p, "body").ok_or_else(|| bad(cmd, "pick the surface body"))?;
+    let frames = s.body_frames();
+    let (_, own, frame) = frames.iter().find(|(world, ..)| world == body).ok_or_else(|| bad(cmd, "unknown surface body"))?;
+    let inverse = solidcraft_doc::mat_inverse(frame).ok_or_else(|| bad(cmd, "the surface placement cannot be inverted"))?;
+    let edge_list = p
+        .get("edges")
+        .and_then(Value::as_array)
+        .filter(|es| !es.is_empty() && es.len() <= 10_000)
+        .ok_or_else(|| bad(cmd, "pick at least one boundary edge (up to 10,000)"))?;
+    let edges = edge_list
+        .iter()
+        .map(|v| {
+            vec3(v).map(|q| Position(solidcraft_doc::apply_point(&inverse, q))).ok_or_else(|| bad(cmd, "edge picks must be world [x, y, z] points"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let distance = expr(p, "distance").ok_or_else(|| bad(cmd, "enter an extension distance"))?;
+    check_expr(s, &distance, Kind::Length, cmd, "distance")?;
+    let kind = FeatureKind::SurfaceExtend { body: BodyName(own.clone()), edges, distance, mode: ExtendMode::Natural, up_to: None, neighbours: true };
+    super::features::add_feature_in(s, p, kind, false)
+}
+
 fn ruled(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "surface.ruled";
     let body = str_(p, "body").ok_or_else(|| bad(cmd, "`body` is required"))?.to_string();
-    if s.model.state().body(&body).is_none() {
+    if s.own_body_name(&body).is_none() {
         return Err(bad(cmd, format!("no body `{body}`")));
     }
     let edges: Vec<solidcore_record::Vec3> =
@@ -1371,6 +1418,53 @@ mod tests {
             .to_string();
         run(s, "sketch.finish", json!({}));
         run(s, "surface.extrude", json!({"sketch": "Arc", "curves": [arc], "distance": 20, "body_name": name}));
+    }
+
+    #[test]
+    fn edge_extrusion_respects_direction_support_and_natural_curvature() {
+        let mut s = Session::default();
+        s.param_check = crate::schema::ParamCheck::Strict;
+        let cmd = "surface.extrude_edge";
+        run(&mut s, "solid.box", json!({"length":10,"width":10,"height":10,"body_name":"Box"}));
+        run(&mut s, cmd, json!({"body":"Box","edges":[[5,0,10]],"mode":"direction","direction":[0,-3,4],"distance":"5 mm","body_name":"Lip"}));
+        let measured = solidcraft_kernel::measure(&s.world_state().unwrap().body("Lip").unwrap().body).unwrap();
+        assert!((measured.area - 50.0).abs() < 1e-7);
+        assert!((measured.bbox.min.y + 3.0).abs() < 1e-7 && (measured.bbox.max.z - 14.0).abs() < 1e-7);
+        quarter_cylinder(&mut s, "CylinderSheet");
+        let r = 10.0 / 2f64.sqrt();
+        let rim = json!([[r, r, 20]]);
+        run(&mut s, cmd, json!({"body":"CylinderSheet","edges":rim,"mode":"direction","direction":[0,0,1],"distance":5,"body_name":"Wall"}));
+        let expected_wall = 25.0 * std::f64::consts::PI;
+        assert!((area(&s, "Wall") - expected_wall).abs() < expected_wall * 0.002);
+        run(&mut s, cmd, json!({"body":"CylinderSheet","edges":rim,"face":[r,r,10],"distance":2,"body_name":"Rim"}));
+        // A quarter annulus: outward radius 12 or inward radius 8, per source orientation.
+        let rim_area = area(&s, "Rim");
+        assert!([11.0, 9.0].iter().any(|k| (rim_area - k * std::f64::consts::PI).abs() < 0.1), "{rim_area}");
+        let before = s.doc.to_json();
+        run(&mut s, cmd, json!({"body":"CylinderSheet","edges":rim,"mode":"extend","distance":5}));
+        let extended_area = 125.0 * std::f64::consts::PI;
+        assert!((area(&s, "CylinderSheet") - extended_area).abs() < extended_area * 0.002);
+        let cold = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert!((area(&cold, "CylinderSheet") - area(&s, "CylinderSheet")).abs() < 1e-8);
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(s.doc.to_json(), before);
+        for direction in [[1, 0, 0], [0, 0, 0]] {
+            let invalid = json!({"body":"Box","edges":[[5,0,10]],"mode":"direction","direction":direction,"distance":5});
+            assert!(s.preview_world(&[(cmd.to_owned(), invalid.clone())]).is_err());
+            assert_eq!(s.doc.to_json(), before);
+            assert!(s.execute(cmd, &invalid).is_err());
+            assert_eq!(s.doc.to_json(), before);
+        }
+        let mut placed = Session::default();
+        let part = run(&mut placed, "component.create", json!({"name":"Part","grounded":false}));
+        run(&mut placed, "solid.box", json!({"length":10,"width":4,"height":6,"body_name":"Placed"}));
+        run(&mut placed, "component.activate", json!({"component":0}));
+        run(&mut placed, "occurrence.move", json!({"occurrence":part["occurrence"],"axis":[1,0,0],"angle":"90 deg","translate":[30,50,0]}));
+        let bounds = solidcraft_kernel::measure(&placed.world_state().unwrap().body("Placed").unwrap().body).unwrap().bbox;
+        let pick = [(bounds.min.x + bounds.max.x) * 0.5, bounds.max.y, bounds.max.z];
+        run(&mut placed, cmd, json!({"body":"Placed","edges":[pick],"mode":"direction","direction":[0,3,4],"distance":5,"body_name":"PlacedLip"}));
+        let lip = solidcraft_kernel::measure(&placed.world_state().unwrap().body("PlacedLip").unwrap().body).unwrap().bbox;
+        assert!((lip.min.x - bounds.min.x).abs() < 1e-7 && (lip.max.y - pick[1] - 3.0).abs() < 1e-7 && (lip.max.z - pick[2] - 4.0).abs() < 1e-7);
     }
 
     /// Extend a cylinder strip: naturally 5 along its axis (10 · π/2 · 25, one face, still a

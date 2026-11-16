@@ -1,0 +1,17 @@
+{
+  "en": {
+    "move.align_handles_to_csys": "Align handles and part to CSYS",
+    "move.handle_angle_x": "Handle angle X",
+    "move.handle_angle_y": "Handle angle Y",
+    "move.handle_angle_z": "Handle angle Z",
+    "move.handle_origin_x": "Handle origin X",
+    "move.handle_origin_y": "Handle origin Y",
+    "move.handle_origin_z": "Handle origin Z",
+    "move.handles_from_reference": "Set handles from CSYS",
+    "move.handles_only": "Move handles only",
+    "move.handles_only_hint": "Move or rotate the handles without moving geometry. Turn this off to move using the handle axes.",
+    "move.handles_reference": "Handle CSYS",
+    "move.missing_csys": "Unavailable CSYS — select another",
+    "move.target_csys": "Target CSYS"
+  }
+}

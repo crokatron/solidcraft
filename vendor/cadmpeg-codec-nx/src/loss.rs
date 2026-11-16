@@ -1,0 +1,322 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Stable loss vocabulary for NX `.prt` decoding.
+//!
+//! Every fallback, approximation, and drop the decoder reports carries a
+//! stable machine-readable code from [`NxLossCode`]. Codes are the gating
+//! surface: harness oracles and downstream tooling key on them, never on the
+//! human-readable message text, so a reworded message is not a contract change
+//! and a new drop path without a code does not compile.
+//!
+//! [`NxLossCode::note`] is the single practical construction path for a
+//! decode-time [`LossNote`] in this crate: it fixes the loss category and
+//! severity from the code so the two cannot drift apart across sites, and it
+//! leaves only the per-instance message to the caller. Local codes appear on
+//! [`LossNote::code`] under the `nx` namespace.
+//!
+//! [`NxLossCode::shared_taxonomy`] is an exhaustive match with no fall-through
+//! arm. A default arm would silently assign a category to a code added later,
+//! and the categories this codec spans (carrier, topology, history, container)
+//! have no honest common default.
+
+use cadmpeg_ir::report::{
+    loss::{LossKind, LossNote, LossTaxonomy},
+    Severity,
+};
+
+macro_rules! loss_codes {
+    ($( $(#[$meta:meta])* $variant:ident => ($code:literal, $severity:ident, $taxonomy:ident), )*) => {
+        /// Stable NX transfer-loss identifier.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub(crate) enum NxLossCode {
+            $( $(#[$meta])* $variant, )*
+        }
+
+        impl NxLossCode {
+            /// Every code in declaration order.
+            #[cfg(test)]
+            const ALL: &'static [Self] = &[$(Self::$variant),*];
+
+            /// Stable loss code string.
+            #[must_use]
+            pub(crate) const fn code(self) -> &'static str {
+                match self { $(Self::$variant => $code),* }
+            }
+
+            /// Loss severity.
+            #[must_use]
+            const fn severity(self) -> Severity {
+                match self { $(Self::$variant => Severity::$severity),* }
+            }
+
+            const fn shared_taxonomy(self) -> LossTaxonomy {
+                match self { $(Self::$variant => LossTaxonomy::$taxonomy),* }
+            }
+        }
+    };
+}
+
+loss_codes! {
+    /// A JT display graph failed native admission.
+    DisplayJtGraphRejected => ("container.display-jt-graph-rejected", Blocking, DecodeDiagnostic),
+    /// A roll-forward table failed native admission.
+    RollForwardTableRejected => ("history.roll-forward-table-rejected", Blocking, DecodeDiagnostic),
+    /// An embedded kernel dialect had no declared grammar and was recovered as residual.
+    KernelDialectUnverified => ("source.kernel-dialect-unverified", Warning, SourceDialectUnverified),
+    /// Two embedded kernel carriers resolved to one dialect-layer identity.
+    DialectLayerCollision => ("source.dialect-layer-collision", Warning, DecodeDiagnostic),
+    /// Census of decoded Parasolid POINT and analytic curve/surface carriers.
+    CarrierAnalyticCensus => ("carrier.analytic-census", Info, CarrierSummary),
+    /// Census of decoded embedded JT display tessellations.
+    CarrierTessellationCensus => ("carrier.tessellation-census", Info, CarrierSummary),
+    /// B-rep topology graph was not reconstructed from surviving typed records.
+    TopologyGraphNotReconstructed => ("topology.graph-not-reconstructed", Blocking, TopologyNotTransferred),
+    /// A complete primary EDGE has no admitted typed projection.
+    PrimaryEdgeUnresolved => ("topology.primary-edge-unresolved", Warning, TopologyNotTransferred),
+    /// A complete primary node of a supported non-EDGE kind has no admitted
+    /// typed projection.
+    PrimaryNodeUnresolved => ("topology.primary-node-unresolved", Warning, TopologyNotTransferred),
+    /// Surface-intersection records lack a validated chart and term-endpoint witness.
+    IntersectionRecordsOpaque => ("intersection.records-opaque", Warning, ObjectRecordsUntransferred),
+    /// Geometric completion reached a declared work bound before all
+    /// intersection pcurve lanes were complete.
+    IntersectionPcurveCompletionBounded => ("intersection.pcurve-completion-bounded", Warning, ObjectRecordsUntransferred),
+    /// Adaptive geometry certification reached its model-wide work bound.
+    GeometryAdaptiveWorkBounded => ("geometry.adaptive-work-bounded", Warning, ObjectRecordsUntransferred),
+    /// Physical Deltas records do not establish the selected aggregate state.
+    DeltasSelectionUnresolved => ("deltas.selection-unresolved", Warning, DecodeDiagnostic),
+    /// Matching current/latest marks select the partition; edit history is not replayed.
+    DeltasHistoryNotReplayed => ("deltas.history-not-replayed", Info, FeatureHistoryRetained),
+    /// Sub-body partitions remain; Boolean history does not resolve every image.
+    SubBodyCompositionUnresolved => ("history.sub-body-composition-unresolved", Warning, FeatureHistoryRetained),
+    /// Plain cached-body images are withheld because the part also has partition-stream bodies.
+    PlainHistoryImagesWithheld => ("history.plain-images-withheld", Warning, FeatureHistoryRetained),
+    /// A referenced Parasolid attribute value relation did not resolve.
+    AttributeValueUnresolved => ("attribute.value-unresolved", Warning, AttributesNotTransferred),
+    /// A topology attribute list reaches an omitted type-81 record or an unresolved type-80 class.
+    AttributeListUnresolved => ("attribute.list-unresolved", Warning, AttributesNotTransferred),
+    /// Feature-history suppression state remains unresolved.
+    FeatureSuppressionUnresolved => ("feature.suppression-unresolved", Warning, FeatureHistoryRetained),
+    /// Configuration activation, body membership, or evaluated state is incomplete.
+    ConfigurationStateUnresolved => ("configuration.state-unresolved", Warning, FeatureHistoryRetained),
+    /// Expression parameter evaluation or dependency semantics are incomplete.
+    ExpressionParameterIncomplete => ("expression.parameter-incomplete", Warning, FeatureHistoryRetained),
+    /// Feature-history operations remain native-only without neutral semantics.
+    FeatureNativeKindRetained => ("feature.native-kind-retained", Warning, FeatureHistoryRetained),
+    /// Feature family identities transferred; construction semantics unresolved.
+    FeatureFamilyConstructionUnresolved => ("feature.family-construction-unresolved", Warning, FeatureHistoryRetained),
+    /// Typed feature output lineage is missing, duplicated, or unresolved.
+    FeatureOutputLineageIncomplete => ("feature.output-lineage-incomplete", Warning, FeatureHistoryRetained),
+    /// Typed feature operations have incomplete neutral construction fields.
+    FeatureConstructionIncomplete => ("feature.construction-incomplete", Warning, FeatureHistoryRetained),
+    /// Sketch history features have no neutral sketch graph.
+    SketchGraphUnresolved => ("sketch.graph-unresolved", Warning, FeatureHistoryRetained),
+    /// Sketch geometry or constraint records remain native-only.
+    SketchNativeSemantics => ("sketch.native-semantics", Warning, FeatureHistoryRetained),
+    /// Bounded offset-store control blocks have no admitted complete grammar.
+    OffsetStoreControlUntyped => ("container.offset-store-control-untyped", Warning, RecordNotTyped),
+    /// A named container stream is retained byte-exact without typed fields.
+    ContainerStreamOpaque => ("container.stream-opaque", Info, RecordNotTyped),
+    /// A classified non-Parasolid stream was not transferred.
+    NonParasolidStreamOmitted => ("stream.non-parasolid-omitted", Info, PassthroughRecordOmitted),
+    /// Assembly `.prt` has no inline geometry; children live in external parts.
+    AssemblyComponentsExternal => ("assembly.components-external", Blocking, AssemblyComponentsExternal),
+    /// `FastLoad` component uses have no corresponding native placement frames.
+    AssemblyOccurrencesUnresolved => ("assembly.occurrences-unresolved", Blocking, AssemblyPlacementsNotTransferred),
+    /// Native assembly placements lack a unique prototype or an established translation unit.
+    AssemblyPlacementFrameUnresolved => ("assembly.placement-frame-unresolved", Blocking, AssemblyPlacementsNotTransferred),
+    /// Emitted placement translations take the length unit of the part's expressions.
+    AssemblyPlacementUnitFromExpressions => ("assembly.placement-unit-from-expressions", Warning, DecodeDiagnostic),
+    /// Emitted placements are direct children of the assembly root.
+    AssemblyPlacementParentAssumed => ("assembly.placement-parent-assumed", Warning, DecodeDiagnostic),
+    /// External component filenames join roster names while directories remain unknown.
+    AssemblyExternalFilenameAssumed => ("assembly.external-filename-assumed", Warning, DecodeDiagnostic),
+    /// A roster prototype has no unique retained external document filename.
+    AssemblyExternalDocumentUnresolved => ("assembly.external-document-unresolved", Warning, MetadataNotTransferred),
+    /// A carrier record of the right family states lanes the IR carrier refuses.
+    CarrierLanesUnpaired => ("carrier.lanes-unpaired", Warning, ObjectRecordsUntransferred),
+    /// A B-spline record stores a control-point weight that is zero or negative.
+    CarrierSplineWeightNonpositive => ("carrier.spline-weight-nonpositive", Warning, ObjectRecordsUntransferred),
+    /// A B-spline record's dimension, counts, or multiplicities contradict
+    /// each other or its arrays.
+    CarrierSplineFieldsInconsistent => ("carrier.spline-fields-inconsistent", Warning, ObjectRecordsUntransferred),
+    /// A CONE record stores a negative sine or cosine of its half-angle,
+    /// whose surface is unresolved.
+    CarrierConeHalfAngleSignUnresolved => ("carrier.cone-half-angle-sign-unresolved", Warning, ObjectRecordsUntransferred),
+    /// A CONE record's stored sine and cosine break the unit identity.
+    CarrierConeHalfAngleIdentityRefused => ("carrier.cone-half-angle-identity-refused", Warning, ObjectRecordsUntransferred),
+    /// A TORUS record stores a negative major radius, whose surface is
+    /// unresolved (`PS-43`).
+    CarrierTorusNegativeMajorUnresolved => ("carrier.torus-negative-major-unresolved", Warning, ObjectRecordsUntransferred),
+    /// A B-spline carrier's descriptor names no control values that resolve to it.
+    CarrierControlsUnresolved => ("carrier.controls-unresolved", Warning, ObjectRecordsUntransferred),
+    /// No gate-passing analytic carrier was found in the Parasolid streams.
+    GeometryNotTransferred => ("geometry.not-transferred", Blocking, GeometryNotTransferred),
+    /// A face loop states no resolvable coedge ring and is omitted from its face.
+    TopologyLoopRingUnresolved => ("topology.loop-ring-unresolved", Warning, TopologyNotTransferred),
+    /// A face's linked loop boundary cannot be admitted and is omitted.
+    TopologyFaceLoopUnresolved => ("topology.face-loop-unresolved", Warning, TopologyNotTransferred),
+    /// A semantic annotation order is past the stated annotation order width.
+    SemanticAnnotationOrderUnstatable => ("annotation.semantic-order-unstatable", Warning, MetadataNotTransferred),
+    /// A record search reached its local work bound and skipped the records
+    /// it was locating.
+    SourceScanBounded => ("source.scan-bounded", Warning, ObjectRecordsUntransferred),
+    /// Indexed OM object records reached the identity graph work bound and
+    /// were kept without a stable identity.
+    ObjectRecordIdentityBounded => ("native.record-identity-bounded", Warning, MetadataNotTransferred),
+    /// An arithmetic-coded Display-JT lane reached its decoder work bound and
+    /// was left undecoded.
+    DisplayJtArithmeticLaneBounded => ("container.display-jt-arithmetic-lane-bounded", Warning, ObjectRecordsUntransferred),
+    /// A Display-JT polygon mesh did not resolve to a tessellation and was
+    /// skipped.
+    DisplayJtTessellationsDropped => ("carrier.display-jt-tessellations-dropped", Warning, ObjectRecordsUntransferred),
+    /// Native object-model attachment failed; none of its records were kept.
+    NativeAttachmentFailed => ("native.attachment-failed", Error, DecodeDiagnostic),
+}
+
+impl NxLossCode {
+    /// Strict floor pinned from this local code.
+    ///
+    /// Defaults to the taxonomy floor. `NativeAttachmentFailed` pins Error
+    /// above its `DecodeDiagnostic` taxonomy, which strict mode otherwise
+    /// tolerates.
+    const fn strict_floor(self) -> Option<Severity> {
+        match self {
+            Self::NativeAttachmentFailed => Some(Severity::Error),
+            other => other.shared_taxonomy().strict_floor(),
+        }
+    }
+
+    /// Namespaced [`LossKind`] for this local code (taxonomy + pinned floor).
+    #[must_use]
+    pub(crate) fn kind(self) -> LossKind {
+        cadmpeg_ir::report::loss::NamespacedLossKind::new(
+            const {
+                match cadmpeg_ir::report::loss::LossNamespace::new("nx") {
+                    Ok(namespace) => namespace,
+                    Err(_) => panic!("reserved codec namespace"),
+                }
+            },
+            self.code(),
+            self.shared_taxonomy(),
+        )
+        .with_strict_floor(self.strict_floor())
+        .into()
+    }
+
+    /// Build a [`LossNote`] for this code with the given per-instance message.
+    ///
+    /// The structured code is `nx/<local>`. Severity comes from the local
+    /// code; the strict floor comes from [`Self::strict_floor`].
+    #[must_use]
+    pub(crate) fn note(self, message: impl Into<String>) -> LossNote {
+        LossNote::new(self.kind(), message).with_severity(self.severity())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NxLossCode;
+    use std::collections::BTreeSet;
+
+    /// Value-level golden: the stable string form of every code, pinned.
+    #[test]
+    fn code_strings_are_pinned() {
+        let codes: Vec<&str> = NxLossCode::ALL.iter().map(|c| c.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "container.display-jt-graph-rejected",
+                "history.roll-forward-table-rejected",
+                "source.kernel-dialect-unverified",
+                "source.dialect-layer-collision",
+                "carrier.analytic-census",
+                "carrier.tessellation-census",
+                "topology.graph-not-reconstructed",
+                "topology.primary-edge-unresolved",
+                "topology.primary-node-unresolved",
+                "intersection.records-opaque",
+                "intersection.pcurve-completion-bounded",
+                "geometry.adaptive-work-bounded",
+                "deltas.selection-unresolved",
+                "deltas.history-not-replayed",
+                "history.sub-body-composition-unresolved",
+                "history.plain-images-withheld",
+                "attribute.value-unresolved",
+                "attribute.list-unresolved",
+                "feature.suppression-unresolved",
+                "configuration.state-unresolved",
+                "expression.parameter-incomplete",
+                "feature.native-kind-retained",
+                "feature.family-construction-unresolved",
+                "feature.output-lineage-incomplete",
+                "feature.construction-incomplete",
+                "sketch.graph-unresolved",
+                "sketch.native-semantics",
+                "container.offset-store-control-untyped",
+                "container.stream-opaque",
+                "stream.non-parasolid-omitted",
+                "assembly.components-external",
+                "assembly.occurrences-unresolved",
+                "assembly.placement-frame-unresolved",
+                "assembly.placement-unit-from-expressions",
+                "assembly.placement-parent-assumed",
+                "assembly.external-filename-assumed",
+                "assembly.external-document-unresolved",
+                "carrier.lanes-unpaired",
+                "carrier.spline-weight-nonpositive",
+                "carrier.spline-fields-inconsistent",
+                "carrier.cone-half-angle-sign-unresolved",
+                "carrier.cone-half-angle-identity-refused",
+                "carrier.torus-negative-major-unresolved",
+                "carrier.controls-unresolved",
+                "geometry.not-transferred",
+                "topology.loop-ring-unresolved",
+                "topology.face-loop-unresolved",
+                "annotation.semantic-order-unstatable",
+                "source.scan-bounded",
+                "native.record-identity-bounded",
+                "container.display-jt-arithmetic-lane-bounded",
+                "carrier.display-jt-tessellations-dropped",
+                "native.attachment-failed",
+            ]
+        );
+    }
+
+    /// Codes are unique and use the stable `family.detail` kebab shape.
+    #[test]
+    fn codes_are_unique_and_well_formed() {
+        let mut seen = BTreeSet::new();
+        for code in NxLossCode::ALL {
+            let text = code.code();
+            assert!(seen.insert(text), "duplicate code {text}");
+            let (family, detail) = text.split_once('.').expect("family.detail shape");
+            assert!(!family.is_empty() && !detail.is_empty());
+            assert!(text.bytes().all(|b| b.is_ascii_lowercase() || b == b'.' || b == b'-'), "code {text} is not lowercase kebab");
+        }
+    }
+
+    /// The note builder fixes severity from the codec-specific code.
+    #[test]
+    fn note_takes_severity_from_the_code() {
+        for code in NxLossCode::ALL {
+            let note = code.note("x");
+            assert_eq!(note.severity, code.severity());
+            assert_eq!(note.message, "x");
+            assert!(note.provenance.is_none());
+        }
+    }
+
+    /// Only an attachment failure pins a floor above its taxonomy floor.
+    #[test]
+    fn strict_floor_follows_taxonomy_except_attachment_failure() {
+        use cadmpeg_ir::report::loss::StrictConsequence;
+        for code in NxLossCode::ALL {
+            let expected = match code {
+                NxLossCode::NativeAttachmentFailed => Some(cadmpeg_ir::report::Severity::Error),
+                other => other.shared_taxonomy().strict_floor(),
+            };
+            assert_eq!(code.kind().strict_floor(), expected, "{}", code.code());
+        }
+        assert_eq!(NxLossCode::NativeAttachmentFailed.note("x").strict_consequence(), StrictConsequence::Reject);
+    }
+}

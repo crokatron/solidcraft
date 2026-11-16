@@ -202,29 +202,51 @@ pub(super) fn reference_mesh(body: &Body, mesh: &OnceLock<Arc<Mesh>>, tolerance:
 /// creases of at least 30 degrees. The shared vertex indices come from the existing mesh body;
 /// the geometry, winding and triangle topology are left to the importer.
 fn mesh_outlines(positions: &[Vec3], triangles: &[[u32; 3]]) -> Vec<Vec<Vec3>> {
-    let normal = |index: usize| {
-        let t = triangles.get(index)?;
-        let (a, b, c) = (positions.get(t[0] as usize)?, positions.get(t[1] as usize)?, positions.get(t[2] as usize)?);
-        (*b - *a).cross(*c - *a).normalized()
+    let _span = solidcraft_profile::span("display", "scan outlines");
+    let normal = |t: &[u32; 3]| {
+        let points = t.map(|i| positions.get(i as usize));
+        let [Some(a), Some(b), Some(c)] = points else { return Vec3::ZERO };
+        (*b - *a).cross(*c - *a).normalized().unwrap_or(Vec3::ZERO)
     };
-    // One compact record per side, sorted for deterministic output, instead of a map of
-    // separately allocated adjacency lists. Mesh imports already cap the triangle count.
-    let mut sides = Vec::with_capacity(triangles.len().saturating_mul(3));
-    for (i, t) in triangles.iter().enumerate() {
-        let Ok(triangle) = u32::try_from(i) else { continue };
-        if normal(i).is_some() {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                sides.push((a.min(b), a.max(b), triangle));
-            }
-        }
+    // One normal per face, reused by its three sides. Previously each manifold edge
+    // fetched coordinates and normalized both neighbours again after the side sort.
+    #[cfg(not(target_arch = "wasm32"))]
+    use rayon::prelude::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    let normals: Vec<_> = if triangles.len() >= 65_536 { triangles.par_iter().map(normal).collect() } else { triangles.iter().map(normal).collect() };
+    #[cfg(target_arch = "wasm32")]
+    let normals: Vec<_> = triangles.iter().map(normal).collect();
+    let sides_for = |(i, t): (usize, &[u32; 3])| {
+        let valid = normals.get(i).is_some_and(|n| *n != Vec3::ZERO);
+        let triangle = u32::try_from(i).ok();
+        [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
+            .into_iter()
+            .filter_map(move |(a, b)| valid.then_some(triangle).flatten().map(|i| (a.min(b), a.max(b), i)))
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut sides: Vec<_> = if triangles.len() >= 65_536 {
+        triangles.par_iter().enumerate().flat_map_iter(sides_for).collect()
+    } else {
+        triangles.iter().enumerate().flat_map(sides_for).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let mut sides: Vec<_> = triangles.iter().enumerate().flat_map(sides_for).collect();
+    // The full tuple is unique for each side of a nondegenerate triangle, so parallel
+    // sorting retains the same deterministic traversal and resulting edge identities.
+    #[cfg(not(target_arch = "wasm32"))]
+    if triangles.len() >= 65_536 {
+        sides.par_sort_unstable();
+    } else {
+        sides.sort_unstable();
     }
+    #[cfg(target_arch = "wasm32")]
     sides.sort_unstable();
     let cos = 30f64.to_radians().cos();
     let mut edges = Vec::new();
     for side in sides.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
         let Some(&(a, b, _)) = side.first() else { continue };
         let visible = match side {
-            [(_, _, i), (_, _, j)] => normal(*i as usize).zip(normal(*j as usize)).is_some_and(|(n, m)| n.dot(m) <= cos),
+            [(_, _, i), (_, _, j)] => normals.get(*i as usize).zip(normals.get(*j as usize)).is_some_and(|(n, m)| n.dot(*m) <= cos),
             _ => true,
         };
         if visible && positions.get(a as usize).is_some() && positions.get(b as usize).is_some() {

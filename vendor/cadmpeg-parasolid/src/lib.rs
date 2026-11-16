@@ -1,0 +1,571 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Parasolid transmit-stream identity, pointers, schema, and record reading.
+//!
+//! Parasolid is an embedded modelling-kernel layer in both NX and SLDPRT.
+//! This crate owns the `parasolid:` dialect rows and the schema-token grammar
+//! so hosts cannot disagree about the identity of the same declaration.
+//! [`records`] reads the neutral-binary node sequence through the base and
+//! embedded schema field lists, [`deltas`] owns the Deltas-stream grammar, and
+//! [`xmt`] carries stream-local node identity.
+
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
+use std::collections::BTreeMap;
+
+use cadmpeg_core::dialect::{Admission, DialectId, DialectLayers, DialectMatch, LayerInstance};
+
+/// Variable-width native node pointers.
+pub mod pointer;
+
+include!("registry_ids.rs");
+
+pub mod deltas;
+pub mod geometry;
+pub mod records;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+pub mod xmt;
+
+/// Declared-key name for the source schema token.
+pub const DECLARED_SCHEMA: &str = "schema";
+/// Declared-key name for the host location carrying the stream.
+pub const DECLARED_CARRIER: &str = "carrier";
+
+/// One exact ASCII `SCH_` token and its location in a supplied prologue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaToken<'a> {
+    value: &'a str,
+    offset: usize,
+}
+
+impl<'a> SchemaToken<'a> {
+    /// Exact token text, including the `SCH_` prefix.
+    #[must_use]
+    pub const fn value(self) -> &'a str {
+        self.value
+    }
+
+    /// Exclusive byte end of the token in the supplied prologue.
+    #[must_use]
+    pub const fn end(self) -> usize {
+        self.offset + self.value.len()
+    }
+}
+
+/// Find the first complete Parasolid schema token in a bounded prologue.
+///
+/// The caller owns the carrier-specific bound. The token grammar is shared:
+/// `SCH_` followed by one or more ASCII alphanumeric or underscore bytes.
+#[must_use]
+pub fn find_schema_token(prologue: &[u8]) -> Option<SchemaToken<'_>> {
+    prologue
+        .windows(4)
+        .enumerate()
+        .filter(|(_, bytes)| *bytes == b"SCH_")
+        .find_map(|(offset, _)| {
+            let mut end = offset + 4;
+            while end < prologue.len()
+                && (prologue[end].is_ascii_alphanumeric() || prologue[end] == b'_')
+            {
+                end += 1;
+            }
+            schema_token(prologue, offset, end)
+        })
+}
+
+/// Find a complete schema token whose byte length immediately precedes it.
+///
+/// This is the `SLDPRT` embedded-header form. The declared length bounds the
+/// token even when the first record begins with an ASCII token character.
+#[must_use]
+pub fn find_u8_length_prefixed_schema_token(prologue: &[u8]) -> Option<SchemaToken<'_>> {
+    prologue
+        .windows(4)
+        .enumerate()
+        .filter(|(_, bytes)| *bytes == b"SCH_")
+        .find_map(|(offset, _)| {
+            let length = usize::from(*prologue.get(offset.checked_sub(1)?)?);
+            let end = offset.checked_add(length)?;
+            schema_token(prologue, offset, end)
+        })
+}
+
+fn schema_token(prologue: &[u8], offset: usize, end: usize) -> Option<SchemaToken<'_>> {
+    let bytes = prologue.get(offset..end)?;
+    is_schema_token(bytes).then_some(())?;
+    let value = std::str::from_utf8(bytes).ok()?;
+    Some(SchemaToken { value, offset })
+}
+
+/// The shared token grammar: `SCH_` and at least one more token byte.
+fn is_schema_token(bytes: &[u8]) -> bool {
+    bytes.len() > 4
+        && bytes.starts_with(b"SCH_")
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+/// Text offered in the schema position that is not a Parasolid schema token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotSchemaToken;
+
+impl std::fmt::Display for NotSchemaToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("not a Parasolid schema token")
+    }
+}
+
+impl std::error::Error for NotSchemaToken {}
+
+/// One owned ASCII `SCH_` token, checked against the shared token grammar.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnedSchemaToken(String);
+
+impl OwnedSchemaToken {
+    /// Exact token text, including the `SCH_` prefix.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for OwnedSchemaToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl From<SchemaToken<'_>> for OwnedSchemaToken {
+    fn from(token: SchemaToken<'_>) -> Self {
+        Self(token.value().to_owned())
+    }
+}
+
+impl TryFrom<&str> for OwnedSchemaToken {
+    type Error = NotSchemaToken;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        is_schema_token(value.as_bytes())
+            .then(|| Self(value.to_owned()))
+            .ok_or(NotSchemaToken)
+    }
+}
+
+impl TryFrom<String> for OwnedSchemaToken {
+    type Error = NotSchemaToken;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        is_schema_token(value.as_bytes())
+            .then_some(())
+            .ok_or(NotSchemaToken)?;
+        Ok(Self(value))
+    }
+}
+
+/// The host location a Parasolid stream was read from.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Carrier(String);
+
+impl Carrier {
+    /// Names the host location carrying one Parasolid stream.
+    #[must_use]
+    pub const fn new(location: String) -> Self {
+        Self(location)
+    }
+
+    /// The location text, as the report records it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Carrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Registry row named by one schema token, or the residual row.
+///
+/// Identity comes from this shared schema-token map so hosts cannot disagree
+/// about the identity of the same declaration.
+fn schema_row(schema: &str) -> DialectId {
+    if schema.eq_ignore_ascii_case("SCH_SW_33103_11000") {
+        PARASOLID_SCH_SW_33103
+    } else if schema.eq_ignore_ascii_case("SCH_SW_32001_11000") {
+        PARASOLID_SCH_SW_32001
+    } else if schema
+        .rsplit_once('_')
+        .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("13006"))
+    {
+        PARASOLID_FORMAT_13006
+    } else {
+        PARASOLID_UNKNOWN
+    }
+}
+
+/// Classify one schema-bearing Parasolid stream and record its host carrier.
+///
+/// `instance` identifies the carrier when the host contains more than one
+/// Parasolid stream. The schema and carrier are always retained verbatim as
+/// declarations, independent of whether the schema has a named registry row.
+/// `verified` lists the rows whose grammar the host applied and verified; every
+/// other row, and the residual row, is admitted without verification.
+#[must_use]
+pub fn classify_layer(
+    schema: OwnedSchemaToken,
+    carrier: Carrier,
+    instance: LayerInstance,
+    verified: &[DialectId],
+) -> ClassifiedLayer {
+    let id = schema_row(schema.value());
+    let declared = BTreeMap::from([
+        (cadmpeg_core::nonblank_const!(DECLARED_SCHEMA), schema.0),
+        (
+            cadmpeg_core::nonblank_const!(DECLARED_CARRIER),
+            carrier.to_string(),
+        ),
+    ]);
+    let matched = if verified.contains(&id) {
+        DialectMatch::admitted(id)
+    } else {
+        DialectMatch::residual(id)
+    }
+    .with_declared(declared);
+    let matched = match instance {
+        LayerInstance::Sole => matched,
+        LayerInstance::Tagged => matched.with_instance(carrier.to_string()),
+    };
+    ClassifiedLayer { matched, carrier }
+}
+
+/// One classified Parasolid layer and the carrier it was read from.
+///
+/// A sole layer carries no instance tag, so the carrier is not recoverable from
+/// the match alone; it is a field here rather than a lookup or a placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedLayer {
+    matched: DialectMatch,
+    carrier: Carrier,
+}
+
+impl ClassifiedLayer {
+    /// The dialect match this layer contributes.
+    #[must_use]
+    pub const fn matched(&self) -> &DialectMatch {
+        &self.matched
+    }
+
+    /// The host location the classified stream was read from.
+    #[must_use]
+    pub const fn carrier(&self) -> &Carrier {
+        &self.carrier
+    }
+
+    /// Consumes the layer, yielding the match alone.
+    #[must_use]
+    pub fn into_matched(self) -> DialectMatch {
+        self.matched
+    }
+}
+
+/// Classify every Parasolid carrier in one host document.
+///
+/// A lone layer needs no instance. Several layers use their carrier paths as
+/// stable instance keys, so hosts cannot disagree about when identity needs a
+/// disambiguator.
+#[must_use]
+pub fn extra_layers(
+    streams: Vec<(OwnedSchemaToken, Carrier)>,
+    verified: &[DialectId],
+) -> Vec<ClassifiedLayer> {
+    let instance = if streams.len() > 1 {
+        LayerInstance::Tagged
+    } else {
+        LayerInstance::Sole
+    };
+    streams
+        .into_iter()
+        .map(|(schema, carrier)| classify_layer(schema, carrier, instance, verified))
+        .collect()
+}
+
+/// Adds classified Parasolid layers and reports every uniqueness collision.
+///
+/// Hosts own their loss-code vocabulary. This helper owns the shared layer-set
+/// operation and its explanation so NX and SLDPRT cannot describe the same
+/// Parasolid collision differently.
+#[must_use]
+pub fn push_extras(
+    layers: &mut DialectLayers,
+    extras: impl IntoIterator<Item = ClassifiedLayer>,
+) -> Vec<String> {
+    let mut collisions = Vec::new();
+    for layer in extras {
+        let ClassifiedLayer { matched, carrier } = layer;
+        match layers.insert(matched) {
+            Ok(()) => {}
+            Err(cadmpeg_core::dialect::DialectLayerError::Duplicate(rejected)) => {
+                collisions.push(format!(
+                    "the container produced a duplicate {} dialect layer at carrier {carrier}; \
+                     the later classification was omitted",
+                    rejected.format()
+                ));
+            }
+            Err(cadmpeg_core::dialect::DialectLayerError::MissingInstance(rejected)) => {
+                collisions.push(format!(
+                    "the container produced an untagged {} dialect layer at carrier {carrier}; \
+                     the later classification was omitted",
+                    rejected.format()
+                ));
+            }
+        }
+    }
+    collisions
+}
+
+/// Explain why a Parasolid layer was admitted without verification.
+///
+/// Host codecs own their loss vocabulary. This helper owns the interpretation
+/// of the declarations produced by [`classify_layer`], so every host wraps the
+/// same kernel fact in its codec-specific loss code.
+#[must_use]
+pub fn unverified_message(matched: &DialectMatch) -> Option<String> {
+    if matched.format() != FORMAT
+        || !matches!(
+            matched.admission(),
+            Admission::Unverified { .. } | Admission::Residual
+        )
+    {
+        return None;
+    }
+
+    let schema = matched
+        .declared()
+        .get(DECLARED_SCHEMA)
+        .map_or("<unrecorded>", String::as_str);
+    let carrier = matched
+        .declared()
+        .get(DECLARED_CARRIER)
+        .map_or("<unrecorded>", String::as_str);
+    if matched.dialect() == &PARASOLID_UNKNOWN {
+        return Some(format!(
+            "The Parasolid stream at {carrier} declares schema {schema:?}, which has no declared \
+         grammar. It was admitted as the `{}` residual layer without substituting another \
+         schema grammar; bounded structural recovery retains the source stream.",
+            matched.dialect()
+        ));
+    }
+    Some(format!(
+        "The Parasolid stream at {carrier} declares schema {schema:?}, which maps to the named \
+     `{}` row, but the host did not verify that row's schema grammar. It was admitted \
+     without substituting another schema grammar; bounded structural recovery retains the \
+     source stream.",
+        matched.dialect()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use cadmpeg_core::dialect::{Admission, DialectId, DialectLayers, DialectMatch, LayerInstance};
+
+    use super::{
+        classify_layer, extra_layers, find_schema_token, find_u8_length_prefixed_schema_token,
+        push_extras, unverified_message, Carrier, OwnedSchemaToken, DECLARED_CARRIER,
+        DECLARED_SCHEMA, FORMAT, PARASOLID_FORMAT_13006, PARASOLID_SCH_SW_32001,
+        PARASOLID_SCH_SW_33103,
+    };
+
+    const ALL_ROWS: [DialectId; 3] = [
+        PARASOLID_SCH_SW_33103,
+        PARASOLID_SCH_SW_32001,
+        PARASOLID_FORMAT_13006,
+    ];
+
+    fn token(text: &str) -> OwnedSchemaToken {
+        OwnedSchemaToken::try_from(text).expect("the fixture text is a schema token")
+    }
+
+    fn carrier(text: &str) -> Carrier {
+        Carrier::new(text.to_owned())
+    }
+
+    #[test]
+    fn schema_token_uses_one_exact_ascii_grammar() {
+        let token =
+            find_schema_token(b"prologue\0SCH_3501171_35102_13006\0body").expect("complete token");
+        assert_eq!(token.value(), "SCH_3501171_35102_13006");
+        assert_eq!(token.offset, 9);
+        assert_eq!(token.end(), 32);
+
+        assert!(find_schema_token(b"SCH_").is_none());
+        assert_eq!(
+            find_schema_token(b"SCH_-SCH_REAL")
+                .expect("the first complete token is selected")
+                .value(),
+            "SCH_REAL"
+        );
+        assert_eq!(
+            find_schema_token(b"SCH_TEST-ignored")
+                .expect("token before delimiter")
+                .value(),
+            "SCH_TEST"
+        );
+
+        let mut prefixed = b"padding".to_vec();
+        prefixed.push(8);
+        prefixed.extend_from_slice(b"SCH_TEST");
+        prefixed.extend_from_slice(b"1234");
+        let token = find_u8_length_prefixed_schema_token(&prefixed)
+            .expect("the declared length bounds the token");
+        assert_eq!(token.value(), "SCH_TEST");
+        assert_eq!(token.end(), 16);
+    }
+
+    #[test]
+    fn named_schemas_and_the_format_suffix_map_to_their_rows_case_insensitively() {
+        for (schema, expected) in [
+            ("SCH_sw_33103_11000", "parasolid:sch-sw-33103"),
+            ("SCH_Sw_32001_11000", "parasolid:sch-sw-32001"),
+            ("SCH_3201255_32001_13006", "parasolid:format-13006"),
+        ] {
+            let matched = classify_layer(
+                token(schema),
+                carrier("stream@12"),
+                LayerInstance::Sole,
+                &ALL_ROWS,
+            );
+            assert_eq!(matched.matched().dialect().as_str(), expected);
+            assert_eq!(matched.matched().admission(), &Admission::Admitted);
+            assert_eq!(matched.matched().declared()[DECLARED_SCHEMA], schema);
+            assert_eq!(matched.matched().declared()[DECLARED_CARRIER], "stream@12");
+            assert_eq!(matched.matched().instance(), None);
+        }
+    }
+
+    #[test]
+    fn residual_schemas_use_residual_admission_without_a_substitution() {
+        let matched = classify_layer(
+            token("SCH_TEST_1_9999"),
+            carrier("block@7:body+3"),
+            LayerInstance::Tagged,
+            &ALL_ROWS,
+        );
+
+        assert_eq!(matched.matched().dialect().as_str(), "parasolid:unknown");
+        assert_eq!(matched.matched().admission(), &Admission::Residual);
+        assert_eq!(
+            matched.matched().declared()[DECLARED_SCHEMA],
+            "SCH_TEST_1_9999"
+        );
+        assert_eq!(
+            matched.matched().declared()[DECLARED_CARRIER],
+            "block@7:body+3"
+        );
+        assert_eq!(matched.matched().instance(), Some("block@7:body+3"));
+        let message =
+            unverified_message(matched.matched()).expect("residual layer explains its recovery");
+        assert!(message.contains("SCH_TEST_1_9999"));
+        assert!(message.contains("block@7:body+3"));
+    }
+
+    #[test]
+    fn several_layers_receive_carrier_instances() {
+        let layers = extra_layers(
+            vec![
+                (token("SCH_SW_33103_11000"), carrier("stream@12")),
+                (token("SCH_TEST_1_9999"), carrier("stream@48")),
+            ],
+            &ALL_ROWS,
+        );
+        assert_eq!(layers[0].matched().instance(), Some("stream@12"));
+        assert_eq!(layers[1].matched().instance(), Some("stream@48"));
+
+        let one = extra_layers(
+            vec![(token("SCH_SW_33103_11000"), carrier("stream@12"))],
+            &ALL_ROWS,
+        );
+        assert_eq!(one[0].matched().instance(), None);
+    }
+
+    #[test]
+    fn push_extras_preserves_the_first_layer_and_reports_later_collisions() {
+        let mut layers = DialectLayers::of(DialectMatch::admitted(
+            DialectId::parse("nx:splmsstr").expect("valid host dialect id"),
+        ));
+        let first = classify_layer(
+            token("SCH_SW_33103_11000"),
+            carrier("stream@12"),
+            LayerInstance::Tagged,
+            &[],
+        );
+        let later = classify_layer(
+            token("SCH_SW_32001_11000"),
+            carrier("stream@12"),
+            LayerInstance::Tagged,
+            &[],
+        );
+
+        let collisions = push_extras(&mut layers, [first.clone(), later]);
+
+        assert_eq!(layers.iter().skip(1).collect::<Vec<_>>(), [first.matched()]);
+        assert_eq!(
+            collisions,
+            [
+                "the container produced a duplicate parasolid dialect layer at carrier stream@12; \
+              the later classification was omitted"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_parasolid_registry_row_is_produced() {
+        let ids: BTreeSet<_> = [
+            "SCH_SW_33103_11000",
+            "SCH_SW_32001_11000",
+            "SCH_3501171_35102_13006",
+            "SCH_TEST_1_9999",
+        ]
+        .map(|schema| {
+            classify_layer(
+                token(schema),
+                carrier("carrier"),
+                LayerInstance::Sole,
+                &ALL_ROWS,
+            )
+            .matched()
+            .dialect()
+            .to_string()
+        })
+        .into_iter()
+        .collect();
+        assert_eq!(
+            ids,
+            cadmpeg_test_support::registry_ids(FORMAT).expect("identity registry parses")
+        );
+    }
+
+    #[test]
+    fn a_known_row_can_be_identified_without_claiming_host_verification() {
+        let matched = classify_layer(
+            token("SCH_3501171_35102_13006"),
+            carrier("stream@12"),
+            LayerInstance::Sole,
+            &[PARASOLID_SCH_SW_33103],
+        );
+
+        assert_eq!(
+            matched.matched().dialect().as_str(),
+            "parasolid:format-13006"
+        );
+        assert_eq!(matched.matched().admission(), &Admission::Residual);
+        let message =
+            unverified_message(matched.matched()).expect("unverified row explains its admission");
+        assert!(message.contains("host did not verify"));
+        assert!(message.contains("parasolid:format-13006"));
+    }
+}

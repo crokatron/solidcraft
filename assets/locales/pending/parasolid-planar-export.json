@@ -1,0 +1,7 @@
+{
+  "en": {
+    "home.export_parasolid_hint": "Exact CAD solids with curved faces and named assembly components. Unsupported geometry is reported before writing.",
+    "ui.format_parasolid_planar": "Parasolid text (solids and assemblies)",
+    "ui.export_parasolid": "Export Parasolid…"
+  }
+}

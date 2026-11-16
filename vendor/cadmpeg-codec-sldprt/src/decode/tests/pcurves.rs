@@ -1,0 +1,848 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Derived pcurve, seam, and analytic-section decode tests.
+#![allow(clippy::unwrap_used)]
+
+use cadmpeg_test_support::EditableDecodeResult;
+
+use std::io::Cursor;
+
+use cadmpeg_ir::codec::{Codec, DecodeOptions};
+
+use crate::test_support::container::sldprt_with_body;
+use crate::test_support::parasolid::bounded_curve_wrapper;
+use crate::test_support::parasolid::bridge;
+use crate::test_support::parasolid::circle_carrier;
+use crate::test_support::parasolid::closed_cylinder_body;
+use crate::test_support::parasolid::coedge;
+use crate::test_support::parasolid::cone_carrier;
+use crate::test_support::parasolid::cylinder_carrier;
+use crate::test_support::parasolid::edge_use;
+use crate::test_support::parasolid::ellipse_carrier;
+use crate::test_support::parasolid::framed_topology_fin;
+use crate::test_support::parasolid::line_carrier;
+use crate::test_support::parasolid::linear_nurbs_curve_carrier;
+use crate::test_support::parasolid::loop_head;
+use crate::test_support::parasolid::nurbs_surface_carrier;
+use crate::test_support::parasolid::plane_carrier;
+use crate::test_support::parasolid::rational_linear_nurbs_curve_carrier;
+use crate::test_support::parasolid::rational_nurbs_surface_carrier;
+use crate::test_support::parasolid::sphere_existing_seam_body;
+use crate::test_support::parasolid::sphere_patch_body;
+use crate::test_support::parasolid::torus_carrier;
+use crate::test_support::parasolid::triangle_body;
+use crate::test_support::parasolid::vertex_use;
+use crate::test_support::parasolid::world_point;
+use crate::SldprtCodec;
+use cadmpeg_ir::geometry::SolvedCurveGeometry;
+
+const EPS_POLAR_RADIAL_COMPONENT: f64 = 1.0e-9;
+
+#[test]
+fn decode_does_not_report_derived_pcurves_as_stored_geometry_loss() {
+    let result = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&triangle_body())),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert!(result
+        .report()
+        .losses
+        .iter()
+        .all(|loss| !loss.message.contains("curve-on-surface")));
+}
+
+#[test]
+fn closed_cylinder_gets_derived_seam() {
+    use cadmpeg_ir::geometry::{CurveGeometry, SolvedCurveGeometry};
+    let f = sldprt_with_body(&closed_cylinder_body());
+    let mut cur = Cursor::new(f);
+
+    let result = SldprtCodec
+        .decode(&mut cur, &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(result.ir().model.faces[0].loops.len(), 1);
+    assert_eq!(result.ir().model.loops[0].coedges().len(), 4);
+    assert_eq!(result.ir().model.pcurves.len(), 4);
+    assert!(result
+        .ir()
+        .model
+        .coedges
+        .iter()
+        .all(|coedge| !coedge.pcurves.is_empty()));
+    assert_eq!(result.ir().model.edges.len(), 3);
+    assert!(result.ir().model.curves.iter().any(|curve| matches!(
+        curve.geometry,
+        CurveGeometry::Solved(SolvedCurveGeometry::Line(_))
+    )));
+}
+
+#[test]
+fn sentinel_vertices_without_partners_withhold_the_rim_edges() {
+    let mut body = closed_cylinder_body();
+    for coedge_attr in [30u16, 31] {
+        let offset = body
+            .windows(4)
+            .position(|window| {
+                window[0..2] == [0x00, 0x11] && window[2..4] == coedge_attr.to_be_bytes()
+            })
+            .expect("coedge");
+        body[offset + 12..offset + 14].copy_from_slice(&1u16.to_be_bytes());
+    }
+
+    let decoded = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(decoded.ir().model.faces.len(), 0);
+    assert_eq!(
+        decoded
+            .report()
+            .losses
+            .iter()
+            .filter(|loss| loss.code.local_code() == "topology.ring-edge-withheld")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_closed_circle_with_conflicting_markers_has_no_range() {
+    let circle = circle_carrier(200, [1.0, 2.0, 0.0], [0.0, 0.0, 1.0], 0.5);
+    let mut against = circle.clone();
+    against[18] = 0x2d;
+    let mut body = Vec::new();
+    body.extend(plane_carrier(
+        100,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ));
+    body.extend(circle);
+    body.extend(against);
+    body.extend(bridge(10, 20, 100));
+    body.extend(loop_head(20, 30, 10));
+    body.extend(coedge(30, 20, 30, 1, 31, 40, false));
+    body.extend(framed_topology_fin(
+        31,
+        [0, 0, 0, 0, 1, 30, 40, 0, 0],
+        false,
+        false,
+        true,
+    ));
+    body.extend(edge_use(40, 200));
+
+    let decoded = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    let edge = &decoded.ir().model.edges[0];
+    assert_eq!(edge.start, edge.end);
+    assert!(edge.param_range().is_none());
+    assert!(decoded
+        .report()
+        .losses
+        .iter()
+        .any(|loss| loss.code.local_code() == "geometry.curve-marker-conflict"));
+}
+
+#[test]
+fn closed_circle_edge_gets_a_derived_seam_vertex() {
+    let mut body = Vec::new();
+    body.extend(plane_carrier(
+        100,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ));
+    body.extend(circle_carrier(200, [1.0, 2.0, 0.0], [0.0, 0.0, 1.0], 0.5));
+    body.extend(bridge(10, 20, 100));
+    body.extend(loop_head(20, 30, 10));
+    body.extend(coedge(30, 20, 30, 1, 31, 40, false));
+    body.extend(framed_topology_fin(
+        31,
+        [0, 0, 0, 0, 1, 30, 40, 0, 0],
+        false,
+        false,
+        true,
+    ));
+    body.extend(edge_use(40, 200));
+
+    let decoded = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(decoded.ir().model.faces.len(), 1);
+    assert_eq!(decoded.ir().model.loops[0].coedges().len(), 1);
+    let edge = &decoded.ir().model.edges[0];
+    assert_eq!(edge.start, edge.end);
+    let vertex = decoded
+        .ir()
+        .model
+        .vertices
+        .iter()
+        .find(|vertex| vertex.id == edge.start)
+        .unwrap();
+    let point = decoded
+        .ir()
+        .model
+        .points
+        .iter()
+        .find(|point| point.id == vertex.point)
+        .unwrap();
+    assert_eq!(
+        [
+            point.position().get().x,
+            point.position().get().y,
+            point.position().get().z
+        ],
+        [1500.0, 2000.0, 0.0]
+    );
+    assert!(
+        matches!(decoded.ir().model.pcurves[0].geometry, cadmpeg_ir::geometry::pcurve::PcurveGeometry::Circle(circle_pcurve)
+                if {
+                    let center = circle_pcurve.center();
+        let y_axis = circle_pcurve.y_axis();
+                    (circle_pcurve.radius().get() == 500.0)
+                        && matches!(y_axis.get(), cadmpeg_ir::math::Point2 { u: 0.0, v: 1.0 })
+                        && (*center == cadmpeg_ir::math::Point2::new(1000.0, 2000.0))
+                })
+    );
+    assert!(cadmpeg_ir::validate_neutral(decoded.ir(), Vec::new())
+        .expect("validate the neutral model")
+        .is_ok());
+}
+
+#[test]
+fn oblique_cylinder_section_gets_an_exact_polar_harmonic_pcurve() {
+    let s = std::f64::consts::FRAC_1_SQRT_2;
+    let mut body = Vec::new();
+    body.extend(cylinder_carrier(100, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.0));
+    body.extend(ellipse_carrier(
+        200,
+        [0.0, 0.0, 0.0],
+        [-s, 0.0, s],
+        [s, 0.0, s],
+        std::f64::consts::SQRT_2,
+        1.0,
+    ));
+    body.extend(bridge(10, 20, 100));
+    body.extend(loop_head(20, 30, 10));
+    body.extend(coedge(30, 20, 30, 50, 0, 40, false));
+    body.extend(edge_use(40, 200));
+    body.extend(vertex_use(50, 60));
+    body.extend(world_point(60, [1.0, 0.0, 1.0]));
+
+    crate::test_support::parasolid::complete_fixture_vertex_owners(&mut body);
+    let decoded = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(decoded.ir().model.pcurves.len(), 1);
+    assert!(
+        matches!(decoded.ir().model.pcurves[0].geometry, cadmpeg_ir::geometry::pcurve::PcurveGeometry::PolarHarmonic(polar_harmonic_pcurve)
+                if {
+                    let radial_center = polar_harmonic_pcurve.radial_center();
+        let radial_cos = polar_harmonic_pcurve.radial_cos();
+        let radial_sin = polar_harmonic_pcurve.radial_sin();
+                    (polar_harmonic_pcurve.axial_origin().get() == 0.0)
+                        && (polar_harmonic_pcurve.axial_sin().get() == 0.0)
+                        && (*radial_center == cadmpeg_ir::math::Point2::new(0.0, 0.0)
+                            && (radial_cos.u - 1000.0).abs() < EPS_POLAR_RADIAL_COMPONENT
+                            && radial_cos.v.abs() < EPS_POLAR_RADIAL_COMPONENT
+                            && radial_sin.u.abs() < EPS_POLAR_RADIAL_COMPONENT
+                            && (radial_sin.v - 1000.0).abs() < EPS_POLAR_RADIAL_COMPONENT)
+                })
+    );
+    assert!(cadmpeg_ir::validate_neutral(decoded.ir(), Vec::new())
+        .expect("validate the neutral model")
+        .is_ok());
+}
+
+#[test]
+fn coaxial_cone_circle_preserves_parameter_direction() {
+    let mut body = Vec::new();
+    body.extend(cone_carrier(
+        100,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        1.0,
+        std::f64::consts::FRAC_PI_4,
+        [1.0, 0.0, 0.0],
+    ));
+    body.extend(circle_carrier(200, [0.0, 0.0, 1.0], [0.0, 0.0, -1.0], 2.0));
+    body.extend(bridge(10, 20, 100));
+    body.extend(loop_head(20, 30, 10));
+    body.extend(coedge(30, 20, 30, 50, 0, 40, false));
+    body.extend(edge_use(40, 200));
+    body.extend(vertex_use(50, 60));
+    body.extend(world_point(60, [2.0, 0.0, 1.0]));
+
+    crate::test_support::parasolid::complete_fixture_vertex_owners(&mut body);
+    let decoded = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+    let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve) =
+        decoded.ir().model.pcurves[0].geometry
+    else {
+        panic!("expected line pcurve");
+    };
+    let origin = *line_pcurve.origin().as_raw();
+    let direction = *line_pcurve.direction().as_raw();
+    assert!(origin.u.abs() < 1.0e-12);
+    assert!((origin.v - 1000.0).abs() < 1.0e-9);
+    assert_eq!(direction, cadmpeg_ir::math::Point2::new(-1.0, 0.0));
+    assert!(cadmpeg_ir::validate_neutral(decoded.ir(), Vec::new())
+        .expect("validate the neutral model")
+        .is_ok());
+}
+
+#[test]
+fn coaxial_torus_circle_gets_constant_minor_angle_pcurve() {
+    let mut body = Vec::new();
+    body.extend(torus_carrier(
+        100,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        2.0,
+        1.0,
+        [1.0, 0.0, 0.0],
+    ));
+    body.extend(circle_carrier(200, [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 2.0));
+    body.extend(bridge(10, 20, 100));
+    body.extend(loop_head(20, 30, 10));
+    body.extend(coedge(30, 20, 30, 50, 0, 40, false));
+    body.extend(edge_use(40, 200));
+    body.extend(vertex_use(50, 60));
+    body.extend(world_point(60, [2.0, 0.0, 1.0]));
+
+    crate::test_support::parasolid::complete_fixture_vertex_owners(&mut body);
+    let decoded = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+    let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve) =
+        decoded.ir().model.pcurves[0].geometry
+    else {
+        panic!("expected line pcurve");
+    };
+    let origin = *line_pcurve.origin().as_raw();
+    let direction = *line_pcurve.direction().as_raw();
+    assert!(origin.u.abs() < 1.0e-12);
+    assert!((origin.v - std::f64::consts::FRAC_PI_2).abs() < 1.0e-12);
+    assert_eq!(direction, cadmpeg_ir::math::Point2::new(1.0, 0.0));
+    assert!(cadmpeg_ir::validate_neutral(decoded.ir(), Vec::new())
+        .expect("validate the neutral model")
+        .is_ok());
+}
+
+#[test]
+fn a_great_circle_pcurve_keeps_its_latitude_within_the_poles() {
+    // An octant bounded by three great circles with one vertex on the pole.
+    // Each great circle's line pcurve keeps latitude within the poles over
+    // the edge's range and meets the edge's vertices.
+    let mut cur = Cursor::new(sldprt_with_body(&sphere_patch_body()));
+    let result = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(&mut cur, &DecodeOptions::default())
+            .unwrap(),
+    );
+    let model = &result.ir().model;
+    let Some(cadmpeg_ir::geometry::SolvedSurfaceGeometry::Sphere(sphere)) =
+        model.surfaces[0].geometry.solved()
+    else {
+        panic!("the fixture's support is a sphere");
+    };
+    let axis = *sphere.frame().axis().as_raw();
+    let reference = *sphere.frame().reference().as_raw();
+    let binormal = axis.cross(reference);
+    let radius = sphere.radius().get();
+    let on_sphere = |u: f64, v: f64| {
+        let (radial, height) = (radius * v.cos(), radius * v.sin());
+        cadmpeg_ir::math::Point3::new(
+            radial * (u.cos() * reference.x + u.sin() * binormal.x) + height * axis.x,
+            radial * (u.cos() * reference.y + u.sin() * binormal.y) + height * axis.y,
+            radial * (u.cos() * reference.z + u.sin() * binormal.z) + height * axis.z,
+        )
+    };
+    let position = |vertex: &cadmpeg_ir::ids::VertexId| {
+        let vertex = model
+            .vertices
+            .iter()
+            .find(|item| &item.id == vertex)
+            .unwrap();
+        model
+            .points
+            .iter()
+            .find(|point| point.id == vertex.point)
+            .unwrap()
+            .position()
+            .get()
+    };
+    for coedge in &model.coedges {
+        let edge = model
+            .edges
+            .iter()
+            .find(|edge| edge.id == coedge.edge)
+            .unwrap();
+        let Some(circle) = model
+            .curves
+            .iter()
+            .find(|curve| edge.curve() == Some(&curve.id))
+            .and_then(|curve| match &curve.geometry {
+                cadmpeg_ir::geometry::CurveGeometry::Solved(
+                    cadmpeg_ir::geometry::SolvedCurveGeometry::Circle(circle),
+                ) => Some(*circle),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let pcurve = model
+            .pcurves
+            .iter()
+            .find(|pcurve| pcurve.id == coedge.pcurves[0].pcurve)
+            .unwrap();
+        let cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line) = pcurve.geometry else {
+            panic!("a great circle on its sphere has a line pcurve");
+        };
+        let (origin, direction) = (*line.origin().as_raw(), *line.direction().as_raw());
+        let angle = |vertex: &cadmpeg_ir::ids::VertexId| {
+            let offset = position(vertex).vector_from(circle.center().get());
+            let reference = *circle.frame().reference().as_raw();
+            let binormal = circle.frame().axis().as_raw().cross(reference);
+            offset.dot(binormal).atan2(offset.dot(reference))
+        };
+        // Without a range an edge runs forward along its circle.
+        let [first, last] = edge.param_range().map_or_else(
+            || {
+                let start = angle(&edge.start);
+                let sweep = (angle(&edge.end) - start).rem_euclid(std::f64::consts::TAU);
+                [start, start + sweep]
+            },
+            cadmpeg_ir::units::FiniteVector::get,
+        );
+        for (parameter, vertex) in [(first, &edge.start), (last, &edge.end)] {
+            let (u, v) = (
+                origin.u + parameter * direction.u,
+                origin.v + parameter * direction.v,
+            );
+            assert!(
+                v.abs() <= std::f64::consts::FRAC_PI_2 + 1e-12,
+                "latitude {v}"
+            );
+            assert!(on_sphere(u, v).distance(position(vertex)) < 1e-9 * radius);
+        }
+    }
+}
+
+#[test]
+fn sphere_patch_gets_degenerate_meridian_seam() {
+    let mut cur = Cursor::new(sldprt_with_body(&sphere_patch_body()));
+    let result = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(&mut cur, &DecodeOptions::default())
+            .unwrap(),
+    );
+    assert_eq!(result.ir().model.edges.len(), 4);
+    assert_eq!(result.ir().model.vertices.len(), 3);
+    assert_eq!(result.ir().model.points.len(), 3);
+    assert_eq!(result.ir().model.loops[0].coedges().len(), 4);
+    assert_eq!(result.ir().model.pcurves.len(), 4);
+    let model = &result.ir().model;
+    let ends = |id: &cadmpeg_ir::ids::CoedgeId| {
+        let coedge = model
+            .coedges
+            .iter()
+            .find(|coedge| &coedge.id == id)
+            .unwrap();
+        let edge = model
+            .edges
+            .iter()
+            .find(|edge| edge.id == coedge.edge)
+            .unwrap();
+        match coedge.sense {
+            cadmpeg_ir::topology::Sense::Forward => (edge.start.clone(), edge.end.clone()),
+            cadmpeg_ir::topology::Sense::Reversed => (edge.end.clone(), edge.start.clone()),
+        }
+    };
+    let ring = model.loops[0].coedges();
+    for (index, id) in ring.iter().enumerate() {
+        let next = &ring[(index + 1) % ring.len()];
+        assert_eq!(ends(id).1, ends(next).0, "{id} -> {next}");
+    }
+    let pole = result
+        .ir()
+        .model
+        .pcurves
+        .iter()
+        .find(|pcurve| pcurve.id.as_str().contains("sphere-seam"))
+        .expect("sphere pole pcurve");
+    assert!(
+        matches!(pole.geometry, cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve)
+                if {
+                    let origin = line_pcurve.origin().as_raw();
+        let direction = line_pcurve.direction().as_raw();
+                    *origin == cadmpeg_ir::math::Point2::new(0.0, std::f64::consts::FRAC_PI_2)
+                        && *direction == cadmpeg_ir::math::Point2::new(1.0, 0.0)
+                })
+    );
+    assert_eq!(
+        pole.parameter_range()
+            .map(cadmpeg_ir::units::FiniteVector::get),
+        Some([0.0, std::f64::consts::TAU])
+    );
+    let seam = result
+        .ir()
+        .model
+        .edges
+        .iter()
+        .find(|edge| {
+            result
+                .source_fidelity()
+                .annotations
+                .provenance
+                .get(edge.id.as_str())
+                .and_then(|note| note.tag.as_deref())
+                == Some("derived_sphere_seam")
+        })
+        .expect("sphere seam");
+    assert_eq!(seam.start, seam.end);
+    let curve = result
+        .ir()
+        .model
+        .curves
+        .iter()
+        .find(|curve| seam.curve() == Some(&curve.id))
+        .expect("sphere seam curve");
+    assert!(
+        matches!(curve.geometry, cadmpeg_ir::geometry::CurveGeometry::Solved(SolvedCurveGeometry::Degenerate(degenerate_curve))
+        if {
+            let point = degenerate_curve.point().get();
+            point == cadmpeg_ir::math::Point3::new(0.0, 0.0, 1000.0)
+        })
+    );
+    let vertex = result
+        .ir()
+        .model
+        .vertices
+        .iter()
+        .find(|vertex| vertex.id == seam.start)
+        .unwrap();
+    let point = result
+        .ir()
+        .model
+        .points
+        .iter()
+        .find(|point| point.id == vertex.point)
+        .unwrap();
+    assert_eq!(
+        [
+            point.position().get().x,
+            point.position().get().y,
+            point.position().get().z
+        ],
+        [0.0, 0.0, 1000.0]
+    );
+}
+
+#[test]
+fn existing_sphere_seam_endpoint_is_normalized_to_axis_pole() {
+    let result = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(
+                &mut Cursor::new(sldprt_with_body(&sphere_existing_seam_body())),
+                &DecodeOptions::default(),
+            )
+            .unwrap(),
+    );
+    let seam_curve = result
+        .ir()
+        .model
+        .curves
+        .iter()
+        .find(|curve| {
+            result
+                .source_fidelity()
+                .annotations
+                .provenance
+                .get(curve.id.as_str())
+                .and_then(|note| note.tag.as_deref())
+                == Some("derived_sphere_seam")
+        })
+        .expect("existing sphere seam curve");
+    let seam = result
+        .ir()
+        .model
+        .edges
+        .iter()
+        .find(|edge| edge.curve() == Some(&seam_curve.id))
+        .expect("existing sphere seam edge");
+    let vertex = result
+        .ir()
+        .model
+        .vertices
+        .iter()
+        .find(|vertex| vertex.id == seam.start)
+        .expect("sphere seam pole vertex");
+    let point = result
+        .ir()
+        .model
+        .points
+        .iter()
+        .find(|point| point.id == vertex.point)
+        .expect("sphere seam pole point");
+
+    assert_eq!(
+        point.position().get(),
+        cadmpeg_ir::math::Point3::new(0.0, 0.0, 1000.0)
+    );
+}
+
+#[test]
+fn nurbs_boundary_curve_gets_isoparametric_pcurve() {
+    let mut body = triangle_body();
+    let bridge = body.windows(2).position(|w| w == [0x00, 0x0e]).unwrap();
+    body[bridge + 26..bridge + 28].copy_from_slice(&180u16.to_be_bytes());
+    let edge = body.windows(2).position(|w| w == [0x00, 0x10]).unwrap();
+    body[edge + 24..edge + 26].copy_from_slice(&190u16.to_be_bytes());
+    body.extend(nurbs_surface_carrier(180, 181, 10));
+    body.extend(linear_nurbs_curve_carrier(190, 191));
+    let mut cur = Cursor::new(sldprt_with_body(&body));
+    let result = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(&mut cur, &DecodeOptions::default())
+            .unwrap(),
+    );
+    assert!(result.ir().model.pcurves.iter().any(|pcurve| {
+        result
+            .source_fidelity()
+            .annotations
+            .provenance
+            .get(pcurve.id.as_str())
+            .and_then(|note| note.tag.as_deref())
+            == Some("derived_nurbs_isoparametric_pcurve")
+    }));
+}
+
+#[test]
+fn linear_nurbs_surface_boundary_gets_affine_line_pcurve() {
+    let mut body = triangle_body();
+    let bridge = body.windows(2).position(|w| w == [0x00, 0x0e]).unwrap();
+    body[bridge + 26..bridge + 28].copy_from_slice(&180u16.to_be_bytes());
+    let edge = body.windows(2).position(|w| w == [0x00, 0x10]).unwrap();
+    body[edge + 24..edge + 26].copy_from_slice(&192u16.to_be_bytes());
+    body.extend(nurbs_surface_carrier(180, 181, 10));
+    body.extend(line_carrier(190, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]));
+    body.extend(bounded_curve_wrapper(
+        192,
+        190,
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        0.0,
+        1.0,
+    ));
+    let result = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(
+                &mut Cursor::new(sldprt_with_body(&body)),
+                &DecodeOptions::default(),
+            )
+            .unwrap(),
+    );
+    assert!(result.ir().model.pcurves.iter().any(|pcurve| {
+        result
+            .source_fidelity()
+            .annotations
+            .provenance
+            .get(pcurve.id.as_str())
+            .and_then(|note| note.tag.as_deref())
+            == Some("derived_nurbs_isoparametric_pcurve")
+            && matches!(pcurve.geometry, cadmpeg_ir::geometry::pcurve::PcurveGeometry::Line(line_pcurve)
+            if {
+                let direction = line_pcurve.direction().as_raw();
+                direction.v == 0.0 && direction.u != 0.0
+            })
+    }));
+    assert_eq!(
+        result
+            .ir()
+            .model
+            .edges
+            .iter()
+            .find(|edge| edge.curve().is_some_and(|id| id.as_str().ends_with("#192")))
+            .and_then(cadmpeg_ir::topology::Edge::param_range)
+            .map(cadmpeg_ir::units::FiniteVector::get),
+        Some([0.0, 1000.0])
+    );
+    assert!(
+        cadmpeg_ir::validate_neutral(result.ir(), result.report().losses.clone())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn bounded_planar_line_pcurve_keeps_the_curve_parameterization() {
+    let mut body = triangle_body();
+    let edge = body
+        .windows(2)
+        .position(|window| window == [0x00, 0x10])
+        .unwrap();
+    body[edge + 24..edge + 26].copy_from_slice(&192u16.to_be_bytes());
+    body.extend(line_carrier(190, [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]));
+    body.extend(bounded_curve_wrapper(
+        192,
+        190,
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        -0.5,
+        0.5,
+    ));
+    let result = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .ir()
+            .model
+            .edges
+            .iter()
+            .find(|edge| edge.curve().is_some_and(|id| id.as_str().ends_with("#192")))
+            .and_then(cadmpeg_ir::topology::Edge::param_range)
+            .map(cadmpeg_ir::units::FiniteVector::get),
+        Some([-500.0, 500.0])
+    );
+    assert!(
+        cadmpeg_ir::validate_neutral(result.ir(), result.report().losses.clone())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn rational_nurbs_surface_row_gets_isoparametric_pcurve() {
+    let mut body = triangle_body();
+    let end_point = body
+        .windows(4)
+        .position(|window| window == [0x00, 0x1d, 0x00, 0x3d])
+        .expect("triangle endpoint point");
+    let endpoint = [0.0_f64, 1.0, 0.0]
+        .into_iter()
+        .flat_map(f64::to_be_bytes)
+        .collect::<Vec<_>>();
+    body[end_point + 16..end_point + 40].copy_from_slice(&endpoint);
+    let bridge = body.windows(2).position(|w| w == [0x00, 0x0e]).unwrap();
+    body[bridge + 26..bridge + 28].copy_from_slice(&180u16.to_be_bytes());
+    let edge = body.windows(2).position(|w| w == [0x00, 0x10]).unwrap();
+    body[edge + 24..edge + 26].copy_from_slice(&190u16.to_be_bytes());
+    body.extend(rational_nurbs_surface_carrier(180, 181, 10));
+    body.extend(rational_linear_nurbs_curve_carrier(190, 191));
+    let result = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(
+                &mut Cursor::new(sldprt_with_body(&body)),
+                &DecodeOptions::default(),
+            )
+            .unwrap(),
+    );
+    assert!(result.ir().model.pcurves.iter().any(|pcurve| {
+        result
+            .source_fidelity()
+            .annotations
+            .provenance
+            .get(pcurve.id.as_str())
+            .and_then(|note| note.tag.as_deref())
+            == Some("derived_nurbs_isoparametric_pcurve")
+    }));
+}
+
+fn isocurve_admission_source() -> Vec<u8> {
+    use crate::test_support::parasolid::{be16, be32, f64_array, u16_array};
+    let mut body = triangle_body();
+    let bridge = body
+        .windows(2)
+        .position(|window| window == [0x00, 0x0e])
+        .unwrap();
+    body[bridge + 26..bridge + 28].copy_from_slice(&180_u16.to_be_bytes());
+    let edge = body
+        .windows(2)
+        .position(|window| window == [0x00, 0x10])
+        .unwrap();
+    body[edge + 24..edge + 26].copy_from_slice(&190_u16.to_be_bytes());
+    let mut surface = vec![0x00, 0x7c];
+    be16(&mut surface, 180);
+    be32(&mut surface, 1);
+    for reference in [0, 10, 0, 0, 0] {
+        be16(&mut surface, reference);
+    }
+    surface.push(0x2b);
+    be16(&mut surface, 181);
+    be16(&mut surface, 0);
+    surface.extend_from_slice(&[0x00, 0x7e]);
+    be16(&mut surface, 181);
+    surface.extend_from_slice(&[0, 0]);
+    be16(&mut surface, 1);
+    be16(&mut surface, 1);
+    be32(&mut surface, 3);
+    be32(&mut surface, 2);
+    surface.extend_from_slice(&[1, 1]);
+    be32(&mut surface, 3);
+    be32(&mut surface, 2);
+    surface.extend_from_slice(&[0, 0, 0, 0x0c]);
+    be16(&mut surface, 3);
+    for reference in [182, 183, 184, 185, 186] {
+        be16(&mut surface, reference);
+    }
+    surface.extend(f64_array(
+        0x2d,
+        182,
+        &[
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0,
+            0.5,
+        ],
+    ));
+    surface.extend(u16_array(183, &[2, 1, 2]));
+    surface.extend(u16_array(184, &[2, 2]));
+    surface.extend(f64_array(0x80, 185, &[0.0, 0.5, 1.0]));
+    surface.extend(f64_array(0x80, 186, &[0.0, 1.0]));
+    body.extend(surface);
+    body.extend(linear_nurbs_curve_carrier(190, 191));
+    sldprt_with_body(&body)
+}
+
+#[test]
+fn geometry_isocurve_route_derives_pcurves() {
+    let source = isocurve_admission_source();
+    let options = DecodeOptions {
+        policy: cadmpeg_core::decode::DecodePolicy::service(),
+        ..DecodeOptions::default()
+    };
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(&source), &options)
+        .unwrap();
+    assert!(!decoded.ir().model.pcurves.is_empty());
+}

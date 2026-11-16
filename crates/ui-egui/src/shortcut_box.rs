@@ -173,7 +173,11 @@ fn keywords(id: &str) -> &'static str {
     match id {
         "file.save_mesh" => "export stl 3mf mesh 3d print printing slicer",
         "file.export" => "export stl 3mf obj step urdf mesh 3d print",
+        "file.export_nx_assembly" => "nx assembly exchange step components parts",
         "file.export_step" => "stp cad",
+        "file.export_parasolid" => "x_t xt cad assembly",
+        "file.export_glb" => "gltf texture color mesh",
+        "file.export_json" => "native editable design",
         "file.export_stl" | "file.export_3mf" => "mesh 3d print printing",
         "file.export_obj" => "mesh",
         "file.export_urdf" => "robot ros simulation",

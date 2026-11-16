@@ -1143,3 +1143,32 @@ fn fs_cloud(o: COut) -> @location(0) vec4<f32> {
     }
     return out_color(vec4<f32>(c, 1.0));
 }
+
+// Authored scan appearance: photographs already contain captured lighting. Preserve their
+// sRGB colours instead of applying the CAD body colour or a second lighting response.
+struct ScanOut {
+    @invariant @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) c: vec4<f32>,
+    @location(2) wp: vec3<f32>,
+};
+@vertex
+fn vs_scan(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) c: vec4<f32>,
+           @location(3) r0: vec4<f32>, @location(4) r1: vec4<f32>, @location(5) r2: vec4<f32>) -> ScanOut {
+    var o: ScanOut;
+    let q = vec4<f32>(p, 1.0);
+    o.wp = placed(vec3<f32>(dot(r0, q), dot(r1, q), dot(r2, q)));
+    o.pos = u.vp * vec4<f32>(o.wp, 1.0);
+    o.uv = uv;
+    o.c = c;
+    return o;
+}
+@fragment
+fn fs_scan(i: ScanOut) -> @location(0) vec4<f32> {
+    if (clipped(i.wp)) { discard; }
+    let sampled = textureSample(img_t, img_s, i.uv);
+    let rgb = sampled.rgb * srgb_decode(i.c.rgb);
+    let alpha = sampled.a * i.c.a;
+    if (u.back.w > 0.5) { return vec4<f32>(rgb, alpha); }
+    return vec4<f32>(srgb_encode(rgb), alpha);
+}

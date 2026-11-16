@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: Apache-2.0
+//! NX dialect identity: which registry row a document is, and how it was
+//! admitted.
+//!
+//! The `*LossCode` template: the enum is internal, registry-generated
+//! [`DialectId`] constants are the boundary, [`classify_layers`] is the one
+//! construction path, and the vocabulary is closed.
+//!
+//! # Host classification is structural
+//!
+//! NX has two container grammars and one dispatch, at [`crate::decode::scan`]:
+//! a file whose bytes start with `SPLMSSTR` is parsed by
+//! [`crate::container::scan_bytes`], and anything else is handed to
+//! [`crate::container::scan_legacy`], which requires a Compound File envelope
+//! carrying `UG_PART/UG_PART` and a `\x0d\x01UGII  ` payload prefix and errors
+//! with [`cadmpeg_core::CodecError::WrongFormat`] otherwise. The parser that
+//! ran is recorded by [`crate::container::ContainerLayout`], not by a second
+//! reading of the magic.
+//!
+//! Each of the two host rows therefore names the grammar that actually parsed
+//! the document, so admission is [`Admission::Admitted`] on both. Embedded
+//! Parasolid streams form separate layers. A schema without a named grammar is
+//! admitted as residual and charges `source.kernel-dialect-unverified`; host
+//! admission does not launder the kernel layer.
+//!
+//! # The version byte is admitted by its container grammar
+//!
+//! `Container::version` is a `u8` — file offset 8 on the modern arm, byte 8 of
+//! the UGII payload prefix on the legacy arm. The modern parser requires 0x06
+//! before it constructs a container. The admitted value is rendered as canonical
+//! decimal in report notes and [`DialectMatch::declared`] under the key for its
+//! container grammar. It never changes the resolved dialect id.
+//!
+//! A successful scan always reads the version byte, so the value used by decode
+//! and the declaration recorded here cannot diverge.
+//!
+//! Product/version text belongs to each indexed object-model store and remains
+//! on the native `StoreHeader` records. It is not a host-container declaration.
+//!
+//! # `nx:unknown` is a registry-only row this codec never emits
+//!
+//! The registry's mandatory totality row covers a part file
+//! matching neither container. NX refuses such a file at the container
+//! boundary — `NxCodec::detect` reports
+//! [`cadmpeg_ir::codec::Confidence::No`], and a forced scan returns
+//! `WrongFormat` — so no run ever produces a report to carry the row. The
+//! `unknown_kind = "detect-unreachable"` excludes it from reportable-row
+//! closure. No codec enum variant or report construction path names it.
+
+use crate::container::Container;
+use crate::loss::NxLossCode;
+use cadmpeg_core::dialect::{DialectId, DialectLayers, DialectMatch};
+use cadmpeg_ir::report::loss::LossNote;
+
+use std::collections::BTreeMap;
+
+include!("dialect/registry_ids.rs");
+
+#[cfg(test)]
+const PARASOLID_FORMAT: &str = "parasolid";
+
+/// Key of the modern container version byte in [`DialectMatch::declared`].
+///
+/// A successful modern scan always reads this byte from the source.
+const DECLARED_SPLMSSTR_VERSION: &str = "splmsstr_version";
+/// Key of the legacy UGII payload version byte in [`DialectMatch::declared`].
+const DECLARED_UGII_VERSION: &str = "ugii_version";
+
+/// One reportable row of `crates/cadmpeg-registry/docs/dialects.toml` under the `nx` namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NxDialect {
+    /// The `SPLMSSTR` member table.
+    Splmsstr,
+    /// The legacy Compound File envelope around a `UG_PART/UG_PART` stream.
+    LegacyCfb,
+}
+
+/// The host and kernel identities admitted from one scan, plus recoverable
+/// damage to the unique layer set.
+pub(crate) struct LayerClassification {
+    host: NxDialect,
+    layers: DialectLayers,
+    losses: Vec<LossNote>,
+}
+
+impl crate::NxCodec {
+    /// Parasolid dialect grammars this host verifies under their own identities.
+    pub const VERIFIED_PARASOLID_GRAMMARS: &'static [DialectId] = &[];
+}
+
+impl LayerClassification {
+    pub(crate) fn container_kind(&self) -> cadmpeg_ir::ContainerKind {
+        self.host.container_kind()
+    }
+
+    pub(crate) fn into_report_parts(self) -> (DialectLayers, Vec<LossNote>) {
+        (self.layers, self.losses)
+    }
+}
+
+/// Classify the host container and every schema-bearing Parasolid stream.
+pub(crate) fn classify_layers(scan: &crate::decode::Scan<'_>) -> LayerClassification {
+    let mut carriers = Vec::new();
+    for stream in &scan.streams {
+        if let Some(schema) = stream.schema_token() {
+            carriers.push((
+                schema.clone(),
+                cadmpeg_parasolid::Carrier::new(format!("stream@{}", stream.file_offset)),
+            ));
+        }
+    }
+    let extra =
+        cadmpeg_parasolid::extra_layers(carriers, crate::NxCodec::VERIFIED_PARASOLID_GRAMMARS);
+    let host = NxDialect::of_container(&scan.container);
+    let mut layers = DialectLayers::of(host.matched(scan.container.layout.version()));
+    let mut losses = Vec::new();
+    for message in cadmpeg_parasolid::push_extras(&mut layers, extra) {
+        losses.push(NxLossCode::DialectLayerCollision.note(message));
+    }
+
+    for layer in layers.iter() {
+        if let Some(message) = cadmpeg_parasolid::unverified_message(layer) {
+            losses.push(NxLossCode::KernelDialectUnverified.note(message));
+        }
+    }
+    LayerClassification {
+        host,
+        layers,
+        losses,
+    }
+}
+
+impl NxDialect {
+    /// Every reportable dialect identity this enum can name.
+    #[cfg(test)]
+    const ALL: [Self; 2] = [Self::Splmsstr, Self::LegacyCfb];
+
+    /// The registry-generated id for this variant.
+    pub(crate) const fn id(self) -> DialectId {
+        match self {
+            Self::Splmsstr => NX_SPLMSSTR,
+            Self::LegacyCfb => NX_LEGACY_CFB,
+        }
+    }
+
+    /// The `ContainerSummary::container_kind` label for this row.
+    ///
+    /// One source for the label and the id, so a summary cannot name a
+    /// container the classification disagrees with.
+    const fn container_kind(self) -> cadmpeg_ir::ContainerKind {
+        match self {
+            Self::Splmsstr => cadmpeg_ir::ContainerKind::Splmsstr,
+            Self::LegacyCfb => cadmpeg_ir::ContainerKind::Cfb,
+        }
+    }
+
+    /// Construct this host row's identity and arm-owned declaration.
+    fn matched(self, version: u8) -> DialectMatch {
+        let (key, value) = match self {
+            Self::LegacyCfb => (
+                cadmpeg_core::nonblank_const!(DECLARED_UGII_VERSION),
+                format_version_byte(version),
+            ),
+            Self::Splmsstr => (
+                cadmpeg_core::nonblank_const!(DECLARED_SPLMSSTR_VERSION),
+                format_version_byte(version),
+            ),
+        };
+        let declared = BTreeMap::from([(key, value)]);
+        DialectMatch::admitted(self.id()).with_declared(declared)
+    }
+
+    /// The row for a parsed container.
+    ///
+    /// The layout is the dispatch itself: whichever parser built the container
+    /// selected its enum variant.
+    fn of_container(container: &Container<'_>) -> Self {
+        match container.layout {
+            crate::container::ContainerLayout::Modern { .. } => Self::Splmsstr,
+            crate::container::ContainerLayout::LegacyCfb { .. } => Self::LegacyCfb,
+        }
+    }
+}
+
+/// Canonical report rendering of the version byte read by either container arm.
+fn format_version_byte(version: u8) -> String {
+    version.to_string()
+}
+
+#[cfg(test)]
+mod tests;

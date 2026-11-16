@@ -252,6 +252,7 @@ mod tests {
                     step: step.into(),
                     components: Vec::new(),
                     skip: Vec::new(),
+                    meshes: Vec::new(),
                 },
                 None,
             )

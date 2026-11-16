@@ -263,6 +263,7 @@ impl Sketch {
 
     /// Validate saved arrays without regenerating legacy geometry or changing point values.
     pub fn validate_wires(&self) -> Result<()> {
+        self.validate_wire_constraints()?;
         if self.wires.len() > crate::link::MAX_LINK_ENTITIES {
             return Err(SketchError::Invalid("too many 3D curves".into()));
         }
@@ -291,7 +292,9 @@ impl Sketch {
     /// Producer semantics for legacy wires with retained association provenance. Breaking a
     /// link removes this evidence, so detached wires conservatively retain world coordinates.
     pub fn legacy_wire_space(&self, wire: &Wire) -> WireSpace {
-        let Some(link) = wire.link.as_deref().and_then(|id| self.link(id)) else { return WireSpace::World };
+        let Some(link) = wire.link.as_deref().and_then(|id| self.link(id)) else {
+            return WireSpace::World;
+        };
         WireSpace::from_legacy_link(link)
     }
 
@@ -381,6 +384,10 @@ impl Sketch {
         self.wire_budget(None, 1, pts.len() + fit.len())?;
         let id = self.fresh(if fit.len() == 1 { "q" } else { "w" })?;
         self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: None, exact: Vec::new() });
+        if let Err(error) = self.connect_wire_ends(&id) {
+            self.wires.pop();
+            return Err(error);
+        }
         Ok(id)
     }
 
@@ -401,12 +408,46 @@ impl Sketch {
         self.wire_budget(None, 1, pts.len() + fit.len())?;
         let id = self.fresh("w")?;
         self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: Some(arc), exact: Vec::new() });
+        if let Err(error) = self.connect_wire_ends(&id) {
+            self.wires.pop();
+            return Err(error);
+        }
         Ok(id)
     }
 
     /// Move a fit point of a drawn 3D curve, and every other drawn point at the same place
     /// (curves drawn end to end stay joined). Returns how many points moved.
     pub fn move_drawn_point(&mut self, wire: &str, index: usize, to: Vec3) -> Result<usize> {
+        if self.wire_constraints.is_empty() {
+            return self.move_drawn_point_unconstrained(wire, index, to);
+        }
+        let before = self.wires.clone();
+        let from = self.wire_index(wire).and_then(|w| self.wires.get(w)).and_then(|w| w.fit.get(index)).copied()
+            .ok_or_else(|| SketchError::Unknown(format!("{wire} point {index}")))?;
+        if self.wire_constraints.iter().any(|c| c.kind == crate::wire_constraints::Relation::Fix && c.a.wire == wire && c.a.index == index)
+            && from.dist(to) > 1e-7 {
+            return Err(SketchError::Invalid("this 3D fit point is fixed; remove Fix before moving it".into()));
+        }
+        if let Err(error) = self.move_drawn_point_unconstrained(wire,index,to) {
+            self.wires = before;
+            return Err(error);
+        }
+        // A cursor request is a soft movement goal. First honor it exactly if feasible;
+        // otherwise project the requested geometry onto the persistent hard relations.
+        // The damped minimum-correction solve keeps all driving dimensions exact.
+        let result = self.solve_wire_constraints(Some((wire,index))).or_else(|_| self.solve_wire_constraints(None));
+        if let Err(error) = result {
+            self.wires = before;
+            return Err(error);
+        }
+        let reached = self.wire_index(wire).and_then(|w| self.wires.get(w)).and_then(|w| w.fit.get(index)).copied();
+        if from.dist(to) > 1e-6 && reached.is_some_and(|p| p.dist(from) < 1e-7) {
+            self.wires = before;
+            return Err(SketchError::Invalid("the 3D constraints prevent movement in that direction".into()));
+        }
+        Ok(before.iter().zip(&self.wires).flat_map(|(a, b)| a.fit.iter().zip(&b.fit)).filter(|(a, b)| a.dist(**b) > 1e-9).count())
+    }
+    fn move_drawn_point_unconstrained(&mut self, wire: &str, index: usize, to: Vec3) -> Result<usize> {
         if !in_range3(to) {
             return Err(SketchError::Invalid("3D point out of range".into()));
         }
@@ -458,6 +499,7 @@ impl Sketch {
     /// Remove wires by id.
     pub fn remove_wires(&mut self, ids: &[String]) {
         self.wires.retain(|w| !ids.contains(&w.id));
+        self.wire_constraints.retain(|c| !ids.contains(&c.a.wire) && !ids.contains(&c.b.wire));
         self.prune_links();
     }
 }
@@ -611,4 +653,189 @@ mod tests {
         sk.wires[0].arc.as_mut().unwrap().radius = 1.0; // claims a circle its ends are not on
         assert!(sk.validate_wires().is_err());
     }
+    #[test]
+    fn spatial_tangent_is_persistent_serialized_and_atomic() {
+        use crate::wire_constraints::Relation;
+        let mut sk = Sketch::new();
+        let line = sk.add_drawn_wire_in(&[Vec3::new(-10., 0., 4.), Vec3::new(0., 0., 4.)], WireSpace::Component).unwrap();
+        let arc = sk.add_drawn_arc_in(&[Vec3::new(0., 0., 4.), Vec3::new(5., 5., 4.), Vec3::new(0., 10., 4.)], WireSpace::Component).unwrap();
+        assert_eq!(sk.wire_constraints.len(), 1, "drawing at an endpoint saves coincidence");
+        let tangent = sk.add_wire_constraint(Relation::Tangent, &format!("{line}.end"), &format!("{arc}.start")).unwrap();
+        assert_ne!(tangent, sk.wire_constraints[0].id);
+        sk.move_drawn_point(&line, 0, Vec3::new(-10., -4., 2.)).unwrap();
+        let a = sk.wires[1].arc.unwrap();
+        let u = sk.wires[0].fit[0] - sk.wires[0].fit[1];
+        let v = a.normal.cross(a.start - a.center);
+        assert!(u.cross(v).len() / (u.len() * v.len()) < 1e-6);
+        assert!(a.start.dist(sk.wires[0].fit[1]) < 1e-6);
+        let restored: Sketch = serde_json::from_value(serde_json::to_value(&sk).unwrap()).unwrap();
+        assert_eq!(restored, sk);
+        let before = sk.clone();
+        assert!(sk.add_wire_constraint(Relation::Tangent, &line, &format!("{arc}:1")).is_err());
+        assert_eq!(sk, before);
+        assert!(sk.move_drawn_point(&arc, 1, (a.start + a.end) * 0.5).is_err());
+        assert_eq!(sk, before);
+        sk.remove_wires(&[arc]);
+        assert!(sk.wire_constraints.is_empty());
+    }
+    #[test]
+    fn spatial_tangent_joins_offset_spline_and_line_and_moves_join() {
+        use crate::wire_constraints::Relation;
+        let mut sk = Sketch::new();
+        let a = sk.add_drawn_wire_in(&[Vec3::new(-10., 0., 4.), Vec3::new(0., 0., 4.)], WireSpace::World).unwrap();
+        let b = sk.add_drawn_wire_in(&[Vec3::new(1., 2., 5.), Vec3::new(4., 5., 6.), Vec3::new(10., 3., 8.)], WireSpace::World).unwrap();
+        sk.add_wire_constraint(Relation::Tangent, &a, &b).unwrap();
+        assert!(sk.wires[0].fit[1].dist(sk.wires[1].fit[0]) < 1e-6);
+        let d = sk.wires[1].fit[1] - sk.wires[1].fit[0];
+        assert!(d.y.abs() < 1e-6 && d.z.abs() < 1e-6);
+        sk.move_drawn_point(&a, 1, Vec3::new(2., 3., 4.)).unwrap();
+        assert!(sk.wires[0].fit[1].dist(sk.wires[1].fit[0]) < 1e-6);
+    }
+    #[test]
+    fn tangent_all_primitive_pairs_in_space() {
+        for first in 0..3 {
+            for second in 0..3 {
+                let mut real = Sketch::new();
+                let make = |sk: &mut Sketch, kind, offset: Vec3| {
+                    let p = [Vec3::new(0., 0., 0.) + offset, Vec3::new(4., 3., 2.) + offset, Vec3::new(8., 0., 1.) + offset];
+                    if kind == 1 {
+                        sk.add_drawn_arc_in(&p, WireSpace::Component).unwrap()
+                    } else {
+                        sk.add_drawn_wire_in(if kind == 0 { &p[..2] } else { &p }, WireSpace::Component).unwrap()
+                    }
+                };
+                let a = make(&mut real, first, Vec3::ZERO);
+                let b = make(&mut real, second, Vec3::new(10., 4., 3.));
+                let mut sk = real;
+                assert!(
+                    sk.add_wire_constraint(crate::wire_constraints::Relation::Tangent, &format!("{a}.end"), &format!("{b}.start")).is_ok(),
+                    "pair {first}/{second}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn spatial_point_coincides_with_curve_endpoint_and_follows_move() {
+        let mut sk = Sketch::new();
+        let point = sk.add_drawn_wire_in(&[Vec3::new(1., 2., 3.)], WireSpace::Component).unwrap();
+        let line = sk.add_drawn_wire_in(&[Vec3::new(5., 6., 7.), Vec3::new(10., 10., 10.)], WireSpace::Component).unwrap();
+        sk.add_wire_constraint(crate::wire_constraints::Relation::Coincident, &point, &format!("{line}.start")).unwrap();
+        assert!(sk.wires[0].fit[0].dist(sk.wires[1].fit[0]) < 1e-6);
+        sk.move_drawn_point(&point, 0, Vec3::new(2., 3., 4.)).unwrap();
+        assert!(sk.wires[0].fit[0].dist(sk.wires[1].fit[0]) < 1e-6);
+        assert_eq!(sk.wires[0].pts.len(), 1);
+    }
+    #[test]
+    fn spatial_dimensions_report_nullspace_and_keep_driving_values() {
+        use crate::wire_constraints::Relation;
+        let mut sk=Sketch::new();
+        let line=sk.add_drawn_wire(&[Vec3::ZERO,Vec3::new(3.,4.,12.)]).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(6));
+        sk.fix_wire_geometry(&format!("{line}.start")).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(3));
+        let len=sk.add_wire_dimension(Relation::Distance,&line,None,13.).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(2));
+        sk.add_wire_dimension(Relation::DeltaX,&line,None,3.).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(1));
+        let freedom=sk.wire_freedom();
+        assert_eq!(freedom.points[0].free_axes,[false;3]);
+        assert_eq!(freedom.points[1].free_axes,[false,true,true]);
+        assert_eq!(freedom.points[1].directions.len(),1);
+        let d=freedom.points[1].directions[0];
+        assert!((4.*d[1]+12.*d[2]).abs()<1e-5);
+        sk.add_wire_dimension(Relation::DeltaY,&line,None,4.).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(0));
+        sk.set_wire_dimension(&len,26.).unwrap();
+        assert!((sk.wires[0].fit[1].len()-26.).abs()<1e-6);
+        assert!((sk.wires[0].fit[1].z-651_f64.sqrt()).abs()<1e-6);
+        let before=sk.clone();
+        assert!(sk.move_drawn_point(&line,1,Vec3::new(3.,4.,25.)).is_err());
+        assert_eq!(sk,before);
+        assert!(sk.add_wire_dimension(Relation::DeltaX,&line,None,6.).is_err());
+        assert_eq!(sk,before);
+        let saved=serde_json::to_string(&sk).unwrap();
+        assert_eq!(serde_json::from_str::<Sketch>(&saved).unwrap(),sk);
+    }
+    #[test]
+    fn spatial_radius_angle_and_redundant_rank_are_measured_analytically() {
+        use crate::wire_constraints::Relation;
+        let mut sk=Sketch::new();
+        let arc=sk.add_drawn_arc_in(&[Vec3::new(5.,0.,2.),Vec3::new(0.,5.,2.),Vec3::new(-5.,0.,2.)],WireSpace::World).unwrap();
+        sk.add_wire_dimension(Relation::Radius,&arc,None,8.).unwrap();
+        assert!((sk.wires[0].arc.unwrap().radius-8.).abs()<1e-6);
+        assert_eq!(sk.wire_freedom().dof,Some(8));
+        let mut sk=Sketch::new();
+        let a=sk.add_drawn_wire(&[Vec3::ZERO,Vec3::X*10.]).unwrap();
+        let b=sk.add_drawn_wire(&[Vec3::new(0.,4.,0.),Vec3::new(0.,14.,10.)]).unwrap();
+        sk.fix_wire_geometry(&a).unwrap();
+        let angle=sk.add_wire_dimension(Relation::Angle,&a,Some(&b),std::f64::consts::FRAC_PI_3).unwrap();
+        let v=(sk.wires[1].fit[1]-sk.wires[1].fit[0]).normalized().unwrap();
+        assert!((v.dot(Vec3::X)-0.5).abs()<1e-6);
+        assert_eq!(sk.wire_freedom().dof,Some(5));
+        sk.add_wire_dimension(Relation::Angle,&a,Some(&b),std::f64::consts::FRAC_PI_3).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(5));
+        let before=sk.clone();assert!(sk.set_wire_dimension(&angle,0.).is_err());assert_eq!(sk,before);
+    }
+
+    #[test]
+    fn spatial_drag_projects_to_dimension_manifold_without_releasing_fix() {
+        use crate::wire_constraints::Relation;
+        let mut sk=Sketch::new();
+        let line=sk.add_drawn_wire(&[Vec3::ZERO,Vec3::new(3.,4.,12.)]).unwrap();
+        sk.fix_wire_geometry(&format!("{line}.start")).unwrap();
+        sk.add_wire_dimension(Relation::Distance,&line,None,13.).unwrap();
+        sk.move_drawn_point(&line,1,Vec3::new(6.,8.,20.)).unwrap();
+        assert!(sk.wires[0].fit[0].len()<1e-7);
+        assert!((sk.wires[0].fit[1].len()-13.).abs()<1e-6);
+        assert!(sk.wires[0].fit[1].dist(Vec3::new(3.,4.,12.))>0.1);
+        assert!(sk.wires[0].fit[1].dist(Vec3::new(6.,8.,20.).normalized().unwrap()*13.)<1e-5);
+        assert_eq!(sk.wire_freedom().dof,Some(2));
+        let before=sk.clone();
+        assert!(sk.move_drawn_point(&line,0,Vec3::X).is_err());assert_eq!(sk,before);
+    }
+
+    #[test]
+    fn singular_extreme_axis_distance_does_not_claim_free_motion() {
+        use crate::wire_constraints::Relation;
+        let mut sk=Sketch::new();let w=sk.add_drawn_wire(&[Vec3::ZERO,Vec3::X*10.]).unwrap();
+        sk.fix_wire_geometry(&format!("{w}.start")).unwrap();
+        sk.add_wire_dimension(Relation::Distance,&w,None,10.).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(2));
+        sk.add_wire_dimension(Relation::Distance,&w,None,10.).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(2),"duplicate length is regular, not a singular obstruction");
+        sk.add_wire_dimension(Relation::DeltaX,&w,None,10.).unwrap();
+        let f=sk.wire_freedom();assert_eq!(f.dof,None);assert_eq!(f.status,"singular");assert!(f.reason.is_some());
+        sk.add_wire_dimension(Relation::DeltaY,&w,None,0.).unwrap();
+        sk.add_wire_dimension(Relation::DeltaZ,&w,None,0.).unwrap();
+        assert_eq!(sk.wire_freedom().dof,Some(0));
+    }
+
+#[test] fn valid_axis_dimension_can_leave_initial_singular_alignment(){
+ use crate::wire_constraints::Relation;
+ let mut sk=Sketch::new();let w=sk.add_drawn_wire(&[Vec3::ZERO,Vec3::X*10.]).unwrap();
+ sk.fix_wire_geometry(&format!("{w}.start")).unwrap();sk.add_wire_dimension(Relation::Distance,&w,None,10.).unwrap();
+ sk.add_wire_dimension(Relation::DeltaX,&w,None,9.).unwrap();
+ let p=sk.wires[0].fit[1];assert!((p.x-9.).abs()<1e-6);assert!((p.len()-10.).abs()<1e-6);assert_eq!(sk.wire_freedom().dof,Some(1));
+}
+
+#[test] fn valid_angle_dimension_can_leave_initial_parallel_lines(){
+ use crate::wire_constraints::Relation;
+ let mut sk=Sketch::new();let a=sk.add_drawn_wire(&[Vec3::ZERO,Vec3::X*10.]).unwrap();
+ let b=sk.add_drawn_wire(&[Vec3::new(0.,5.,0.),Vec3::new(10.,5.,0.)]).unwrap();sk.fix_wire_geometry(&a).unwrap();
+ sk.add_wire_dimension(Relation::Angle,&a,Some(&b),std::f64::consts::FRAC_PI_3).unwrap();
+ let dir=(sk.wires[1].fit[1]-sk.wires[1].fit[0]).normalized().unwrap();assert!((dir.x-0.5).abs()<1e-6);assert_eq!(sk.wire_freedom().dof,Some(5));
+}
+
+#[test] fn parallel_angle_seed_preserves_fixed_second_line_and_fixed_endpoint(){
+ use crate::wire_constraints::Relation;
+ for hold_second in [false,true] {
+  let mut sk=Sketch::new();let a=sk.add_drawn_wire(&[Vec3::ZERO,Vec3::X*10.]).unwrap();
+  let b=sk.add_drawn_wire(&[Vec3::new(0.,5.,0.),Vec3::new(10.,5.,0.)]).unwrap();
+  if hold_second {sk.fix_wire_geometry(&b).unwrap();} else {sk.fix_wire_geometry(&a).unwrap();sk.fix_wire_geometry(&format!("{b}.start")).unwrap();}
+  let original=sk.clone();sk.add_wire_dimension(Relation::Angle,&a,Some(&b),std::f64::consts::FRAC_PI_3).unwrap();
+  let u=(sk.wires[0].fit[1]-sk.wires[0].fit[0]).normalized().unwrap();let v=(sk.wires[1].fit[1]-sk.wires[1].fit[0]).normalized().unwrap();assert!((u.dot(v)-0.5).abs()<1e-6);
+  if hold_second {assert_eq!(sk.wires[1],original.wires[1]);}else{assert_eq!(sk.wires[0],original.wires[0]);assert_eq!(sk.wires[1].fit[0],original.wires[1].fit[0]);}
+ }
+}
+
 }

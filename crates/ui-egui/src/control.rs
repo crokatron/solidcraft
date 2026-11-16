@@ -113,6 +113,7 @@ fn dialog_state(app: &SolveApp) -> Value {
         "editing": d.editing.map(|(feature, _)| feature),
         "inputs": d.inputs.iter().enumerate().map(|(i, input)| json!({"label": input.label, "items": input.items, "active": i == d.active})).collect::<Vec<_>>(),
         "error": d.error,
+        "mesh_region_preview": d.mesh_region_preview.as_ref().and_then(|p| p.counts()).map(|(count,drawn)| json!({"triangles":count,"drawn":drawn})),
         "commands": runs.as_ref().ok().map(|cmds| cmds.iter().map(|(command, params)| json!({"command": command, "params": params})).collect::<Vec<_>>()),
         "waiting": runs.err(),
     })
@@ -123,8 +124,12 @@ fn dialog_state(app: &SolveApp) -> Value {
 fn open_windows(app: &SolveApp) -> Vec<&'static str> {
     [
         (app.params.is_some(), "parameters.change"),
+        (app.scan_workflow.is_some(), "scan.workflow"),
+        (app.spatial_dimensions.is_some(), "sketch.dimension3d"),
         (app.design_properties.is_some(), "document.metadata"),
         (app.sketch_report.is_some(), "sketch.inspect"),
+        (app.live_slice.is_some(), "scan.live_slice"),
+        (app.mesh_report.is_some(), app.mesh_report.as_ref().map(crate::mesh_report::window_command).unwrap_or("mesh.inspect_topology")),
         (app.bom.is_some(), "assembly.bom"),
         (app.material_card_review.is_some(), "material.properties.validate"),
         (app.help.about, "about"),
@@ -718,6 +723,12 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         },
         "ui.confirm" => with(p, |q| ui_confirm(app, q)),
         "ui.shortcut" => with(p, |q| ui_shortcut(app, q)),
+        "ui.shortcuts_import" => {
+            with(p, |q: params::ShortcutImport| match crate::nx_shortcuts_ui::control(app, q.text.as_deref(), &q.source, q.apply, q.replace) {
+                Ok(value) => ok(value),
+                Err(error) => err(error),
+            })
+        }
         "ui.browser" => ui_browser(app),
         "ui.capture" => with(p, |q: params::Action| match q.action {
             Some(a) => match crate::browser::answer_capture(app, &a) {
@@ -993,10 +1004,16 @@ fn ui_inspect(app: &SolveApp) -> Outcome {
         "tool": app.tool.as_ref().map(|t| t.cmd),
         "dialog": dialog_state(app),
         "windows": open_windows(app),
+        "mesh_report": app.mesh_report,
+        "mesh_region_colors": app.mesh_region_colors.as_ref().map(|r| json!({"batches":r.count(),"display_triangles":r.mesh.triangles.len(),"error":r.error})),
+        "live_slice":app.live_slice.as_ref().map(|v|v.inspect()),"mesh_lasso_gpu_ready": app.dense_lasso.as_ref().is_some_and(|l|l.ready_for(app)),
         "status": app.status.as_ref().map(|(text, _, error)| json!({"text": text, "error": error})),
         "hover": app.viewport.hover,
         "renderer": if app.viewport.gpu.is_some() { "gpu" } else { "cpu" },
         "frame_ms": app.frame_ms,
+        "scene_revision": app.session.revision,
+        "display_meshing": crate::open_meshing::progress(app),
+        "scan_textures": {"busy": app.viewport.mesh_textures.busy(), "generation": app.viewport.mesh_textures.generation()},
         "draw": app.viewport.draw_stats.as_ref().and_then(|s| s.lock().ok().map(|d| json!({
             "draw_calls": d.draw_calls, "triangles": d.triangles, "line_segments": d.line_segments, "supersampled": d.supersampled,
         }))),

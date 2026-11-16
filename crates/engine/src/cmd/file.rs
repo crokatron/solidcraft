@@ -54,13 +54,13 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .contract(&OPEN_CONTRACT)
         .output(output_schema_for::<OpenResult>)
-        .params("path: .sc design (or a .solidcraft design from an earlier release), .dxf/.svg drawing (opens as a new, unsaved design with an XY sketch, using sketch.insert_dxf/sketch.insert_svg units and defaults), or a .step/.stp/.igs/.fcstd/.3dm/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make), or a .ply/.xyz/.pts point cloud (opens as a new design holding it, as pointcloud.insert makes; its `units` and `max_points` as there); up?: z|y for a STEP, IGES, FreeCAD, Rhino or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step); units?: for an STL or OBJ file (see file.insert_mesh); origin?: bool for a mesh file (see file.insert_mesh); folder?: bool for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step); read_only?: bool (a design: saving to its own file is refused, file.save_as keeps the changes elsewhere) → open_elsewhere: {host, user, app, opened} when another SolidCraft has the design open (its lock file is fresh); newer_file: {format, reads_up_to, unknown_changes, not_understood, notice} and warnings when a newer SolidCraft saved it: it opens all the same, and what this version can't read is named there and kept by saving"),
+        .params("path: .sc design (or a .solidcraft design from an earlier release), .dxf/.svg drawing (opens as a new, unsaved design with an XY sketch, using sketch.insert_dxf/sketch.insert_svg units and defaults), or a .step/.stp/.igs/.fcstd/.3dm/.prt/.x_t/.x_b/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, NX, Parasolid, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make), or a .ply/.xyz/.pts point cloud (opens as a new design holding it, as pointcloud.insert makes; its `units` and `max_points` as there); up?: z|y for a STEP, IGES, FreeCAD, Rhino, NX, Parasolid or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD, Rhino, NX or Parasolid file (see file.insert_step); units?: for an STL or OBJ file (see file.insert_mesh); origin?: bool for a mesh file (see file.insert_mesh); folder?: bool for a STEP, IGES, FreeCAD, Rhino, NX or Parasolid file (see file.insert_step); read_only?: bool (a design: saving to its own file is refused, file.save_as keeps the changes elsewhere) → open_elsewhere: {host, user, app, opened} when another SolidCraft has the design open (its lock file is fresh); newer_file: {format, reads_up_to, unknown_changes, not_understood, notice} and warnings when a newer SolidCraft saved it: it opens all the same, and what this version can't read is named there and kept by saving"),
     CommandSpec::new("file.insert_step", "Insert STEP", crate::checked!("file.insert_step", insert_step))
         .at("SOLID", "INSERT")
         .icon("import")
         .contract(&INSERT_STEP_CONTRACT)
         .output(output_schema_for::<StepInserted>)
-        .params("path: STEP, IGES, FreeCAD .FCStd or Rhino .3dm file (its bodies join the design as an Import base feature in a new component named after the file, placed in the active component; an assembly's products become nested components, a repeated part one component with an occurrence per placement, all held as one rigid group until component.unlock → component, component_name, occurrence, subcomponents?, rigid_joints?, group?: the folder); folder?: bool (default false; true: an import that brings more than one item into the history (its Import feature and the rigid joints holding its parts) goes into a new history folder named `Group #N`); name? (the feature's and the component's); up?: z|y (default z: the file's axes are kept; y: the file has Y up, so the import's component is turned a quarter turn about X, Y becoming Z → stand_up: its occurrence); names?: auto|solid|product|instance (default auto: keep meaningful solid names, replace placeholders with the nearest named product, else instance; solid: the solid's own name; product: the part's name; instance: the occurrence's name, else the product's); matrix?: [12 or 16 numbers] (where the new component's occurrence sits in the active component, after `up`: a rigid row-major 3x4 rotation-and-translation or 4x4 matrix, flat or as rows, as occurrence.move takes it; a scale, shear or mirror is refused before the file is read); tolerance? (see occurrence.move)"),
+        .params("path: STEP, IGES, FreeCAD .FCStd, Rhino .3dm, NX .prt or Parasolid .x_t/.x_b file (its bodies join the design as an Import base feature in a new component named after the file, placed in the active component; an assembly's products become nested components, a repeated part one component with an occurrence per placement, all held as one rigid group until component.unlock → component, component_name, occurrence, subcomponents?, rigid_joints?, group?: the folder); folder?: bool (default false; true: an import that brings more than one item into the history (its Import feature and the rigid joints holding its parts) goes into a new history folder named `Group #N`); name? (the feature's and the component's); up?: z|y (default z: the file's axes are kept; y: the file has Y up, so the import's component is turned a quarter turn about X, Y becoming Z → stand_up: its occurrence); names?: auto|solid|product|instance (default auto: keep meaningful solid names, replace placeholders with the nearest named product, else instance; solid: the solid's own name; product: the part's name; instance: the occurrence's name, else the product's); matrix?: [12 or 16 numbers] (where the new component's occurrence sits in the active component, after `up`: a rigid row-major 3x4 rotation-and-translation or 4x4 matrix, flat or as rows, as occurrence.move takes it; a scale, shear or mirror is refused before the file is read); tolerance? (see occurrence.move)"),
     CommandSpec::new("file.insert_mesh", "Insert Mesh", crate::checked!("file.insert_mesh", insert_mesh))
         .at("SOLID", "INSERT")
         .icon("import")
@@ -102,7 +102,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .contract(&EXPORT_CONTRACT)
         .output(crate::schema::output_schema_for::<crate::schema::file::FileExportResult>)
-        .params("path; format?: stl|stla|obj|step|3mf|3mf-tagged|glb|urdf|json (default from extension; 3mf-tagged: 3MF whose triangles carry their B-rep face, at full precision, for meshing and analysis tools; docs/formats/3mf-face-tags.md; obj: the colours of the bodies go in a material library (`.mtl`) written next to the mesh file; glb: binary glTF in metres with Y up, each body placed and named, its colours, metallic and roughness as materials; a transparent body or face, or a body a render setup gives an image texture or optics, is refused; urdf: the whole assembly as a robot, with STL meshes written next to it; docs/urdf.md); bodies?: [names] (JSON and URDF export the complete design); urdf only: mesh_prefix? (before each mesh file name, e.g. package://robot/meshes/), effort? (default 1000), velocity? (default 10); quality?: standard|fine|finest (STL, OBJ, 3MF and GLB: how closely the mesh follows curved faces, a chord tolerance of 2e-4, 5e-5 or 1e-5 of each body's size; default standard); objects?: body|component (3MF only: one object per body, the default, or one object for each placed component with two or more bodies, with those bodies as its parts, so a slicer loads them as one object with parts)"),
+        .params("path; format?: stl|stla|obj|step|x_t|3mf|3mf-tagged|glb|urdf|json (default from extension; x_t: closed CAD solids and component assemblies with exact analytic/NURBS geometry; unsupported sheets/procedural geometry/scan meshes refused; 3mf-tagged: 3MF whose triangles carry their B-rep face, at full precision, for meshing and analysis tools; docs/formats/3mf-face-tags.md; obj: the colours of the bodies go in a material library (`.mtl`) written next to the mesh file; glb: binary glTF in metres with Y up, each body placed and named, its colours, metallic and roughness as materials; a transparent body or face, or a body a render setup gives an image texture or optics, is refused; urdf: the whole assembly as a robot, with STL meshes written next to it; docs/urdf.md); bodies?: [names] (JSON and URDF export the complete design); urdf only: mesh_prefix? (before each mesh file name, e.g. package://robot/meshes/), effort? (default 1000), velocity? (default 10); quality?: standard|fine|finest (STL, OBJ, 3MF and GLB: how closely the mesh follows curved faces, a chord tolerance of 2e-4, 5e-5 or 1e-5 of each body's size; default standard); objects?: body|component (3MF only: one object per body, the default, or one object for each placed component with two or more bodies, with those bodies as its parts, so a slicer loads them as one object with parts)"),
     // One command per format, so each File › Export item can have a key of its own; started
     // from a key or command search, the app opens the save picker (the mesh dialog for STL and
     // 3MF). Each takes `file.export`'s parameters for its format, without `format`.
@@ -118,6 +118,22 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&EXPORT_STL_CONTRACT)
         .output(crate::schema::output_schema_for::<crate::schema::file::ExportResult>)
         .params("path; bodies?: [names] (default: every body); quality?: standard|fine|finest (default standard) → {path, bytes, format}: binary STL, whatever the path's extension"),
+    CommandSpec::new("file.export_nx_assembly", "NX Assembly (STEP)", crate::checked!("file.export_nx_assembly", export_nx_assembly))
+        .icon("export").noundo().contract(&EXPORT_DESIGN_CONTRACT)
+        .output(crate::schema::output_schema_for::<crate::schema::file::ExportResult>)
+        .params("path → STEP assembly with named component structure for opening in NX; not native NX .prt; always exports the complete assembly"),
+    CommandSpec::new("file.export_parasolid", "Export Parasolid", crate::checked!("file.export_parasolid", export_parasolid))
+        .icon("export").noundo().contract(&EXPORT_STEP_CONTRACT)
+        .output(crate::schema::output_schema_for::<crate::schema::file::ExportResult>)
+        .params("path; bodies?: [names] (default: every body) → Parasolid text (.x_t); unsupported geometry is refused"),
+    CommandSpec::new("file.export_glb", "Export GLB", crate::checked!("file.export_glb", export_glb_cmd))
+        .icon("export").noundo().contract(&EXPORT_STEP_CONTRACT)
+        .output(crate::schema::output_schema_for::<crate::schema::file::ExportResult>)
+        .params("path; bodies?: [names] (default: every body) → GLB with appearance"),
+    CommandSpec::new("file.export_json", "Export Design JSON", crate::checked!("file.export_json", export_json))
+        .icon("export").noundo().contract(&EXPORT_DESIGN_CONTRACT)
+        .output(crate::schema::output_schema_for::<crate::schema::file::ExportResult>)
+        .params("path → complete native design as JSON"),
     CommandSpec::new("file.export_3mf", "Export 3MF", crate::checked!("file.export_3mf", export_3mf))
         .icon("mesh_export")
         .noundo()
@@ -179,6 +195,7 @@ const EXPORT_CONTRACT: crate::schema::TypedContract<crate::schema::file::ExportP
 const SAVE_CONTRACT: TypedContract<SaveParams> = TypedContract::new();
 const SAVE_AS_CONTRACT: TypedContract<SaveAsParams> = TypedContract::new();
 const EXPORT_STEP_CONTRACT: crate::schema::TypedContract<crate::schema::file::ExportStepParams> = crate::schema::TypedContract::new();
+const EXPORT_DESIGN_CONTRACT: crate::schema::TypedContract<crate::schema::file::ExportDesignParams> = crate::schema::TypedContract::new();
 const EXPORT_STL_CONTRACT: crate::schema::TypedContract<crate::schema::file::ExportMeshParams> = crate::schema::TypedContract::new();
 const EXPORT_3MF_CONTRACT: crate::schema::TypedContract<crate::schema::file::Export3mfParams> = crate::schema::TypedContract::new();
 const EXPORT_OBJ_CONTRACT: crate::schema::TypedContract<crate::schema::file::ExportMeshParams> = crate::schema::TypedContract::new();
@@ -366,7 +383,9 @@ fn add_mesh(
         }
         (g.feature, Some(g.plan), g.looks)
     } else {
-        (solidcraft_io::mesh_import_feature_in(&bytes, path, unit.map_or(1.0, |(_, mm)| mm)).map_err(err)?, None, Vec::new())
+        let dir = std::path::Path::new(path).parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let mut load = |name: &str| solidcraft_io::vfs::read(&dir.join(name).to_string_lossy(), 128 << 20).map_err(|e| e.to_string());
+        (solidcraft_io::mesh_import_feature_with_assets(&bytes, path, unit.map_or(1.0, |(_, mm)| mm), &mut load).map_err(err)?, None, Vec::new())
     };
     if let Some(angle) = crease_angle
         && let solidcraft_doc::FeatureKind::MeshImport { meshes, .. } = &mut mf.kind
@@ -507,7 +526,10 @@ fn insert_step(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.insert_step";
     let path = path_arg(p, cmd)?;
     if !solidcraft_io::is_step_path(path) {
-        return Err(bad(cmd, "only STEP, IGES, FreeCAD and Rhino files (.step, .stp, .igs, .iges, .fcstd, .3dm) can be inserted"));
+        return Err(bad(
+            cmd,
+            "only STEP, IGES, FreeCAD, Rhino, NX and Parasolid files (.step, .stp, .igs, .iges, .fcstd, .3dm, .prt, .x_t, .x_b) can be inserted",
+        ));
     }
     let options = step_options(p, cmd)?;
     let placement = match p.get("matrix") {
@@ -1089,6 +1111,7 @@ fn saved_preview(s: &Session) -> Option<solidcraft_io::DesignPreview> {
             return None;
         }
         preview.meshes.push(solidcraft_doc::MeshData {
+            appearance: None,
             name: body.name.clone(),
             positions: mesh.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
             triangles: mesh.triangles.iter().flatten().copied().collect(),
@@ -1196,6 +1219,11 @@ fn export_to(
         // The colours of the bodies go in a material library beside the mesh file.
         return export_obj(s, path, bodies, quality);
     }
+    if format != Format::Design
+        && s.world_state()?.bodies.iter().any(|b| (bodies.is_empty() || bodies.contains(&b.name)) && b.mesh_appearance.is_some())
+    {
+        return Err(bad(cmd, "this format cannot preserve scan colours and textures yet; use OBJ export or save the SolidCraft design"));
+    }
     if format == Format::Glb {
         return export_glb(s, cmd, path, bodies, quality);
     }
@@ -1208,6 +1236,8 @@ fn export_to(
         solidcraft_io::write_design(&s.design())
     } else if format == Format::Step && bodies.is_empty() && !s.doc.occurrences.is_empty() {
         solidcraft_io::step_assembly(&s.doc, &s.doc.painted(&s.model.state()), &name)?
+    } else if format == Format::ParasolidText && bodies.is_empty() && !s.doc.occurrences.is_empty() {
+        solidcraft_io::parasolid_assembly(&s.doc, &s.doc.painted(&s.model.state()), &s.doc.painted(&*s.world_state()?), &name)?
     } else {
         // Bodies carry the colour they are shown in (appearance, material or imported), and the
         // file the design's properties where the format has a place for them.
@@ -1282,6 +1312,32 @@ fn export_step(s: &mut Session, p: &Value) -> Result<Value> {
     export_to(s, cmd, path, Format::Step, &string_list(cmd, p, "bodies")?, &[], solidcraft_io::MeshQuality::default())
 }
 
+fn export_nx_assembly(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "file.export_nx_assembly";
+    let path = path_arg(p, cmd)?;
+    if std::path::Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("prt")) {
+        return Err(bad(cmd, "NX assembly exchange produces STEP (.step), not a native NX .prt file"));
+    }
+    export_to(s, cmd, path, Format::Step, &[], &[], solidcraft_io::MeshQuality::default())
+}
+
+fn export_parasolid(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "file.export_parasolid";
+    export_to(s, cmd, path_arg(p, cmd)?, Format::ParasolidText, &string_list(cmd, p, "bodies")?, &[], solidcraft_io::MeshQuality::default())
+}
+
+fn export_glb_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut params = p.clone();
+    params["format"] = json!("glb");
+    export(s, &params)
+}
+
+fn export_json(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut params = p.clone();
+    params["format"] = json!("json");
+    export(s, &params)
+}
+
 fn export_stl(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.export_stl";
     let path = path_arg(p, cmd)?;
@@ -1314,6 +1370,10 @@ fn export_obj(s: &Session, path: &str, bodies: &[String], quality: solidcraft_io
     let mtl_name = mtl_path.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| String::from("model.mtl"));
     let files = solidcraft_io::export_obj(&s.doc.painted(&*s.world_state()?), bodies, &mtl_name, quality)?;
     let mut targets: Vec<(String, &[u8])> = Vec::new();
+    let directory = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(""));
+    for (name, bytes) in &files.assets {
+        targets.push((directory.join(name).to_string_lossy().to_string(), bytes.as_ref()));
+    }
     if !files.mtl.is_empty() {
         targets.push((mtl_path.to_string_lossy().to_string(), files.mtl.as_bytes()));
     }
@@ -3136,4 +3196,27 @@ mod tests {
             assert!(params_of("file.save_as").contains(o.param), "`{}` is not a documented parameter of file.save_as", o.param);
         }
     }
+    #[test]
+    fn nx_assembly_exchange_preserves_names_and_rejects_native_extension() {
+        let mut session = Session::default();
+        for name in ["Export Part One", "Export Part Two"] {
+            session.execute("component.create", &json!({"name":name,"grounded":false})).unwrap();
+            session.execute("solid.box", &json!({"length":10,"width":8,"height":6})).unwrap();
+            if name == "Export Part One" {
+                session.execute("solid.box", &json!({"length":4,"width":4,"height":4,"corner":[20,0,0]})).unwrap();
+            }
+            session.execute("component.activate", &json!({"component":0})).unwrap();
+        }
+        let path = std::env::temp_dir().join(format!("solidcraft-nx-exchange-{}.step", std::process::id()));
+        session.execute("file.export_nx_assembly", &json!({"path":path.to_string_lossy()})).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Export Part One") && text.contains("Export Part Two"));
+        assert_eq!(text.matches("NEXT_ASSEMBLY_USAGE_OCCURRENCE").count(), 2);
+        assert_eq!(text.matches("MANIFOLD_SOLID_BREP").count(), 3);
+        let native = path.with_extension("prt");
+        assert!(session.execute("file.export_nx_assembly", &json!({"path":native.to_string_lossy()})).is_err());
+        assert!(!native.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
 }

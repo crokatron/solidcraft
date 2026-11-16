@@ -625,6 +625,14 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
         v.push(Item::sep());
     }
     if app.session.active_sketch.is_some() {
+        if app.tool.is_some() {
+            v.push(act("ui.sketchToolOk", app.tr_label("OK"), "finish"));
+            v.push(act("ui.sketchToolApply", app.tr_label("Apply"), "finish"));
+            v.push(act("ui.sketchToolCancel", app.tr_label("Cancel"), "sketch_cancel"));
+        }
+        if crate::sketch3d::drawing(app) {
+            v.push(act("ui.cycleSketchAxis", app.tr("ui.sketch3d.toggle_axis"), "axis").key("Ctrl"));
+        }
         v.extend(sketch_entity_items(app));
         v.push(Item::sep());
         v.push(cmd(app, "sketch.trim", "Trim"));
@@ -908,6 +916,11 @@ fn plane_items(app: &SolveApp, id: u64) -> Vec<Item> {
     let mut items = Vec::new();
     if matches!(f.kind, solidcraft_engine::doc::FeatureKind::ConstructionPlane { .. }) {
         items.push(cmd(app, "sketch.create", "Create Sketch").with(json!({ "plane": f.name })));
+        if matches!(f.kind, solidcraft_engine::doc::FeatureKind::ConstructionPlane { plane: solidcraft_engine::doc::PlaneRef::Custom { .. } })
+            && app.session.model.state().bodies.iter().any(|b| b.body.is_mesh())
+        {
+            items.push(act("ui.alignScanPlane", "Align Plane to CSYS", "align").with(json!({"feature":id})));
+        }
         items.push(Item::sep());
     }
     items.push(act("ui.editFeature", "Edit Feature", crate::timeline::icon_of(&f.kind)).with(json!({ "feature": id })));
@@ -1566,6 +1579,10 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         }
         "ui.finishSketch" => app.finish_sketch(),
         "ui.cancelSketch" => app.cancel_sketch(),
+        "ui.cycleSketchAxis" => crate::sketch3d::cycle_axis(app),
+        "ui.sketchToolOk" => crate::tools::confirm_tool(app, crate::ui_kit::Action::Ok),
+        "ui.sketchToolApply" => crate::tools::confirm_tool(app, crate::ui_kit::Action::Apply),
+        "ui.sketchToolCancel" => crate::tools::confirm_tool(app, crate::ui_kit::Action::Cancel),
         "ui.relinkSource" | "ui.relinkPlacement" => {
             if let Some(component) = id_of(&p, "component") {
                 crate::linked_source::start(app, component, id_of(&p, "occurrence"));
@@ -1698,7 +1715,7 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             let name = crate::export_name::offered(app, body, body.unwrap_or(&app.session.doc.name));
             app.pick_save_command(
                 &format!("{name}.step"),
-                &["step", "stp", "igs", "stl", "3mf", "obj", "glb"],
+                &["step", "stp", "igs", "x_t", "stl", "3mf", "obj", "glb"],
                 "file.export",
                 json!({"bodies": bodies}),
             );
@@ -1930,6 +1947,11 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             let keys = strs(&p, "keys");
             if !keys.is_empty() {
                 let _ = app.run("browser.visibility", json!({ "items": keys, "visible": show }));
+            }
+        }
+        "ui.alignScanPlane" => {
+            if let Some(id) = id_of(&p, "feature") {
+                crate::scan_alignment_ui::start_plane(app, id);
             }
         }
         "ui.editFeature" => {

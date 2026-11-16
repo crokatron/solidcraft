@@ -141,7 +141,13 @@ pub struct MatchOrder(pub Continuity);
 impl<'de> Deserialize<'de> for MatchOrder {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = Value::deserialize(d)?;
-        params::continuity("surface.match", Some(&v), "`order`", Construction::Match).map(MatchOrder).map_err(|e| match e {
+        (if v.as_str().is_some_and(|text| text.eq_ignore_ascii_case("g0")) {
+            Ok(Continuity::G0)
+        } else {
+            params::continuity("surface.match", Some(&v), "`order`", Construction::Match)
+        })
+        .map(MatchOrder)
+        .map_err(|e| match e {
             crate::EngineError::BadParams { msg, .. } => D::Error::custom(whole(msg)),
             other => D::Error::custom(whole(other.to_string())),
         })
@@ -156,7 +162,7 @@ impl JsonSchema for MatchOrder {
         true
     }
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        json_schema!({"type": "string", "pattern": "^[gG][123]$"})
+        json_schema!({"type": "string", "pattern": "^[gG][0123]$"})
     }
 }
 

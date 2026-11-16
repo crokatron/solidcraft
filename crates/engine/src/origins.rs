@@ -3,7 +3,9 @@
 use solidcore_record::{Plane, Vec3};
 use solidcraft_doc::construct::{ConstructGeom, DatumItem, DatumRef};
 
-use crate::Session;
+use crate::{Result, Session};
+use solidcraft_doc::{IDENTITY, Mat, mat_inverse, mat_mul};
+use solidcraft_geom::prelude::*;
 
 pub const ITEMS: [&str; 7] = ["O", "X", "Y", "Z", "XY", "XZ", "YZ"];
 pub const MAX_SHOWN: usize = 10_000;
@@ -93,5 +95,123 @@ impl Session {
             }
         }
         out
+    }
+}
+
+/// A complete coordinate frame, resolved in world space at the current placement.
+/// Keys identify references; matrices are snapshots, not constraints or saved datums.
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct CoordinateFrame {
+    pub key: String,
+    pub label: String,
+    /// Column-major affine matrix: X, Y, Z axes and origin.
+    pub matrix: Mat,
+}
+
+/// A rigid delta that carries every axis and the origin of `source` onto `target`.
+/// Unlike normal-only alignment this preserves the specified roll about Z.
+pub fn frame_delta(source: &Mat, target: &Mat) -> Result<Mat> {
+    let fail = || crate::EngineError::Other("Coordinate systems must have finite origins and orthonormal right-handed axes.".into());
+    if !solidcraft_doc::is_placement(source) || !solidcraft_doc::is_placement(target) {
+        return Err(fail());
+    }
+    let inverse = mat_inverse(source).ok_or_else(fail)?;
+    let delta = mat_mul(target, &inverse);
+    if !solidcraft_doc::is_placement(&delta) {
+        return Err(fail());
+    }
+    Ok(delta)
+}
+
+fn plane_frame(plane: Plane) -> Mat {
+    let z = plane.normal();
+    [
+        [plane.x.x, plane.x.y, plane.x.z, 0.],
+        [plane.y.x, plane.y.y, plane.y.z, 0.],
+        [z.x, z.y, z.z, 0.],
+        [plane.origin.x, plane.origin.y, plane.origin.z, 1.],
+    ]
+}
+
+impl Session {
+    /// Full world, component-origin, named-origin and construction-plane coordinate systems.
+    /// Includes pending occurrence placements, without changing the document or the undo stack.
+    pub fn coordinate_frames(&self) -> Vec<CoordinateFrame> {
+        let mut out = vec![CoordinateFrame { key: "world".into(), label: "World CSYS".into(), matrix: IDENTITY }];
+        let doc = self.placed_document();
+        let state = self.model.state();
+        let mut planes = std::collections::BTreeMap::<u64, Vec<_>>::new();
+        for construct in &state.construct {
+            let ConstructGeom::Plane(plane) = construct.geom else { continue };
+            let Some(feature) = doc.feature(construct.feature) else { continue };
+            if feature.suppressed {
+                continue;
+            }
+            planes.entry(feature.component).or_default().push((construct, plane));
+        }
+        let mut named = std::collections::BTreeMap::<u64, Vec<_>>::new();
+        for entry in &doc.assembly.origins {
+            if let Ok(local) = solidcraft_doc::joints::resolve_origin(&doc, &state, &entry.origin) {
+                named.entry(entry.origin.occurrence).or_default().push((entry, local));
+            }
+        }
+        let occurrences: std::collections::BTreeMap<_, _> = doc.occurrences.iter().map(|o| (o.id, o)).collect();
+        for (component, path, world) in doc.placements() {
+            if out.len() >= MAX_SHOWN {
+                break;
+            }
+            let suffix = path.iter().filter_map(|id| occurrences.get(id).map(|o| o.name.as_str())).collect::<Vec<_>>().join(" / ");
+            if component != 0 {
+                out.push(CoordinateFrame { key: folder(&path), label: format!("{suffix} - Origin CSYS"), matrix: world });
+            }
+            let path_key = if path.is_empty() { "root".into() } else { path.iter().map(u64::to_string).collect::<Vec<_>>().join("/") };
+            for (entry, local) in named.get(&path.last().copied().unwrap_or(0)).into_iter().flatten() {
+                if out.len() >= MAX_SHOWN {
+                    break;
+                }
+                let matrix = mat_mul(&world, local);
+                if !solidcraft_doc::is_placement(&matrix) {
+                    continue;
+                }
+                out.push(CoordinateFrame {
+                    key: format!("joint:{}:{path_key}", entry.name),
+                    label: if suffix.is_empty() { format!("{} - Named CSYS", entry.name) } else { format!("{suffix} / {} - Named CSYS", entry.name) },
+                    matrix,
+                });
+            }
+            for (construct, plane) in planes.get(&component).into_iter().flatten() {
+                if out.len() >= MAX_SHOWN {
+                    break;
+                }
+                let matrix = mat_mul(&world, &plane_frame(*plane));
+                if !solidcraft_doc::is_placement(&matrix) {
+                    continue;
+                }
+                let path_key = if path.is_empty() { "root".into() } else { path.iter().map(u64::to_string).collect::<Vec<_>>().join("/") };
+                out.push(CoordinateFrame {
+                    key: format!("plane:{}:{path_key}", construct.feature),
+                    label: if suffix.is_empty() {
+                        format!("{} - Plane CSYS", construct.name)
+                    } else {
+                        format!("{suffix} / {} - Plane CSYS", construct.name)
+                    },
+                    matrix,
+                });
+            }
+        }
+        out
+    }
+
+    /// Resolve a previously chosen frame again; missing/suppressed/deleted references fail
+    /// instead of silently falling back to the world coordinate system.
+    pub fn coordinate_frame(&self, key: &str) -> Result<Mat> {
+        if key.len() > 2048 {
+            return Err(crate::EngineError::Other("Coordinate system reference is too long.".into()));
+        }
+        self.coordinate_frames()
+            .into_iter()
+            .find(|frame| frame.key == key)
+            .map(|frame| frame.matrix)
+            .ok_or_else(|| crate::EngineError::Other("The selected coordinate system is no longer available. Select it again.".into()))
     }
 }

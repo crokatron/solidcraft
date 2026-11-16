@@ -45,6 +45,7 @@ mod fill;
 mod fillet_setback_tests;
 mod freeform;
 pub mod fuzz;
+pub mod geometry_snap;
 mod heal;
 mod helix;
 pub mod history;
@@ -117,6 +118,8 @@ pub mod profile;
 pub mod provenance;
 mod record;
 mod repair;
+pub mod scan_surface_fit;
+pub mod scan_symmetry;
 #[cfg(test)]
 mod seam_faces_tests;
 mod sew;
@@ -433,3 +436,6 @@ mod tests;
 
 #[cfg(test)]
 mod trimmed_face_mesh_tests;
+
+mod match_trimmed;
+pub use match_trimmed::{matched_trimmed,MatchReport};

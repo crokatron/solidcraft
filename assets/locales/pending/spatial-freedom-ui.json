@@ -1,0 +1,9 @@
+{
+  "en": {
+    "ui.spatial_freedom_remaining": "{count} degrees of freedom remaining",
+    "ui.spatial_motion_fixed": "Fixed point",
+    "ui.spatial_motion_free": "Local motion directions; connected geometry may move too",
+    "ui.spatial_motion_tip": "Free points are shown in the free-point colour. Select a point to see its permitted local motion directions. These are infinitesimal directions; connected geometry may move together.",
+    "ui.spatial_motion_unknown": "Motion analysis unavailable for this sketch"
+  }
+}

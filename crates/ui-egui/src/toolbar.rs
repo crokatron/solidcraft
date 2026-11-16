@@ -238,6 +238,7 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
                     action("save", "save", &save_tip, shown, false),
                     action("undo", "undo", &undo_tip, shown, true),
                     action("redo", "redo", &redo_tip, shown, true),
+                    action("notifications", "list", app.tr("notifications.title"), true, false),
                 ],
                 quick,
                 help: app_bar::BarButton { id: "help", icon: "help", tip: app.tr("ui.help"), enabled: true, narrow: false, wide_only: false },
@@ -274,6 +275,7 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
                         "save" => save(app),
                         "undo" => FileAction::Undo.run(app),
                         "redo" => FileAction::Redo.run(app),
+                        "notifications" => app.messages.open = !app.messages.open,
                         "settings" => crate::prefs::open_at(app, 0),
                         _ => {}
                     },
@@ -481,7 +483,9 @@ fn file_rows(app: &SolveApp) -> Vec<app_bar::FileRow> {
     rows.push(row("file.export_stl", app.tr_label("Export STL…"), &key("file.export_stl"), "mesh_export", shown));
     rows.push(row("file.export_3mf", app.tr_label("Export 3MF…"), &key("file.export_3mf"), "mesh_export", shown));
     rows.push(row("file.send_to_slicer", app.tr("cmd.file_send_to_slicer"), "", "mesh_export", shown && crate::dialogs_save_mesh::available(app)));
+    rows.push(row("file.export_nx_assembly", app.tr_label("NX Assembly (STEP)"), &key("file.export_nx_assembly"), "export", shown));
     rows.push(row("file.export_step", app.tr_label("Export STEP…"), &key("file.export_step"), "export", shown));
+    rows.push(row("file.export_parasolid", app.tr("ui.export_parasolid"), &key("file.export_parasolid"), "export", shown));
     rows.push(row("file.export_view_dxf", app.tr_label("Export Current View as DXF…"), "", "export", shown));
     rows.push(row("file.export_obj", app.tr_label("Export OBJ…"), &key("file.export_obj"), "export", shown));
     rows.push(row("export_glb", &format!("{}…", app.tr("ui.export_glb")), "", "export", shown));
@@ -518,6 +522,7 @@ fn run_file_row(app: &mut SolveApp, id: &str) {
         "file.export_stl" => FileAction::Command("file.export_stl").run(app),
         "file.export_3mf" => FileAction::Command("file.export_3mf").run(app),
         "file.export_step" => FileAction::Command("file.export_step").run(app),
+        "file.export_nx_assembly" => FileAction::Command("file.export_nx_assembly").run(app),
         "file.export_view_dxf" => FileAction::Command("file.export_view_dxf").run(app),
         "file.export_obj" => FileAction::Command("file.export_obj").run(app),
         "file.export_urdf" => FileAction::Command("file.export_urdf").run(app),
@@ -533,6 +538,7 @@ fn run_file_row(app: &mut SolveApp, id: &str) {
             }
         }
         "export_glb" => FileAction::Export("glb").run(app),
+        "file.export_parasolid" => FileAction::Command("file.export_parasolid").run(app),
         "export_json" => FileAction::Export("json").run(app),
         "install" => {
             if let Some(offer) = crate::install::offered(app) {
@@ -629,7 +635,10 @@ pub(crate) fn export(app: &mut SolveApp, ext: &str) {
 /// open the mesh dialog with the format chosen. `false`: `id` is no such command.
 pub(crate) fn start_export(app: &mut SolveApp, id: &str) -> bool {
     let (extension, mesh) = match id {
-        "file.export_step" => ("step", false),
+        "file.export_step" | "file.export_nx_assembly" => ("step", false),
+        "file.export_parasolid" => ("x_t", false),
+        "file.export_glb" => ("glb", false),
+        "file.export_json" => ("json", false),
         "file.export_obj" => ("obj", false),
         "file.export_urdf" => ("urdf", false),
         "file.export_stl" => ("stl", true),
@@ -642,6 +651,13 @@ pub(crate) fn start_export(app: &mut SolveApp, id: &str) -> bool {
     }
     if mesh {
         crate::dialogs_save_mesh::start_with_format(app, extension);
+    } else if id == "file.export_nx_assembly" {
+        let name = format!("{}.step", app.session.doc.name);
+        app.pick_save(&name, &["step", "stp"], |app, path| {
+            if let Some(path) = path {
+                let _ = app.run("file.export_nx_assembly", json!({"path":path}));
+            }
+        });
     } else {
         export(app, extension);
     }
@@ -659,9 +675,7 @@ fn export_as(app: &mut SolveApp, ext: &str, format: Option<&str>) {
         if let Some(format) = format {
             params["format"] = json!(format);
         }
-        if app.run("file.export", params).is_ok() {
-            app.set_status(format!("Exported {path}"), false);
-        }
+        let _ = app.run("file.export", params);
     });
 }
 
@@ -776,7 +790,6 @@ pub(crate) fn contextual_tab(app: &SolveApp, tab: &str) -> bool {
 fn tab_aliases(tab: &str) -> &'static [&'static str] {
     match tab {
         "MODEL" => &["SOLID", "PLASTIC"],
-        "SURFACE" => &["MESH"],
         "MANAGE" => &["UTILITIES"],
         _ => &[],
     }
@@ -2337,6 +2350,22 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
     }
     for (k, repeat, mods) in keys {
         use egui::Key;
+        if matches!(k, Key::Delete | Key::Backspace)
+            && app.dialog.as_ref().is_some_and(|d| {
+                crate::dialogs::is_facet_lasso(d)
+                    || matches!(d.kind, crate::dialogs::Kind::MeshEdit { command: "pointcloud.copy_snippet" | "mesh.copy_facet_cloud", .. })
+            })
+        {
+            if k == Key::Delete
+                && !repeat
+                && mods == egui::Modifiers::NONE
+                && !ctx.egui_wants_keyboard_input()
+                && ctx.pointer_latest_pos().is_some_and(|p| app.viewport.rect.is_some_and(|r| r.contains(p)) && !crate::shell::covered(app, p))
+            {
+                crate::dialogs::delete_lasso_selection(app);
+            }
+            continue;
+        }
         // Only Esc pressed twice in a row finishes a sketch: any other key in between resets it.
         if k != Key::Escape {
             app.last_escape = None;

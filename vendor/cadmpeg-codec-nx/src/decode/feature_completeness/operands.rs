@@ -1,0 +1,462 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Operand and selection completeness predicates.
+
+use super::positive_feature_length;
+use cadmpeg_ir::{
+    features::{
+        holes::HoleKind,
+        patterns::{PatternKind, PatternTransform},
+        AngularTermination, BodySelection, BooleanOp, EdgeSelection, ExtrudeExtent, ExtrudeStart,
+        FaceSelection, FeatureId, LinearTermination, LoftPointSection, LoftSection, PathRef,
+        PlanarProfileRef, ProfileRef, RevolveConstruction, RevolveExtent, RibConstruction,
+        RibDraft, SweepMode, SweepOrientation, VertexSelection,
+    },
+    scalar::Length,
+};
+
+pub(super) fn hole_feature_is_incomplete(
+    profile: Option<&PlanarProfileRef>,
+    face: Option<&FaceSelection>,
+    placements: Option<&[cadmpeg_ir::features::holes::HolePlacement]>,
+    treatments: (&HoleKind, Option<&HoleKind>),
+    diameter: Option<Length>,
+    extent: Option<&LinearTermination>,
+) -> bool {
+    let (kind, exit_kind) = treatments;
+    let profile_incomplete = profile.is_some_and(planar_profile_ref_is_incomplete);
+    let face_incomplete = face.is_some_and(face_selection_is_incomplete);
+    let axis_is_direction_invariant = matches!(extent, Some(LinearTermination::ThroughAll {}))
+        && exit_kind.is_none_or(|exit| exit == kind);
+    let placements_complete = placements.is_some_and(|placements| {
+        !placements.is_empty()
+            && !placements
+                .iter()
+                .enumerate()
+                .any(|(index, placement)| placements[index + 1..].contains(placement))
+            && placements.iter().all(|placement| match placement {
+                cadmpeg_ir::features::holes::HolePlacement::Directed { .. } => true,
+                cadmpeg_ir::features::holes::HolePlacement::Axis { .. } => {
+                    axis_is_direction_invariant
+                }
+            })
+    });
+    let placements_incomplete = placements.is_some() && !placements_complete;
+    let location_unresolved =
+        !placements_complete && profile.is_none_or(planar_profile_ref_is_incomplete);
+    let orientation_unresolved =
+        !placements_complete && face.is_none_or(face_selection_is_incomplete);
+    profile_incomplete
+        || face_incomplete
+        || placements_incomplete
+        || location_unresolved
+        || orientation_unresolved
+        || hole_kind_is_incomplete(kind, diameter)
+        || exit_kind.is_some_and(|kind| hole_kind_is_incomplete(kind, diameter))
+        || diameter.is_none_or(|diameter| !positive_feature_length(diameter))
+        || extent.is_none_or(termination_is_incomplete)
+}
+
+fn hole_kind_is_incomplete(kind: &HoleKind, bore_diameter: Option<Length>) -> bool {
+    let treatment_diameter_is_incomplete = |diameter: cadmpeg_ir::scalar::PositiveLength| {
+        bore_diameter.is_none_or(|bore| diameter.get() <= bore.get())
+    };
+    match kind {
+        HoleKind::Unresolved(_)
+        | HoleKind::PartialCounterbore(..)
+        | HoleKind::PartialCountersink(..) => true,
+        HoleKind::Simple => false,
+        HoleKind::Chamfer { diameter, .. } | HoleKind::Countersink { diameter, .. } => {
+            treatment_diameter_is_incomplete(*diameter)
+        }
+        HoleKind::SimpleDrilled { .. } => false,
+        HoleKind::Counterbore { diameter, .. } => treatment_diameter_is_incomplete(*diameter),
+        HoleKind::CounterboreDrilled { diameter, .. } => {
+            treatment_diameter_is_incomplete(*diameter)
+        }
+        HoleKind::Counterdrill { diameters, .. } => {
+            treatment_diameter_is_incomplete(diameters.diameter())
+        }
+    }
+}
+
+pub(super) fn extrude_extent_is_incomplete(
+    extent: &ExtrudeExtent,
+    dependencies: &[FeatureId],
+) -> bool {
+    let side_is_incomplete = |side: &cadmpeg_ir::features::ExtrudeSide| {
+        termination_is_incomplete(&side.termination)
+            || termination_dependency_is_incomplete(&side.termination, dependencies)
+    };
+    match extent {
+        ExtrudeExtent::OneSided { side } | ExtrudeExtent::Symmetric { side } => {
+            side_is_incomplete(side)
+        }
+        ExtrudeExtent::TwoSided { first, second } => {
+            side_is_incomplete(first) || side_is_incomplete(second)
+        }
+    }
+}
+
+pub(super) fn extrude_start_is_incomplete(start: &ExtrudeStart) -> bool {
+    match start {
+        ExtrudeStart::Unresolved {} => true,
+        ExtrudeStart::FromFace { face, .. } => face_selection_is_incomplete(face),
+        ExtrudeStart::OffsetProfilePlane { .. }
+        | ExtrudeStart::ProfilePlane {}
+        | ExtrudeStart::FromPlane { .. } => false,
+    }
+}
+
+pub(super) fn revolve_feature_is_incomplete(
+    construction: &RevolveConstruction,
+    op: BooleanOp,
+    dependencies: &[FeatureId],
+) -> bool {
+    let RevolveConstruction::Resolved {
+        profile,
+        axis,
+        extent,
+        solid,
+        ..
+    } = construction
+    else {
+        return true;
+    };
+    planar_profile_ref_is_incomplete(profile)
+        || planar_profile_dependency_is_incomplete(profile, dependencies)
+        || {
+            let side_is_incomplete = |termination: &AngularTermination| {
+                angular_termination_is_incomplete(termination)
+                    || angular_termination_dependency_is_incomplete(termination, dependencies)
+            };
+            match extent {
+                RevolveExtent::OneSided { termination }
+                | RevolveExtent::Symmetric { termination } => side_is_incomplete(termination),
+                RevolveExtent::TwoSided { first, second } => {
+                    side_is_incomplete(first) || side_is_incomplete(second)
+                }
+            }
+        }
+        || axis.reference.as_ref().is_some_and(path_ref_is_incomplete)
+        || solid.is_none()
+        || matches!(op, BooleanOp::Unresolved)
+}
+
+pub(super) fn termination_is_incomplete(termination: &LinearTermination) -> bool {
+    match termination {
+        LinearTermination::Unresolved {} => true,
+        LinearTermination::ToFace { face, .. } => face_selection_is_incomplete(face),
+        LinearTermination::ToVertex { vertex } => match vertex {
+            VertexSelection::Generated { .. } => false,
+            VertexSelection::Historical {
+                state,
+                vertex,
+                native,
+            } => {
+                state.as_str().trim().is_empty()
+                    || vertex.as_str().trim().is_empty()
+                    || native.as_str().trim().is_empty()
+            }
+            VertexSelection::Unresolved | VertexSelection::Native(_) => true,
+        },
+        LinearTermination::OffsetFromFace { face, .. } => face_selection_is_incomplete(face),
+        LinearTermination::ToShape { target } => face_selection_is_incomplete(target),
+        LinearTermination::Blind { .. } => false,
+        LinearTermination::ThroughAll {}
+        | LinearTermination::ThroughNext {}
+        | LinearTermination::ToFirst {}
+        | LinearTermination::ToLast {}
+        | LinearTermination::ToPlane { .. } => false,
+    }
+}
+
+pub(super) fn termination_dependency_is_incomplete(
+    termination: &LinearTermination,
+    dependencies: &[FeatureId],
+) -> bool {
+    matches!(
+        termination,
+        LinearTermination::ToVertex {
+            vertex: VertexSelection::Generated { vertex, .. },
+        } if !dependencies.contains(&vertex.feature)
+    )
+}
+
+fn angular_termination_is_incomplete(termination: &AngularTermination) -> bool {
+    match termination {
+        AngularTermination::Unresolved {} => true,
+        AngularTermination::ToFace { face, .. } => face_selection_is_incomplete(face),
+        AngularTermination::ToVertex { vertex } => match vertex {
+            VertexSelection::Generated { .. } => false,
+            VertexSelection::Historical {
+                state,
+                vertex,
+                native,
+            } => {
+                state.as_str().trim().is_empty()
+                    || vertex.as_str().trim().is_empty()
+                    || native.as_str().trim().is_empty()
+            }
+            VertexSelection::Unresolved | VertexSelection::Native(_) => true,
+        },
+        AngularTermination::OffsetFromFace { face, .. } => face_selection_is_incomplete(face),
+        AngularTermination::ToShape { target } => face_selection_is_incomplete(target),
+        AngularTermination::Angle { .. } => false,
+        AngularTermination::ThroughAll {}
+        | AngularTermination::ThroughNext {}
+        | AngularTermination::ToFirst {}
+        | AngularTermination::ToLast {} => false,
+    }
+}
+
+fn angular_termination_dependency_is_incomplete(
+    termination: &AngularTermination,
+    dependencies: &[FeatureId],
+) -> bool {
+    matches!(
+        termination,
+        AngularTermination::ToVertex {
+            vertex: VertexSelection::Generated { vertex, .. },
+        } if !dependencies.contains(&vertex.feature)
+    )
+}
+
+pub(super) fn rib_feature_is_incomplete(construction: &RibConstruction, op: BooleanOp) -> bool {
+    construction
+        .profile
+        .as_ref()
+        .is_none_or(planar_profile_ref_is_incomplete)
+        || construction.direction.is_none()
+        || construction.thickness.is_none()
+        || construction.side.is_none()
+        || matches!(construction.draft, RibDraft::Unresolved)
+        || matches!(op, BooleanOp::Unresolved)
+}
+
+pub(super) fn sweep_mode_is_incomplete(mode: SweepMode) -> bool {
+    match mode {
+        SweepMode::Unresolved {} => true,
+        SweepMode::Solid {
+            op: cadmpeg_ir::features::SolidSweepOperation::NewBody,
+        }
+        | SweepMode::Solid { .. }
+        | SweepMode::Surface {} => false,
+    }
+}
+
+pub(super) fn sweep_orientation_is_incomplete(orientation: &SweepOrientation) -> bool {
+    match orientation {
+        SweepOrientation::Auxiliary { path, .. } => path_ref_is_incomplete(path),
+        SweepOrientation::GuideSurface { faces } => face_selection_is_incomplete(faces),
+        SweepOrientation::Binormal { .. } => false,
+        SweepOrientation::CorrectedFrenet {}
+        | SweepOrientation::Fixed {}
+        | SweepOrientation::Frenet {} => false,
+    }
+}
+
+pub(super) fn pattern_is_incomplete<C: cadmpeg_ir::features::patterns::CompositeStages>(
+    pattern: &PatternKind<C>,
+) -> bool {
+    match pattern.definition() {
+        PatternTransform::Unresolved { .. } => true,
+        PatternTransform::Linear {
+            direction,
+            count,
+            second,
+            ..
+        } => {
+            direction.is_none()
+                || u64::from(*count) * u64::from(second.as_ref().map_or(1, |axis| axis.count)) < 2
+        }
+        PatternTransform::LinearOffsets { direction, offsets } => {
+            direction.is_none() || offsets.len() < 2
+        }
+        PatternTransform::Circular { count, .. } => *count < 2,
+        PatternTransform::CircularAngles { angles, .. } => angles.len() < 2,
+        PatternTransform::Mirror { .. } => false,
+        PatternTransform::MirrorReference { .. } => true,
+        PatternTransform::CurveDriven { path, count, .. } => {
+            path.as_ref().is_none_or(path_ref_is_incomplete) || *count < 2
+        }
+        PatternTransform::Scale { center, .. } => {
+            matches!(
+                center,
+                cadmpeg_ir::features::patterns::PatternScaleCenter::Native(_)
+            )
+        }
+        PatternTransform::Composite { stages } => stages
+            .stages()
+            .iter()
+            .any(|stage| pattern_is_incomplete(&stage.pattern)),
+    }
+}
+
+pub(crate) fn pattern_feature_is_incomplete(
+    seeds: &[cadmpeg_ir::features::patterns::PatternSeed],
+    pattern: &PatternKind,
+    dependencies: &[cadmpeg_ir::features::FeatureId],
+) -> bool {
+    seeds.is_empty()
+        || seeds.iter().any(|seed| match seed {
+            cadmpeg_ir::features::patterns::PatternSeed::Feature(feature) => {
+                !dependencies.contains(feature)
+            }
+            cadmpeg_ir::features::patterns::PatternSeed::Faces(faces) => {
+                face_selection_is_incomplete(faces)
+            }
+            cadmpeg_ir::features::patterns::PatternSeed::Bodies(bodies) => {
+                body_selection_is_incomplete(bodies)
+            }
+            cadmpeg_ir::features::patterns::PatternSeed::Occurrences(occurrences) => {
+                occurrences.is_empty()
+            }
+        })
+        || seeds
+            .iter()
+            .enumerate()
+            .any(|(index, seed)| seeds[..index].contains(seed))
+        || pattern_is_incomplete(pattern)
+}
+
+pub(crate) fn body_selection_is_incomplete(selection: &BodySelection) -> bool {
+    match selection {
+        BodySelection::Bodies(bodies) | BodySelection::Resolved { bodies, .. } => {
+            selection_ids_are_incomplete(bodies)
+        }
+        BodySelection::ResolvedSet { .. } => false,
+        BodySelection::Local { bodies, native } => {
+            native.trim().is_empty()
+                || selection_ids_are_incomplete(bodies)
+                || bodies.iter().any(|body| body.trim().is_empty())
+        }
+        BodySelection::Unresolved
+        | BodySelection::Historical { .. }
+        | BodySelection::HistoricalSet { .. }
+        | BodySelection::Generated { .. }
+        | BodySelection::Native(_)
+        | BodySelection::NativeSet(_) => true,
+    }
+}
+
+pub(in crate::decode) fn face_selection_is_incomplete(selection: &FaceSelection) -> bool {
+    match selection {
+        FaceSelection::Unresolved
+        | FaceSelection::Generated { .. }
+        | FaceSelection::Native(_)
+        | FaceSelection::Historical { .. }
+        | FaceSelection::HistoricalPartial { .. } => true,
+        FaceSelection::Faces(faces) | FaceSelection::Resolved { faces, .. } => {
+            selection_ids_are_incomplete(faces)
+        }
+    }
+}
+
+pub(super) fn edge_selection_is_incomplete(selection: &EdgeSelection) -> bool {
+    match selection {
+        EdgeSelection::Unresolved
+        | EdgeSelection::Generated { .. }
+        | EdgeSelection::Native(_)
+        | EdgeSelection::Historical { .. }
+        | EdgeSelection::HistoricalPartial { .. } => true,
+        EdgeSelection::All => false,
+        EdgeSelection::Edges(edges) | EdgeSelection::Resolved { edges, .. } => {
+            selection_ids_are_incomplete(edges)
+        }
+    }
+}
+
+pub(super) fn profile_ref_is_incomplete(profile: &ProfileRef) -> bool {
+    match profile {
+        ProfileRef::SpatialSketchSelection { .. } => true,
+        ProfileRef::SpatialSketchProfiles { .. } => false,
+        ProfileRef::Planar(planar) => planar_profile_ref_is_incomplete(planar),
+    }
+}
+
+pub(super) fn planar_profile_ref_is_incomplete(profile: &PlanarProfileRef) -> bool {
+    match profile {
+        PlanarProfileRef::Unresolved(_)
+        | PlanarProfileRef::Native(_)
+        | PlanarProfileRef::SketchSelection { .. } => true,
+        PlanarProfileRef::Sketch(_)
+        | PlanarProfileRef::SketchEntities { .. }
+        | PlanarProfileRef::SketchProfiles { .. }
+        | PlanarProfileRef::SketchRegions { .. }
+        | PlanarProfileRef::HistoricalFaces { .. }
+        | PlanarProfileRef::Feature(_) => false,
+        PlanarProfileRef::Generated { curves, .. } => curves
+            .iter()
+            .enumerate()
+            .any(|(index, curve)| curves[..index].contains(curve)),
+        PlanarProfileRef::Faces(faces) => selection_ids_are_incomplete(faces),
+    }
+}
+
+pub(super) fn profile_dependency_is_incomplete(
+    profile: &ProfileRef,
+    dependencies: &[FeatureId],
+) -> bool {
+    match profile {
+        ProfileRef::Planar(planar) => planar_profile_dependency_is_incomplete(planar, dependencies),
+        ProfileRef::SpatialSketchProfiles { .. } | ProfileRef::SpatialSketchSelection { .. } => {
+            false
+        }
+    }
+}
+
+pub(super) fn planar_profile_dependency_is_incomplete(
+    profile: &PlanarProfileRef,
+    dependencies: &[FeatureId],
+) -> bool {
+    match profile {
+        PlanarProfileRef::Feature(feature) => !dependencies.contains(feature),
+        PlanarProfileRef::Generated { curves, .. } => curves
+            .iter()
+            .any(|curve| !dependencies.contains(&curve.feature)),
+        _ => false,
+    }
+}
+
+pub(super) fn loft_section_is_incomplete(section: &LoftSection) -> bool {
+    match section {
+        LoftSection::Profile(profile) => profile_ref_is_incomplete(profile),
+        LoftSection::Point(LoftPointSection::Native(_)) => true,
+        LoftSection::Point(LoftPointSection::Point(_)) => false,
+        LoftSection::Point(LoftPointSection::Vertex(_)) => false,
+    }
+}
+
+fn selection_ids_are_incomplete<T: Ord>(ids: &[T]) -> bool {
+    ids.is_empty()
+        || ids
+            .iter()
+            .enumerate()
+            .any(|(index, id)| ids[..index].contains(id))
+}
+
+pub(in crate::decode) fn path_ref_is_incomplete(path: &PathRef) -> bool {
+    match path {
+        PathRef::Unresolved(_) | PathRef::Native(_) | PathRef::SpatialSketchSelection { .. } => {
+            true
+        }
+        PathRef::HistoricalEdges { .. } => false,
+        PathRef::Sketch(_) => false,
+        PathRef::SketchCurves { .. } => false,
+        PathRef::SpatialSketchCurves { .. } => false,
+        PathRef::Edges(edges) => selection_ids_are_incomplete(edges),
+        PathRef::Curves(curves) => selection_ids_are_incomplete(curves),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selection_ids_are_incomplete;
+
+    #[test]
+    fn selection_completeness_detects_nonadjacent_duplicate_ids() {
+        assert!(selection_ids_are_incomplete::<u32>(&[]));
+        assert!(!selection_ids_are_incomplete(&[2, 1, 3]));
+        assert!(selection_ids_are_incomplete(&[2, 1, 2]));
+    }
+}

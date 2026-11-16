@@ -868,6 +868,7 @@ fn mesh_and_solid_body_rows_have_different_icons_and_tooltips() {
                 triangles: mesh.triangles.iter().flatten().copied().collect(),
                 color: None,
                 corner_normals: Default::default(),
+                appearance: None,
             }],
         },
         Some("Imported mesh"),

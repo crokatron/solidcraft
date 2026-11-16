@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Sketch-marker lane decode, write-back, and native-validation tests.
+#![allow(clippy::unwrap_used)]
+
+use cadmpeg_test_support::EditableDecodeResult;
+
+use std::io::Cursor;
+
+use cadmpeg_ir::codec::{Codec, DecodeOptions};
+
+use crate::test_support::container::make_block;
+use crate::test_support::container::sldprt_with_body;
+use crate::test_support::history::resolved_features_payload_with_names;
+use crate::test_support::history::sldprt_with_body_and_resolved_features;
+use crate::test_support::native::sldprt_native;
+use crate::test_support::native::update_sldprt_native;
+use crate::test_support::parasolid::triangle_body;
+use crate::SldprtCodec;
+
+#[test]
+fn decode_uses_operand_tag_to_disambiguate_marker_kind() {
+    let mut source = sldprt_with_body(&triangle_body());
+    source.extend(make_block(
+        0x42,
+        "Contents/Keywords",
+        br#"<Keywords><Sketch Name="Sketch1" Type="ProfileFeature"/></Keywords>"#,
+    ));
+    let mut payload = resolved_features_payload_with_names(&[0, 1, 2], &["Sketch1", "D1"]);
+    for offset in 0..payload.len().saturating_sub(1) {
+        if payload[offset..offset + 2] == [0xd6, 0x80] {
+            payload[offset..offset + 2].copy_from_slice(&0x837bu16.to_le_bytes());
+        }
+    }
+    let marker = [0xff, 0xff, 0x1f, 0x00, 0x03];
+    let first = payload
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("first marker");
+    payload[first + 88..first + 92].copy_from_slice(&2u32.to_le_bytes());
+    source.extend(make_block(
+        0x45,
+        "Contents/Config-0-ResolvedFeatures",
+        &payload,
+    ));
+
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let lane = &sldprt_native(decoded.ir()).feature_input_lanes[0];
+    let operand = &lane.scalars[0].operands[1];
+    assert_eq!(operand.entity_index, 2);
+    assert_eq!(
+        operand.entity_ref.as_deref(),
+        Some(lane.sketch_entities[0].id())
+    );
+}
+
+#[test]
+fn decode_resolves_each_marker_link_by_trailing_local_id() {
+    let mut source = sldprt_with_body(&triangle_body());
+    source.extend(make_block(
+        0x42,
+        "Contents/Keywords",
+        br#"<Keywords><Sketch Name="Sketch1" Type="ProfileFeature"/></Keywords>"#,
+    ));
+    let mut payload = resolved_features_payload_with_names(&[4, 1, 2], &["Sketch1", "D1"]);
+    let marker = [0xff, 0xff, 0x1f, 0x00, 0x03];
+    let offset = payload
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("first sketch marker");
+    payload[offset + 64..offset + 66].copy_from_slice(&2u16.to_le_bytes());
+    payload[offset + 66..offset + 68].copy_from_slice(&99u16.to_le_bytes());
+    payload[offset + 68..offset + 70].copy_from_slice(&1u16.to_le_bytes());
+    payload[offset + 70..offset + 72].fill(0);
+    payload[offset + 72..offset + 80].copy_from_slice(&(-1.0f64).to_le_bytes());
+    source.extend(make_block(
+        0x45,
+        "Contents/Config-0-ResolvedFeatures",
+        &payload,
+    ));
+
+    let decoded = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(&mut Cursor::new(source), &DecodeOptions::default())
+            .unwrap(),
+    );
+    let native = sldprt_native(decoded.ir());
+    let lane = &native.feature_input_lanes[0];
+    assert_eq!(
+        lane.sketch_entities
+            .iter()
+            .map(crate::records::SketchInputEntity::local_id)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(2), Some(3)]
+    );
+    assert_eq!(
+        lane.sketch_entities[0]
+            .links
+            .as_ref()
+            .map(crate::records::SketchInputLinks::selector),
+        Some(1)
+    );
+    assert_eq!(
+        lane.sketch_entities[0]
+            .links()
+            .iter()
+            .map(|link| (link.local_id, link.entity_ref.as_str()))
+            .collect::<Vec<_>>(),
+        [(2, lane.sketch_entities[1].id())]
+    );
+    crate::test_support::plan_inherited_write(
+        decoded.ir(),
+        decoded.source_fidelity(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn semantic_writer_rejects_edited_sketch_marker_local_id() {
+    let source = sldprt_with_body_and_resolved_features(&triangle_body(), &[0, 1]);
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let mut decoded = EditableDecodeResult::from(decoded);
+    update_sldprt_native(&mut decoded.ir_mut(), |native| {
+        native.feature_input_lanes[0].sketch_entities[0] =
+            native.feature_input_lanes[0].sketch_entities[0].with_test_identity(
+                native.feature_input_lanes[0].sketch_entities[0].object_index(),
+                Some(7),
+            );
+    });
+    assert!(crate::resolved_features::validate::validate_native(
+        &cadmpeg_test_support::service_decode_context(),
+        decoded.ir()
+    )
+    .unwrap()
+    .iter()
+    .any(|finding| finding.message.contains("local object id does not match")));
+
+    let error = crate::test_support::plan_inherited_write(
+        decoded.ir(),
+        decoded.source_fidelity(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("local object id does not match"));
+}
+
+#[test]
+fn semantic_writer_rejects_edited_sketch_marker_object_index() {
+    let source = sldprt_with_body_and_resolved_features(&triangle_body(), &[0, 1]);
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let mut decoded = EditableDecodeResult::from(decoded);
+    update_sldprt_native(&mut decoded.ir_mut(), |native| {
+        native.feature_input_lanes[0].sketch_entities[0] =
+            native.feature_input_lanes[0].sketch_entities[0].with_test_identity(
+                Some(77),
+                native.feature_input_lanes[0].sketch_entities[0].local_id(),
+            );
+    });
+    assert!(crate::resolved_features::validate::validate_native(
+        &cadmpeg_test_support::service_decode_context(),
+        decoded.ir()
+    )
+    .unwrap()
+    .iter()
+    .any(|finding| finding.message.contains("object index does not match")));
+
+    let error = crate::test_support::plan_inherited_write(
+        decoded.ir(),
+        decoded.source_fidelity(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("object index does not match"));
+}
+
+#[test]
+fn semantic_writer_rejects_incomplete_sketch_marker_lanes() {
+    let decoded = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body_and_resolved_features(
+                &triangle_body(),
+                &[0, 1, 2],
+            )),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+    let mut decoded = EditableDecodeResult::from(decoded);
+    update_sldprt_native(&mut decoded.ir_mut(), |native| {
+        native.feature_input_lanes[0].sketch_entities.remove(1);
+    });
+    decoded.source_fidelity_mut().annotations = cadmpeg_ir::Annotations::default();
+
+    let error = crate::test_support::plan_inherited_write(
+        decoded.ir(),
+        decoded.source_fidelity(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("expects entity ordinal 1, found 2"),
+        "{error}"
+    );
+}

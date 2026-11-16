@@ -29,11 +29,14 @@ pub fn word_cased(name: &str) -> String {
 /// A ribbon tab's name as the ribbon shows it, in the current language: "SHEET METAL" reads
 /// "Sheet Metal", or "Blech" in German. A partial catalog may translate only the word-cased name.
 pub fn tab_name(tab: &str) -> String {
+    if tab == "IMPORT / EXPORT" {
+        return solidcraft_ui_text::tr("ui.exchange_tab").to_string();
+    }
     let cased = word_cased(solidcraft_ui_text::tr_label(tab_label(tab)));
     solidcraft_ui_text::tr_label(&cased).to_string()
 }
 
-pub const TABS: &[&str] = &["MODEL", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "VIEW"];
+pub const TABS: &[&str] = &["MODEL", "SURFACE", "MESH", "ASSEMBLE", "INSERT", "IMPORT / EXPORT", "INSPECT", "MANAGE", "VIEW"];
 
 /// Every tab's exact registry name with its accent: the contextual and specialty tabs, and the
 /// legacy Render sub-tabs that still share the Render accent. Theme files key their per-tab
@@ -49,6 +52,7 @@ pub const TAB_ACCENTS: TabTable = TabTable::new(&[
     tab_style("WELDMENTS", AccentRamp::Main, None),
     tab_style("ASSEMBLE", AccentRamp::Main, None),
     tab_style("INSERT", AccentRamp::Main, None),
+    tab_style("IMPORT / EXPORT", AccentRamp::Main, None),
     tab_style("INSPECT", AccentRamp::Main, None),
     tab_style("MANAGE", AccentRamp::Main, None),
     tab_style("VIEW", AccentRamp::Main, None),
@@ -209,7 +213,7 @@ pub const SECTIONS: &[Section] = &[
         tab: "MODEL",
         panel: "SKETCH",
         promoted: 1,
-        ids: &["sketch.create", "sketch.edit", "sketch.line3d", "sketch.arc3d", "sketch.spline3d", "sketch.point3d"],
+        ids: &["sketch.create", "sketch.edit", "sketch.line3d", "sketch.arc3d", "sketch.spline3d", "sketch.point3d", "sketch.fillet3d"],
     },
     Section { tab: "MODEL", panel: "CREATE", promoted: 3, ids: &["solid.extrude", "solid.revolve", "solid.hole"] },
     Section {
@@ -239,6 +243,52 @@ pub const SECTIONS: &[Section] = &[
     Section { tab: "SURFACE", panel: "CREATE", promoted: 4, ids: &["surface.extrude", "surface.revolve", "surface.sweep", "surface.loft"] },
     Section { tab: "SURFACE", panel: "EDIT", promoted: 4, ids: &["surface.trim", "surface.untrim", "surface.extend", "surface.stitch"] },
     Section { tab: "SURFACE", panel: "CONVERT", promoted: 2, ids: &["surface.thicken", "mesh.convert"] },
+    Section { tab: "MESH", panel: "WORKFLOW", promoted: 1, ids: &["scan.workflow"] },
+    Section { tab: "MESH", panel: "VERTEX / EDGE", promoted: 3, ids: &["mesh.move_vertex", "mesh.split_edge", "mesh.flip_edge"] },
+    Section {
+        tab: "MESH",
+        panel: "FACES",
+        promoted: 3,
+        ids: &["mesh.delete_facets", "mesh.isolate_facets", "mesh.subdivide_face", "mesh.delete_face"],
+    },
+    Section { tab: "MESH", panel: "CLOUDS", promoted: 3, ids: &["mesh.copy_point_cloud", "mesh.copy_facet_cloud", "pointcloud.copy_snippet"] },
+    Section {
+        tab: "MESH",
+        panel: "REGIONS",
+        promoted: 5,
+        ids: &[
+            "mesh.auto_regions",
+            "mesh.isolate_region",
+            "mesh.delete_region",
+            "mesh.fit_surface",
+            "mesh.fit_region_plane",
+            "mesh.fit_region_cylinder",
+        ],
+    },
+    Section {
+        tab: "MESH",
+        panel: "ALIGNMENT",
+        promoted: 6,
+        ids: &[
+            "mesh.symmetry_plane",
+            "mesh.align_plane_to_csys",
+            "mesh.align_coarse",
+            "mesh.align_landmarks",
+            "mesh.align_datum",
+            "mesh.align_scans",
+            "mesh.compare_scans",
+        ],
+    },
+    Section { tab: "MESH", panel: "CUT", promoted: 3, ids: &["scan.live_slice", "mesh.auto_sections", "mesh.trim_plane", "mesh.section"] },
+    Section {
+        tab: "MESH",
+        panel: "REPAIR",
+        promoted: 3,
+        ids: &["mesh.heal_scan", "mesh.fill_holes", "mesh.inspect_topology", "mesh.orient_normals", "mesh.cleanup"],
+    },
+    Section { tab: "MESH", panel: "ISLANDS", promoted: 2, ids: &["mesh.delete_island", "mesh.remove_islands"] },
+    Section { tab: "MESH", panel: "REFINE", promoted: 2, ids: &["mesh.global_remesh", "mesh.smooth", "mesh.decimate"] },
+    Section { tab: "MESH", panel: "FILES", promoted: 3, ids: &["file.insert_mesh", "mesh.convert", "file.save_mesh"] },
     Section {
         tab: "ASSEMBLE",
         panel: "COMPONENTS",
@@ -287,6 +337,33 @@ pub const SECTIONS: &[Section] = &[
         ids: &["file.insert_step", "file.insert_mesh", "pointcloud.insert", "component.insert_design", "file.save_mesh", "file.send_to_slicer"],
     },
     Section { tab: "INSERT", panel: "IMAGES", promoted: 3, ids: &["canvas.insert", "canvas.decal", "canvas.edit"] },
+    Section {
+        tab: "IMPORT / EXPORT",
+        panel: "IMPORT",
+        promoted: 4,
+        ids: &[
+            "doc.open",
+            "file.insert_step",
+            "file.insert_mesh",
+            "pointcloud.insert",
+            "component.insert_design",
+            "sketch.insert_dxf",
+            "sketch.insert_svg",
+        ],
+    },
+    Section {
+        tab: "IMPORT / EXPORT",
+        panel: "CAD EXPORT",
+        promoted: 3,
+        ids: &["file.export_step", "file.export_parasolid", "file.export_nx_assembly"],
+    },
+    Section {
+        tab: "IMPORT / EXPORT",
+        panel: "MESH EXPORT",
+        promoted: 4,
+        ids: &["file.export_stl", "file.export_3mf", "file.export_obj", "file.export_glb", "file.save_mesh", "file.send_to_slicer"],
+    },
+    Section { tab: "IMPORT / EXPORT", panel: "DRAWING / DATA", promoted: 3, ids: &["file.export_view_dxf", "file.export_urdf", "file.export_json"] },
     Section { tab: "INSERT", panel: "2D", promoted: 2, ids: &["sketch.insert_dxf", "sketch.insert_svg"] },
     Section { tab: "INSERT", panel: "LIBRARY", promoted: 3, ids: &["parts.fastener", "parts.library", "parts.resize", "parts.insert"] },
     Section { tab: "INSERT", panel: "LINKS", promoted: 2, ids: &["component.update_links", "component.break_link"] },
@@ -372,8 +449,8 @@ pub const SECTIONS: &[Section] = &[
     Section {
         tab: "SKETCH",
         panel: "MODIFY",
-        promoted: 3,
-        ids: &["sketch.trim", "sketch.offset", "sketch.fillet", "sketch.transform", "sketch.copy", "sketch.cut", "sketch.paste"],
+        promoted: 4,
+        ids: &["sketch.trim", "sketch.offset", "sketch.fillet", "sketch.fillet3d", "sketch.transform", "sketch.copy", "sketch.cut", "sketch.paste"],
     },
     Section { tab: "SKETCH", panel: "PATTERN", promoted: 3, ids: &["sketch.mirror", "sketch.pattern.circular", "sketch.pattern.rectangular"] },
     Section {
@@ -533,6 +610,40 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("inspect.zebra", "Zebra"),
     ("joint.as_built", "As-Built"),
     ("material.assign", "Material"),
+    ("mesh.align_plane_to_csys", "Align Plane to CSYS"),
+    ("mesh.align_landmarks", "Landmark Align"),
+    ("mesh.align_datum", "Align to Datum"),
+    ("mesh.align_coarse", "Auto Align"),
+    ("mesh.align_scans", "Fine Align Scans"),
+    ("mesh.auto_regions", "Auto Regions"),
+    ("mesh.global_remesh", "Global Remesh"),
+    ("mesh.auto_sections", "Auto Sections"),
+    ("mesh.copy_point_cloud", "Copy to Point Cloud"),
+    ("mesh.copy_facet_cloud", "Copy Lasso Patch"),
+    ("pointcloud.copy_snippet", "Copy Cloud Snippet"),
+    ("mesh.cleanup", "Clean"),
+    ("mesh.compare_scans", "Compare Scans"),
+    ("mesh.convert", "Convert"),
+    ("mesh.decimate", "Decimate"),
+    ("mesh.delete_face", "Delete Face"),
+    ("mesh.delete_island", "Delete Island"),
+    ("mesh.delete_region", "Delete Region"),
+    ("mesh.fill_holes", "Fill Holes"),
+    ("mesh.fit_region_cylinder", "Fit Region Cylinder"),
+    ("mesh.fit_region_plane", "Fit Region Plane"),
+    ("mesh.fit_surface", "Fit Scan Surface"),
+    ("mesh.flip_edge", "Flip Edge"),
+    ("mesh.heal_scan", "Heal Scan"),
+    ("mesh.inspect_topology", "Inspect Mesh"),
+    ("mesh.isolate_region", "Isolate Region"),
+    ("mesh.move_vertex", "Move Vertex"),
+    ("mesh.orient_normals", "Orient Normals"),
+    ("mesh.remove_islands", "Remove Small"),
+    ("mesh.section", "Section Sketch"),
+    ("mesh.smooth", "Smooth"),
+    ("mesh.split_edge", "Split Edge"),
+    ("mesh.subdivide_face", "Subdivide"),
+    ("mesh.trim_plane", "Plane Trim"),
     ("occurrence.move", "Move"),
     ("parameters.change", "Parameters"),
     ("parameters.graph", "Param. Graph"),
@@ -623,6 +734,8 @@ pub fn destination(c: &CommandSpec) -> Option<(&'static str, &'static str)> {
 pub(crate) fn legacy_render_destination(c: &CommandSpec) -> Option<(&'static str, &'static str)> {
     // A few shared commands have a canonical home that differs from their first occurrence.
     let primary = match c.id {
+        "file.insert_mesh" | "file.save_mesh" => Some(("INSERT", "FILES")),
+        "mesh.convert" => Some(("MESH", "FILES")),
         "sheet.manage_rules" => Some(("MANAGE", "RULES")),
         "sheet.convert" => Some(("MODEL", "MODIFY")),
         "parameters.change" => Some(("MANAGE", "PARAMETERS")),
@@ -664,7 +777,9 @@ pub fn legacy_panel(tab: &str, panel: &str) -> Option<(&'static str, &'static st
         ("PLASTIC" | "SHEET METAL" | "SURFACE" | "MESH", "CONSTRUCT") => Some(("MODEL", "CONSTRUCT")),
         ("PLASTIC" | "SHEET METAL" | "SURFACE" | "MESH", "INSPECT") => Some(("INSPECT", "CHECK")),
         ("PLASTIC" | "SHEET METAL" | "SURFACE" | "MESH", "INSERT") => Some(("INSERT", "FILES")),
-        ("MESH", "CREATE" | "PREPARE") => Some(("SURFACE", "CONVERT")),
+        ("MESH", "CREATE" | "PREPARE") => Some(("MESH", "FILES")),
+        ("SURFACE", "MESH EDIT") => Some(("MESH", "VERTEX / EDGE")),
+        ("SURFACE", "SCAN CLEANUP") => Some(("MESH", "REPAIR")),
         ("UTILITIES", "MAKE" | "ADD-INS" | "UTILITY") => Some(("MANAGE", "DESIGN")),
         ("UTILITIES", "INSPECT") => Some(("INSPECT", "CHECK")),
         _ => None,
@@ -739,6 +854,7 @@ pub fn tab_icon(tab: &str) -> &'static str {
     match tab {
         "MODEL" => "extrude",
         "SURFACE" => "surface_extrude",
+        "MESH" => "mesh_body",
         "ASSEMBLE" => "joint",
         "INSERT" => "import",
         "INSPECT" => "measure",
@@ -1103,13 +1219,13 @@ mod tests {
         }
     }
 
-    /// The ribbon redesign (#2176) removed the MESH and UTILITIES tabs. A command that still
+    /// The ribbon redesign (#2176) removed the UTILITIES tab. A command that still
     /// declares one is advertised at a place the ribbon cannot show, because the generated command
     /// inventory prints the placement a spec declares (#133).
     #[test]
     fn no_command_is_advertised_at_a_tab_the_ribbon_removed() {
         for c in solidcraft_engine::command_specs() {
-            assert!(!matches!(c.tab, "MESH" | "UTILITIES"), "{} declares the removed {} tab", c.id, c.tab);
+            assert!(!matches!(c.tab, "UTILITIES"), "{} declares the removed {} tab", c.id, c.tab);
         }
         let spec = solidcraft_engine::find_command("file.save_mesh").expect("file.save_mesh is registered");
         assert_eq!((spec.tab, spec.panel), ("INSERT", "FILES"), "Save As Mesh declares the panel that shows it");

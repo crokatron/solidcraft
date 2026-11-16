@@ -25,6 +25,9 @@ pub struct Message {
     pub at: f64,
     /// How many times in a row it came.
     pub count: u32,
+    /// Explicit file-operation location; never inferred from arbitrary diagnostic text.
+    pub folder: Option<String>,
+    pub dismissed: bool,
 }
 
 #[derive(Default)]
@@ -48,7 +51,7 @@ impl Messages {
         }
         let text =
             if text.chars().count() > MAX_CHARS { format!("{}…", text.chars().take(MAX_CHARS).collect::<String>()) } else { text.to_string() };
-        self.list.push_back(Message { text, error, at, count: 1 });
+        self.list.push_back(Message { text, error, at, count: 1, folder: None, dismissed: false });
         while self.list.len() > KEEP {
             self.list.pop_front();
         }
@@ -61,6 +64,32 @@ impl Messages {
 
     pub fn clear(&mut self) {
         self.list.clear();
+    }
+
+    pub fn file(&mut self, text: &str, path: &str, at: f64) {
+        self.push(text, false, at);
+        if let Some(message) = self.list.back_mut() {
+            message.folder = std::path::Path::new(path).parent().map(|p| p.to_string_lossy().into_owned()).filter(|p| !p.is_empty());
+            message.dismissed = false;
+        }
+    }
+
+    pub fn pending(&self) -> Option<&Message> {
+        self.list.iter().rev().find(|m| m.folder.is_some() && !m.dismissed)
+    }
+
+    pub fn dismiss(&mut self, at: f64) {
+        for message in &mut self.list {
+            if message.at == at {
+                message.dismissed = true;
+            }
+        }
+    }
+
+    pub fn dismiss_all(&mut self) {
+        for message in &mut self.list {
+            message.dismissed = true;
+        }
     }
 
     /// The messages as text, oldest first, one per line: how long ago, `error:` for errors, the
@@ -98,7 +127,11 @@ pub fn control(app: &mut SolveApp, p: &Value) -> Value {
     if let Some(open) = p.get("open").and_then(Value::as_bool) {
         app.messages.open = open;
     }
-    let list: Vec<Value> = app.messages.iter().map(|m| json!({"text": m.text, "error": m.error, "at": m.at, "count": m.count})).collect();
+    let list: Vec<Value> = app
+        .messages
+        .iter()
+        .map(|m| json!({"text": m.text, "error": m.error, "at": m.at, "count": m.count, "folder":m.folder,"dismissed":m.dismissed}))
+        .collect();
     json!({ "messages": list, "open": app.messages.open })
 }
 
@@ -109,10 +142,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let t = Tokens::get();
     let now = crate::now_ms();
-    let (closed, _) = crate::ui_kit::Window::new(egui::Id::unique("sc_messages"), "list", tr("messages.title")).fields().actions("", "", None).show(
-        ctx,
-        true,
-        |ui| {
+    let (closed, _) = crate::ui_kit::Window::new(egui::Id::unique("sc_messages"), "list", tr("notifications.title"))
+        .fields()
+        .actions("", "", None)
+        .show(ctx, true, |ui| {
             ui.horizontal(|ui| {
                 let copy = crate::ui_kit::button(ui, tr("messages.copy_all"), crate::ui_kit::Button::Enabled(app.messages.iter().len() > 0));
                 crate::scenario::publish_handle("messages:copy", copy.rect.center());
@@ -124,6 +157,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 if clear.clicked() {
                     app.messages.clear();
                 }
+                let dismiss = ui.button(tr("notifications.dismiss_all"));
+                crate::scenario::publish_handle("notifications:dismiss-all", dismiss.rect.center());
+                if dismiss.clicked() {
+                    app.messages.dismiss_all();
+                    app.status = None;
+                }
             });
             ui.separator();
             if app.messages.iter().len() == 0 {
@@ -131,16 +170,28 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 return;
             }
             egui::ScrollArea::vertical().max_height(solidcraft_theme::Tokens::get().form_card_width).auto_shrink([false, true]).show(ui, |ui| {
-                for m in app.messages.iter().rev() {
+                let rows: Vec<_> = app.messages.iter().rev().cloned().collect();
+                for (index, m) in rows.iter().enumerate() {
                     ui.horizontal_top(|ui| {
                         ui.add_sized(vec2(70.0, 14.0), egui::Label::new(RichText::new(ago(now, m.at)).small().color(t.text_dim)));
                         let text = RichText::new(line(m)).color(if m.error { t.error } else { t.text });
                         ui.add(egui::Label::new(text).wrap().selectable(true));
                     });
+                    if let Some(folder) = &m.folder {
+                        ui.horizontal(|ui| {
+                            let copy = ui.button(tr("notifications.copy_folder"));
+                            crate::scenario::publish_handle(&format!("notifications:copy-folder:{index}"), copy.rect.center());
+                            if copy.clicked() {
+                                ctx.copy_text(folder.clone());
+                            }
+                            if !m.dismissed && ui.button(tr("notifications.dismiss")).clicked() {
+                                app.messages.dismiss(m.at);
+                            }
+                        });
+                    }
                 }
             });
-        },
-    );
+        });
     if closed {
         app.messages.open = false;
     }
@@ -174,6 +225,35 @@ mod tests {
         let mut m = Messages::default();
         m.push(&"x".repeat(10_000), true, 0.0);
         assert_eq!(m.iter().next().map(|x| x.text.chars().count()), Some(4001));
+    }
+
+    #[test]
+    fn file_notifications_survive_later_status_and_dismiss_independently() {
+        let mut m = Messages::default();
+        m.file("Exported first", "C:/Projects/My Door/first.step", 1.0);
+        m.push("Selection changed", false, 2.0);
+        assert_eq!(m.pending().and_then(|m| m.folder.as_deref()), Some("C:/Projects/My Door"));
+        m.file("Exported second", "C:/Projects/My Door/second.x_t", 3.0);
+        m.dismiss(3.0);
+        assert_eq!(m.pending().map(|m| m.text.as_str()), Some("Exported first"));
+        m.dismiss_all();
+        assert!(m.pending().is_none());
+        assert_eq!(m.iter().len(), 3, "dismissal must retain notification history");
+    }
+
+    #[test]
+    fn file_notification_stays_after_timeout_and_opens_center() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.messages.file("Exported test", "C:/Projects/My Door/test.step", crate::now_ms() - 60_000.0);
+        h.frames(3);
+        assert!(crate::scenario::handle_at("notifications:copy-folder").is_some());
+        h.step(&serde_json::json!({"click":{"handle":"status:chip"}})).unwrap();
+        assert!(h.app.messages.open);
+        assert!(crate::scenario::handle_at("notifications:copy-folder:0").is_some());
+        h.step(&serde_json::json!({"click":{"handle":"notifications:dismiss-all"}})).unwrap();
+        assert!(h.app.messages.pending().is_none());
+        assert_eq!(h.app.messages.iter().len(), 1);
     }
 
     /// Status messages land in the list, a click on the chip and Help › Messages… open the window,

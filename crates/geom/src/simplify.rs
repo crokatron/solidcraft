@@ -31,6 +31,21 @@ const MIN_TURN_COS: f64 = 0.2;
 /// A simplified copy of a mesh: solidcore-tess's, the type the viewport draws levels of detail from.
 pub use solidcore_tess::simplify::Level;
 
+/// Reduce an editable mesh. The editing command needs only the resulting geometry; a
+/// screen-space error bound and its separate nearest-triangle index are specific to display LOD.
+pub fn reduce(positions: &[Vec3], triangles: &[[u32; 3]], target: usize) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    if target == 0 || target >= triangles.len() || triangles.len() > MAX_TRIANGLES {
+        return None;
+    }
+    let mut mesh = Collapser::new(positions, triangles)?;
+    mesh.collapse_to(target);
+    if mesh.live_triangles == 0 || mesh.live_triangles >= triangles.len() {
+        return None;
+    }
+    let (level, _) = mesh.level();
+    Some((level.positions, level.triangles))
+}
+
 /// The mesh (`positions`, and `triangles` indexing them; corners at the same position are one
 /// vertex) simplified to each of `targets` triangles in turn (largest first), one [`Level`] per
 /// target reached. Simplification stops early when no edge can collapse any more; the levels made

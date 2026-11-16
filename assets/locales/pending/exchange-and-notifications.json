@@ -1,0 +1,26 @@
+{
+  "en": {
+    "cmd.file.export_glb": "Export GLB",
+    "cmd.file.export_json": "Export Design JSON",
+    "cmd.file.export_nx_assembly": "NX Assembly (STEP)",
+    "cmd.file.export_parasolid": "Export Parasolid",
+    "help.doc.open": "Open an existing design or import a supported CAD, mesh or point-cloud file into a new design. Use this to start working from a saved file.",
+    "help.file.export_3mf": "Export placed bodies as a 3MF mesh file. Use it for additive manufacturing workflows that support named objects.",
+    "help.file.export_glb": "Export the displayed bodies and their appearance as GLB. Use it to exchange a textured model with visualization tools.",
+    "help.file.export_json": "Export a copy of the complete editable design as JSON. This does not change the current design's save path.",
+    "help.file.export_nx_assembly": "Export the complete assembly as STEP with named components and their placements. Open it in NX with assembly structure enabled to create component parts. This writes a .step exchange file, not a native NX .prt file.",
+    "help.file.export_obj": "Export placed meshes with their colours and supported texture images. Keep the OBJ, MTL and image files together when transferring a textured scan.",
+    "help.file.export_parasolid": "Export the placed CAD bodies as a Parasolid text file. Unsupported geometry is reported before replacing a file.",
+    "help.file.export_step": "Export exact CAD geometry as STEP, preserving assembly structure when exporting the entire design. Use it for editable CAD exchange.",
+    "help.file.export_stl": "Export bodies as a triangulated STL file. Use it for printing workflows that do not need colours or component structure.",
+    "help.file.export_urdf": "Export the assembly as a URDF robot with associated mesh files. Use it to transfer links and joints to robotics tools.",
+    "help.file.export_view_dxf": "Export the current view as a DXF drawing. Use it to transfer projected outlines to a drafting application.",
+    "notifications.copy_folder": "Copy folder path",
+    "notifications.dismiss": "Dismiss",
+    "notifications.dismiss_all": "Dismiss all",
+    "notifications.exported": "Exported {path}",
+    "notifications.imported": "Imported {path}",
+    "notifications.title": "Notifications",
+    "ui.exchange_tab": "Import / Export"
+  }
+}

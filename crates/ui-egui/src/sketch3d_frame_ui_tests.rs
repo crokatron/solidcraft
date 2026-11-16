@@ -341,3 +341,199 @@ fn point3d_tool_places_points_and_stays() {
     assert!(wires[1].fit[0].dist(Vec3::new(20.0, 10.0, 10.0)) < 1e-6, "{:?}", wires[1].fit);
     assert!(h.app.tool.as_ref().is_some_and(|t| t.cmd == "sketch.point3d"), "the tool stays for the next point");
 }
+#[test]
+fn tangent_tool_accepts_spatial_endpoint_clicks() {
+    let mut h = crate::scenario::Harness::new();
+    let id = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.run("sketch.line3d", json!({"points":[[-20,0,10],[0,0,10]]})).unwrap();
+    h.app.run("sketch.line3d", json!({"points":[[8,8,15],[25,20,20]]})).unwrap();
+    h.app.set_origin_shown(false);
+    h.call("ui.view", json!({"view":"home"}));
+    h.call("ui.view", json!({"view":"fit"}));
+    h.frames(3);
+    h.app.start("sketch.constraint.tangent");
+    h.frames(2);
+    h.step(&json!({"click":{"world":[0,0,10]}})).unwrap();
+    h.step(&json!({"click":{"world":[8,8,15]}})).unwrap();
+    h.frames(2);
+    let sk = h.app.session.doc.sketch(id).unwrap();
+    assert!(sk.wire_constraints.iter().any(|c| c.kind == solidcraft_engine::sketch::wire_constraints::Relation::Tangent));
+    assert!(sk.wires[0].fit[1].dist(sk.wires[1].fit[0]) < 1e-6);
+}
+#[test]
+fn standard_line_in_3d_mode_remains_spatial_on_the_sketch_plane() {
+    let mut h = crate::scenario::Harness::new();
+    let id = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.set_origin_shown(false);
+    h.call("ui.view", json!({"view":"home"}));
+    h.frames(3);
+    h.app.start("sketch.line");
+    h.frames(2);
+    h.step(&json!({"click":{"world":[-20,0,0]}})).unwrap();
+    h.step(&json!({"click":{"world":[0,0,0]}})).unwrap();
+    h.frames(2);
+    let sk = h.app.session.doc.sketch(id).unwrap();
+    assert_eq!(sk.wires.len(), 1, "3D mode must not silently downgrade on-plane lines");
+    assert!(sk.curves.is_empty());
+    assert!(sk.wires[0].fit.iter().all(|p| p.z.abs() < 1e-6));
+}
+#[test]
+fn spatial_sketch_status_counts_freedom_and_recognises_fixed_geometry() {
+    let mut h = crate::scenario::Harness::new();
+    let id = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.run("sketch.line3d", json!({"points":[[0,0,0],[10,0,0]]})).unwrap();
+    h.frames(3);
+    assert!(h.widget("3D DOF unknown").is_none());
+    assert!(h.widget("Fully constrained").is_none());
+    let world = h.app.session.world_state().unwrap();
+    let sketch = world.sketch(id).unwrap();
+    assert_eq!(crate::sketch_state::SketchState::of(sketch), crate::sketch_state::SketchState::Under(6));
+    assert_eq!(crate::status_bar::SketchState::of(sketch), crate::status_bar::SketchState::Under(6));
+    h.app.run("sketch.dimension3d", json!({"kind":"fix", "a":"w1"})).unwrap();
+    h.frames(3);
+    let state = h.app.session.model.state();
+    let sketch = state.sketch(id).unwrap();
+    assert_eq!(crate::sketch_state::SketchState::of(sketch), crate::sketch_state::SketchState::Full);
+    assert_eq!(crate::status_bar::SketchState::of(sketch), crate::status_bar::SketchState::Full);
+}
+
+#[test]
+fn spatial_mobility_cache_tracks_dimensions_and_fixed_point_handles() {
+    let mut h = crate::scenario::Harness::new();
+    let id = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.run("sketch.line3d", json!({"points":[[0,0,0],[10,0,0]]})).unwrap();
+    let first = crate::spatial_freedom::active(&h.app).unwrap();
+    assert_eq!(first.dof, Some(6));
+    assert!(std::rc::Rc::ptr_eq(&first, &crate::spatial_freedom::active(&h.app).unwrap()));
+    h.app.run("sketch.dimension3d", json!({"kind":"fix","a":"w1.start"})).unwrap();
+    h.app.run("sketch.dimension3d", json!({"kind":"distance","a":"w1","value":10})).unwrap();
+    let length = crate::spatial_freedom::active(&h.app).unwrap();
+    assert!(!std::rc::Rc::ptr_eq(&first, &length));
+    assert_eq!(length.dof, Some(2));
+    let fixed = length.points.iter().find(|p| p.wire == "w1" && p.index == 0).unwrap();
+    assert_eq!(fixed.free_axes, [false; 3]);
+    let tip = length.points.iter().find(|p| p.wire == "w1" && p.index == 1).unwrap();
+    assert_eq!(tip.free_axes, [false, true, true]);
+    h.app.set_origin_shown(false);
+    h.call("ui.view", json!({"view":"home"}));
+    h.frames(3);
+    h.step(&json!({"click":{"world":[0,0,0]}})).unwrap();
+    h.frames(2);
+    assert!(crate::scenario::handle_at("triad_x").is_none(), "a fixed point has no active move handle");
+    h.step(&json!({"click":{"world":[10,0,0]}})).unwrap();
+    h.frames(2);
+    assert!(crate::scenario::handle_at("spatial_motion:w1:0").is_some(), "free endpoint shows nullspace motion direction");
+    let local = h.app.session.model.state();
+    assert_eq!(crate::sketch_state::SketchState::of(local.sketch(id).unwrap()), crate::sketch_state::SketchState::Under(2));
+}
+
+#[test]
+fn spatial_fix_tool_targets_the_clicked_endpoint_with_idle_points_disabled() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.run("sketch.line3d", json!({"points":[[0,0,0],[20,0,0]]})).unwrap();
+    assert!(!h.app.preferences.select_3d_curve_points);
+    h.app.set_origin_shown(false);
+    h.call("ui.view", json!({"view":"home"}));
+    h.app.session.selection.clear();
+    h.app.start("sketch.constraint.fix");
+    h.frames(3);
+    h.step(&json!({"click":{"world":[20,0,0]}})).unwrap();
+    h.frames(2);
+    let report = h.app.run("sketch.inspect", json!({})).unwrap();
+    assert_eq!(report["spatial_dof"], 3);
+    assert_eq!(report["wire_constraints"].as_array().unwrap().len(), 1);
+    assert_eq!(report["wire_constraints"][0]["a"]["index"], 1);
+}
+
+#[test]
+fn placement_axis_guides_follow_ctrl_palette_popup_and_shift() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.set_origin_shown(false);
+    h.call("ui.view", json!({"view":"home"}));
+    h.frames(3);
+    h.app.start("sketch.line");
+    h.frames(3);
+    h.step(&json!({"click":{"world":[0,0,0]}})).unwrap();
+    h.step(&json!({"move":{"world":[10,10,0]},"ctrl":true})).unwrap();
+    assert!(crate::sketch3d::placement_label(&h.app, false).contains('X'));
+    assert_eq!(crate::scenario::count_of("sketch3d:placement_axis"), Some(0.));
+    h.step(&json!({"move":{"world":[10,10,0]}})).unwrap();
+    h.step(&json!({"click":{"handle":"sketch3d:toggle_axis"}})).unwrap();
+    h.frames(2);
+    assert!(crate::sketch3d::placement_label(&h.app, false).contains('Y'));
+    let item = crate::context_menu::items(&h.app, &crate::context_menu::Target::Viewport).into_iter().find(|i| i.id == "ui.cycleSketchAxis").unwrap();
+    crate::context_menu::run_item(&mut h.app, &item, egui::pos2(400., 400.));
+    h.step(&json!({"move":{"world":[10,10,0]}})).unwrap();
+    assert!(crate::sketch3d::placement_label(&h.app, false).contains('Z'));
+    h.step(&json!({"move":{"world":[10,10,0]},"shift":true})).unwrap();
+    assert_eq!(crate::scenario::count_of("sketch3d:placement_axis"), Some(-1.));
+    assert_eq!(crate::scenario::count_of("sketch3d:free_placement"), Some(1.));
+    h.step(&json!({"move":{"world":[10,10,0]}})).unwrap();
+    assert_eq!(crate::scenario::count_of("sketch3d:placement_axis"), Some(2.));
+}
+
+#[test]
+fn sketch_tool_confirm_retains_apply_discards_cancel_and_keeps_failed_spline() {
+    let mut h = crate::scenario::Harness::new();
+    let id = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.start("sketch.line");
+    h.frames(2);
+    for p in [[0, 0, 0], [10, 0, 0]] {
+        h.step(&json!({"click":{"world":p}})).unwrap();
+    }
+    let count = h.app.session.doc.sketch(id).unwrap().wires.len();
+    assert_eq!(count, 1);
+    crate::tools::confirm_tool(&mut h.app, crate::ui_kit::Action::Apply);
+    assert!(h.app.tool.is_some());
+    assert_eq!(h.app.session.active_sketch, Some(id));
+    h.frames(2);
+    assert_eq!(crate::scenario::count_of("sketch_tool:remembered_action"), Some(1.));
+    crate::tools::confirm_tool(&mut h.app, crate::ui_kit::Action::Apply);
+    assert!(h.app.tool.is_some(), "empty Apply never exits tool");
+    crate::tools::confirm_tool(&mut h.app, crate::ui_kit::Action::Cancel);
+    assert!(h.app.tool.is_none());
+    assert_eq!(h.app.session.doc.sketch(id).unwrap().wires.len(), count);
+    h.app.start("sketch.spline3d");
+    crate::sketch3d::restore_pending_chain((Some("sketch.spline3d"), vec![Vec3::ZERO]));
+    crate::tools::confirm_tool(&mut h.app, crate::ui_kit::Action::Apply);
+    assert_eq!(crate::sketch3d::pending_chain().1.len(), 1);
+    assert!(h.app.tool.is_some());
+    crate::sketch3d::restore_pending_chain((Some("sketch.spline3d"), vec![Vec3::ZERO, Vec3::new(5., 3., 1.), Vec3::new(10., 0., 2.)]));
+    crate::tools::confirm_tool(&mut h.app, crate::ui_kit::Action::Ok);
+    assert!(h.app.tool.is_none());
+    assert_eq!(h.app.session.active_sketch, Some(id));
+    assert_eq!(h.app.session.doc.sketch(id).unwrap().wires.len(), count + 1);
+}
+
+#[test]
+fn sketch_tool_buttons_remain_below_status_header_on_small_scrolled_palette() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.home.open = false;
+    h.ctx.set_pixels_per_point(1.25);
+    h.call("ui.resize", json!({"width":1382.4,"height":825.6}));
+    h.app.run("sketch.create", json!({"plane":"XY","name":"Axis guide test"})).unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.start("sketch.line");
+    h.frames(5);
+    let before = crate::scenario::handle_at("sketch_tool:Cancel").unwrap();
+    let meter = crate::scenario::rect_of("sketch_palette:meter").unwrap();
+    assert!(before.y > meter.bottom() + 5., "confirmation must sit below sticky status header: {before:?} {meter:?}");
+    let options = crate::scenario::rect_of("sketch_palette:options").unwrap();
+    h.call("ui.scroll", json!({"x":options.center().x,"y":options.center().y,"delta":-180,"unit":"point"}));
+    h.frames(4);
+    let after = crate::scenario::handle_at("sketch_tool:Cancel").unwrap();
+    assert!((after.y - before.y).abs() < 1., "confirmation controls must not scroll under header");
+    h.step(&json!({"click":{"handle":"sketch_tool:Cancel"}})).unwrap();
+    h.frames(2);
+    assert!(h.app.tool.is_none(), "Cancel must remain clickable at 1728x1032 physical / 1382x825 logical");
+    assert!(h.app.session.active_sketch.is_some());
+}

@@ -350,3 +350,213 @@ fn a_move_its_joints_undo_names_the_joint_in_a_repeated_assembly() {
     let warning = r["warning"].as_str().unwrap_or_default();
     assert!(warning.contains("Mount"), "the warning names the joint: {warning}");
 }
+
+#[test]
+fn coordinate_frame_delta_matches_origin_and_all_axes_and_refuses_nonrigid_frames() {
+    use solidcore_record::Vec3;
+    use solidcraft_doc::{IDENTITY, mat_mul, rigid};
+    let source = rigid(Vec3::new(7., -4., 12.), Vec3::ZERO, Vec3::new(1., 2., 3.), 0.7);
+    let target = rigid(Vec3::new(-8., 2., 19.), Vec3::ZERO, Vec3::X, std::f64::consts::PI);
+    let delta = crate::origins::frame_delta(&source, &target).unwrap();
+    let aligned = mat_mul(&delta, &source);
+    assert!(aligned.iter().flatten().zip(target.iter().flatten()).all(|(a, b)| (a - b).abs() < 1e-10));
+    let mut shear = IDENTITY;
+    shear[1][0] = 0.2;
+    let mut mirror = IDENTITY;
+    mirror[0][0] = -1.;
+    let mut nan = IDENTITY;
+    nan[3][0] = f64::NAN;
+    for invalid in [shear, mirror, nan] {
+        assert!(crate::origins::frame_delta(&invalid, &target).is_err());
+        assert!(crate::origins::frame_delta(&source, &invalid).is_err());
+    }
+}
+
+#[test]
+fn coordinate_frames_include_named_csys_and_planes_in_nested_pending_placements() {
+    use solidcore_record::{Plane, Vec3};
+    use solidcraft_doc::joints::{JointOrigin, NamedOrigin, Snap};
+    use solidcraft_doc::{FeatureKind, PlaneRef, mat_mul, rigid};
+    use solidcraft_geom::prelude::*;
+    let mut s = Session::default();
+    let parent = run(&mut s, "component.create", json!({"name":"Parent","grounded":false}));
+    let parent_occ = parent["occurrence"].as_u64().unwrap();
+    let child = run(&mut s, "component.create", json!({"name":"Child","grounded":false}));
+    let child_occ = child["occurrence"].as_u64().unwrap();
+    let child_component = child["component"].as_u64().unwrap();
+    let local = rigid(Vec3::new(2., 3., 4.), Vec3::ZERO, Vec3::Y, 0.4);
+    s.doc_mut().occurrences.iter_mut().find(|o| o.id == child_occ).unwrap().transform = local;
+    let plane = Plane::new(Vec3::new(1., 2., 3.), Vec3::Y, Vec3::Z).unwrap();
+    let feature = s.doc_mut().add_feature(FeatureKind::ConstructionPlane { plane: PlaneRef::Custom { plane } }, Some("Mounting frame")).unwrap();
+    s.doc_mut().feature_mut(feature).unwrap().component = child_component;
+    s.doc_mut().assembly.origins.push(NamedOrigin {
+        name: "My CSYS".into(),
+        origin: JointOrigin::new(child_occ, Snap::Frame { origin: Vec3::new(4., 5., 6.), z: Vec3::X, x: Some(Vec3::Y) }),
+    });
+    s.refresh();
+    run(&mut s, "occurrence.move", json!({"occurrence":parent_occ,"translate":[10,20,30],"axis":[0,0,1],"angle":"90 deg","capture":false}));
+    let world = s.occurrence_placement(&[parent_occ, child_occ]).unwrap().world;
+    let expected_origin = mat_mul(&world, &[[0., 1., 0., 0.], [0., 0., 1., 0.], [1., 0., 0., 0.], [4., 5., 6., 1.]]);
+    let before = s.doc.to_json();
+    let pending = s.pending_moves.clone();
+    let revision = s.revision;
+    let listed = run(&mut s, "model.coordinate_frames", json!({}));
+    let frames = listed["frames"].as_array().unwrap();
+    assert!(frames.iter().any(|f| f["key"] == "world"));
+    let named = frames.iter().find(|f| f["label"].as_str().unwrap().contains("My CSYS")).unwrap();
+    let actual: solidcraft_doc::Mat = serde_json::from_value(named["matrix"].clone()).unwrap();
+    assert!(actual.iter().flatten().zip(expected_origin.iter().flatten()).all(|(a, b)| (a - b).abs() < 1e-9));
+    let key = named["key"].as_str().unwrap().to_string();
+    assert_eq!(s.coordinate_frame(&key).unwrap(), actual);
+    let plane_key = format!("plane:{feature}:{parent_occ}/{child_occ}");
+    let expected_plane = mat_mul(&world, &[[0., 1., 0., 0.], [0., 0., 1., 0.], [1., 0., 0., 0.], [1., 2., 3., 1.]]);
+    let actual = s.coordinate_frame(&plane_key).unwrap();
+    assert!(actual.iter().flatten().zip(expected_plane.iter().flatten()).all(|(a, b)| (a - b).abs() < 1e-9));
+    assert_eq!(s.doc.to_json(), before);
+    assert_eq!(s.pending_moves, pending);
+    assert_eq!(s.revision, revision);
+    s.doc_mut().feature_mut(feature).unwrap().suppressed = true;
+    s.refresh();
+    assert!(s.coordinate_frame(&plane_key).is_err());
+    s.doc_mut().assembly.origins.clear();
+    assert!(s.coordinate_frame(&key).is_err());
+    assert!(s.coordinate_frame("missing").is_err());
+}
+
+#[test]
+fn move_apply_captures_only_the_selected_component_and_undo_restores_its_preview() {
+    let mut s = Session::default();
+    let first = run(&mut s, "component.create", json!({"name":"First","grounded":false}))["occurrence"].as_u64().unwrap();
+    run(&mut s, "component.activate", json!({"component":"root"}));
+    let second = run(&mut s, "component.create", json!({"name":"Second","grounded":false}))["occurrence"].as_u64().unwrap();
+    run(&mut s, "occurrence.move", json!({"occurrence":first,"translate":[1,2,3],"capture":false}));
+    run(&mut s, "occurrence.move", json!({"occurrence":second,"translate":[4,5,6],"capture":false}));
+    let before = s.doc.to_json();
+    let pending = s.pending_moves.clone();
+    let local = pending[&second];
+    let rows: Vec<Vec<f64>> = (0..4).map(|r| (0..4).map(|c| local[c][r]).collect()).collect();
+    run(&mut s, "occurrence.move", json!({"occurrence":second,"space":"local","to_matrix":rows,"capture":true}));
+    assert_eq!(s.pending_moves.get(&first), pending.get(&first));
+    assert!(!s.pending_moves.contains_key(&second));
+    assert_eq!(s.doc.occurrences.iter().find(|o| o.id == second).unwrap().transform, local);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.to_json(), before);
+    assert_eq!(s.pending_moves, pending);
+}
+
+#[test]
+fn geometry_handle_snaps_follow_nested_pending_placements() {
+    use crate::geometry_snap::{GeometryKind, GeometryPick, SnapMode};
+    use solidcore_record::brep::Curve;
+    let mut s = Session::default();
+    let parent = run(&mut s, "component.create", json!({"name":"Snap Parent","grounded":false}))["occurrence"].as_u64().unwrap();
+    let child = run(&mut s, "component.create", json!({"name":"Snap Child","grounded":false}))["occurrence"].as_u64().unwrap();
+    run(&mut s, "solid.box", json!({"length":10,"width":20,"height":30,"corner":[0,0,0]}));
+    run(&mut s, "occurrence.move", json!({"occurrence":parent,"translate":[100,200,300],"axis":[0,0,1],"angle":"90 deg","capture":false}));
+    run(&mut s, "occurrence.move", json!({"occurrence":child,"translate":[4,5,6],"capture":false}));
+    let world = s.world_state().unwrap();
+    let body = &world.bodies[0];
+    let record = body.body.record();
+    let (edge, e) = record.edges.iter().enumerate().find(|(_, e)| matches!(e.curve, Curve::Line { .. })).unwrap();
+    let a = record.vertices[e.vertices[0] as usize].point;
+    let b = record.vertices[e.vertices[1] as usize].point;
+    let expected = [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2., (a[2] + b[2]) / 2.];
+    let pick = GeometryPick { body: body.name.clone(), kind: GeometryKind::Edge, index: Some(edge), point: expected };
+    let before = s.doc.to_json();
+    let pending = s.pending_moves.clone();
+    let revision = s.revision;
+    let mid = s.geometry_snap(&pick, SnapMode::Midpoint).unwrap();
+    near(mid.point, expected);
+    near(s.geometry_snap(&pick, SnapMode::Point).unwrap().point, expected);
+    let dir = mid.direction.unwrap();
+    assert!((dir.iter().map(|v| v * v).sum::<f64>() - 1.).abs() < 1e-10);
+    let vertex = GeometryPick { kind: GeometryKind::Vertex, index: None, point: a, ..pick.clone() };
+    near(s.geometry_snap(&vertex, SnapMode::Point).unwrap().point, a);
+    assert!(s.geometry_snap(&pick, SnapMode::Center).is_err());
+    let invalid = GeometryPick { index: Some(usize::MAX), ..pick };
+    assert!(s.geometry_snap(&invalid, SnapMode::Point).is_err());
+    assert_eq!(s.doc.to_json(), before);
+    assert_eq!(s.pending_moves, pending);
+    assert_eq!(s.revision, revision);
+    let min = |axis: usize| record.vertices.iter().map(|v| v.point[axis]).fold(f64::INFINITY, f64::min);
+    near([min(0), min(1), min(2)], [75., 204., 306.]);
+}
+#[test]
+fn geometry_handle_face_and_circle_samples_keep_analytic_normals() {
+    use crate::geometry_snap::{GeometryKind, GeometryPick, SnapMode};
+    use solidcore_record::brep::{Curve, Surface};
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"diameter":10,"height":20,"base":[0,0,0]}));
+    let world = s.world_state().unwrap();
+    let body = &world.bodies[0];
+    let record = body.body.record();
+    let (edge, frame) =
+        record.edges.iter().enumerate().find_map(|(i, e)| if let Curve::Circle { frame, .. } = &e.curve { Some((i, frame)) } else { None }).unwrap();
+    let pick = GeometryPick { body: body.name.clone(), kind: GeometryKind::Edge, index: Some(edge), point: [5., 0., 0.] };
+    near(s.geometry_snap(&pick, SnapMode::Center).unwrap().point, frame.origin);
+    assert!(s.geometry_straight_edge(&pick).is_err());
+    let face = record.faces.iter().position(|f| matches!(f.surface, Surface::Cylinder { .. })).unwrap();
+    let pick = GeometryPick { kind: GeometryKind::Face, index: Some(face), point: [6., 0., 10.], ..pick };
+    let snapped = s.geometry_snap(&pick, SnapMode::Point).unwrap();
+    near(snapped.point, [5., 0., 10.]);
+    near(snapped.direction.unwrap(), [1., 0., 0.]);
+    let queried = run(&mut s, "model.geometry_snap", json!({"pick":pick,"mode":"point"}));
+    near(serde_json::from_value(queried["point"].clone()).unwrap(), [5., 0., 10.]);
+}
+#[test]
+fn geometry_handle_virtual_intersection_and_axis_flip_are_true_3d() {
+    use crate::geometry_snap::align_axis;
+    use solidcraft_doc::IDENTITY;
+    let cross = solidcraft_kernel::geometry_snap::line_intersection([[0., 0., 0.], [1., 0., 0.]], [[3., 2., 0.], [3., 3., 0.]], 1e-6).unwrap();
+    near(cross.point, [3., 0., 0.]);
+    assert!(solidcraft_kernel::geometry_snap::line_intersection([[0., 0., 0.], [1., 0., 0.]], [[3., 2., 1.], [3., 3., 1.]], 1e-6).is_err());
+    assert!(solidcraft_kernel::geometry_snap::line_intersection([[0., 0., 0.], [1., 0., 0.]], [[0., 1., 0.], [1., 1., 0.]], 1e-6).is_err());
+    let mut frame = IDENTITY;
+    frame[3] = [10., 20., 30., 1.];
+    for axis in 0..3 {
+        let m = align_axis(&frame, axis, [1., 2., 3.], false).unwrap();
+        assert!(solidcraft_doc::is_placement(&m));
+        assert_eq!(m[3], frame[3]);
+        let n = 14f64.sqrt();
+        near([m[axis][0], m[axis][1], m[axis][2]], [1. / n, 2. / n, 3. / n]);
+    }
+    let flipped = align_axis(&frame, 0, [1., 0., 0.], true).unwrap();
+    assert!(solidcraft_doc::is_placement(&flipped));
+    near([flipped[0][0], flipped[0][1], flipped[0][2]], [-1., 0., 0.]);
+    assert!(align_axis(&frame, 3, [1., 0., 0.], false).is_err());
+    assert!(align_axis(&frame, 0, [0., 0., 0.], false).is_err());
+}
+
+#[test]
+fn geometry_handle_face_centers_use_bounded_axis_and_follow_component_moves() {
+    use crate::geometry_snap::{GeometryKind, GeometryPick, SnapMode};
+    use solidcore_record::brep::Surface;
+    for (command, params) in [
+        ("solid.cylinder", json!({"diameter":10,"height":20,"base":[3,4,5]})),
+        ("solid.cone", json!({"radius":10,"top_radius":4,"height":20,"base":[3,4,5]})),
+        ("solid.cone", json!({"radius":10,"height":20,"base":[3,4,5]})),
+    ] {
+        let mut s = Session::default();
+        let occurrence = run(&mut s, "component.create", json!({"name":"Axial part","grounded":false}))["occurrence"].as_u64().unwrap();
+        run(&mut s, command, params);
+        // Z becomes X; the face centre must follow the pending placement.
+        run(&mut s, "occurrence.move", json!({"occurrence":occurrence,"translate":[100,200,300],"axis":[0,1,0],"angle":"90 deg","capture":false}));
+        let world = s.world_state().unwrap();
+        let body = &world.bodies[0];
+        let index = body.body.record().faces.iter().position(|f| matches!(f.surface, Surface::Cylinder { .. } | Surface::Cone { .. })).unwrap();
+        let pick = GeometryPick { body:body.name.clone(), kind:GeometryKind::Face, index:Some(index), point:[0.,0.,0.] };
+        let before = s.doc.to_json();
+        let pending = s.pending_moves.clone();
+        let snap = s.geometry_snap(&pick, SnapMode::Center).unwrap();
+        near(snap.point, [115.,204.,297.]);
+        // Cone carriers may reverse their canonical axis; either sign is coaxial.
+        let direction = snap.direction.unwrap();
+        near([direction[0].abs(),direction[1].abs(),direction[2].abs()], [1.,0.,0.]);
+        let other_hint = GeometryPick { point:[500.,-300.,14.], ..pick.clone() };
+        near(s.geometry_snap(&other_hint, SnapMode::Center).unwrap().point, snap.point);
+        let queried = run(&mut s, "model.geometry_snap", json!({"pick":pick,"mode":"center"}));
+        near(serde_json::from_value(queried["point"].clone()).unwrap(), snap.point);
+        assert_eq!(s.doc.to_json(), before);
+        assert_eq!(s.pending_moves, pending);
+    }
+}

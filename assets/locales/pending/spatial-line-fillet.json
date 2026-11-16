@@ -1,0 +1,6 @@
+{
+  "en": {
+    "cmd.sketch.fillet3d": "3D Sketch Fillet",
+    "help.sketch.fillet3d": "Round the corner between two drawn straight lines with a tangent circular arc. The radius must fit on both segments."
+  }
+}

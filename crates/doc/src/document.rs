@@ -1994,6 +1994,12 @@ pub enum FeatureKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         faces: Vec<FacePick>,
         target: BodyName,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_edges: Vec<Position>,
+        #[serde(default = "match_cross_scale")]
+        cross_scale: f64,
+        #[serde(default = "match_reverse_target")]
+        reverse_target: bool,
         edges: Vec<Position>,
         #[serde(default = "match_order")]
         order: Continuity,
@@ -2074,6 +2080,10 @@ pub enum FeatureKind {
         /// component (#1386). Empty in designs from before format 22: every body is built.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         skip: Vec<u64>,
+        /// Mesh bodies from a linked design, following its STEP bodies. An empty STEP
+        /// payload is permitted when the linked design contains only meshes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        meshes: Vec<MeshData>,
     },
     /// Rebuild an upstream mesh as a solid: analytic planar/cylindrical faces for a
     /// constant-section part, planar facets for any other closed mesh.
@@ -2392,6 +2402,8 @@ fn blend_orders() -> [Continuity; 2] {
 }
 
 /// The continuity a match holds by default: position, tangent plane and curvature.
+fn match_cross_scale() -> f64 { 1.0 }
+fn match_reverse_target() -> bool { true }
 fn match_order() -> Continuity {
     Continuity::G2
 }
@@ -2425,6 +2437,8 @@ pub struct MeshData {
     pub corner_normals: std::sync::Arc<[f64]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<std::sync::Arc<solidcraft_geom::mesh_appearance::MeshAppearance>>,
 }
 
 /// The same mesh: shared arrays are the same without reading them, so the dirty check and
@@ -2436,6 +2450,7 @@ impl PartialEq for MeshData {
         use std::sync::Arc;
         self.name == other.name
             && self.color == other.color
+            && self.appearance == other.appearance
             && (Arc::ptr_eq(&self.triangles, &other.triangles) || self.triangles == other.triangles)
             && (Arc::ptr_eq(&self.positions, &other.positions) || self.positions == other.positions)
             && (Arc::ptr_eq(&self.corner_normals, &other.corner_normals) || self.corner_normals == other.corner_normals)

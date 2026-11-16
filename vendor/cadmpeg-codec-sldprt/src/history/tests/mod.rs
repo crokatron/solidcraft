@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Feature-history reference, projection, and write-prepare tests.
+#![allow(clippy::unwrap_used)]
+
+use crate::records::Configuration;
+use crate::records::Feature;
+use crate::records::FeatureHistory;
+use crate::records::FeatureSource;
+use crate::test_support::container::make_block;
+use crate::test_support::container::outer_header;
+use cadmpeg_ir::features::ConfigurationId;
+use cadmpeg_ir::features::DesignConfiguration;
+use std::collections::BTreeMap;
+
+#[test]
+fn history_from_nameless_block_keeps_annotation_owner() {
+    let payload = br#"<Keywords Name="Part"><Configuration Name="Default"/><Feature id="1" Name="Boss"/></Keywords>"#;
+    let mut source = outer_header();
+    source.extend(make_block(0x43, "", payload));
+    let scan = crate::test_support::container::scan(&source);
+    let arena = cadmpeg_core::decode::DecodeArena::new();
+    let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+        &source,
+        &arena,
+        &cadmpeg_core::decode::DecodePolicy::service(),
+    )
+    .unwrap();
+    let mut annotations = cadmpeg_ir::annotations::Annotations::default();
+    let mut losses = Vec::new();
+    let histories = super::histories(&ctx, &scan, &mut annotations, &mut losses).unwrap();
+
+    assert_eq!(histories.len(), 1);
+    assert!(!histories[0].features.is_empty());
+    assert!(annotations
+        .provenance
+        .values()
+        .any(|provenance| provenance.stream() == "block@8"));
+}
+
+pub(in crate::history) fn feature(id: &str, source_id: Option<&str>, ordinal: u32) -> Feature {
+    Feature {
+        id: id.into(),
+        parent: "history".into(),
+        xml_tag: "Feature".into(),
+        tree_parent: None,
+        source_id: source_id
+            .map(|source_id| FeatureSource::try_from(source_id).expect("test feature source id")),
+        ordinal,
+        name: id.to_string(),
+        kind: "Custom".into(),
+        input_class: None,
+        suppressed: false,
+        parameters: BTreeMap::new(),
+        dimension_properties: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        text: None,
+        content: Vec::new(),
+    }
+}
+
+pub(in crate::history) fn feature_input_lane(
+    id: &str,
+    configuration: Option<&str>,
+) -> crate::records::FeatureInputLane {
+    crate::records::FeatureInputLane {
+        id: id.into(),
+        configuration: configuration.map(str::to_string),
+        native_payload: Vec::new().into(),
+        classes: Vec::new(),
+        names: Vec::new(),
+        scalars: Vec::new(),
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: Vec::new(),
+    }
+}
+
+pub(in crate::history) fn design_configuration(
+    id: &str,
+    ordinal: u32,
+    source_index: Option<u32>,
+    native_ref: Option<&str>,
+) -> DesignConfiguration {
+    DesignConfiguration {
+        id: ConfigurationId::mint(format!("synthetic:test:id#{id}")).expect("identity grammar"),
+        ordinal,
+        active: false,
+        source_index,
+        name: Some(id.to_string()),
+        material: None,
+        properties: BTreeMap::new(),
+        bodies: Some(cadmpeg_ir::features::DistinctMembers::default()),
+        parameter_values: BTreeMap::new(),
+        parameter_overrides: BTreeMap::new(),
+        feature_states: BTreeMap::new(),
+        native_ref: native_ref.map(str::to_string),
+    }
+}
+
+pub(in crate::history) fn native_configuration(
+    id: &str,
+    ordinal: u32,
+    source_index: Option<u32>,
+) -> Configuration {
+    Configuration {
+        id: id.into(),
+        parent: "history".into(),
+        ordinal,
+        source_index,
+        name: id.to_string(),
+        material: None,
+        properties: BTreeMap::new(),
+    }
+}
+
+pub(in crate::history) fn with_configuration_id(
+    mut configuration: DesignConfiguration,
+    id: u32,
+) -> DesignConfiguration {
+    configuration
+        .properties
+        .insert(cadmpeg_core::nonblank_literal!("id"), id.to_string());
+    configuration
+}
+
+pub(in crate::history) fn native_with_configuration_lanes(
+    configurations: Vec<Configuration>,
+    lanes: Vec<crate::records::FeatureInputLane>,
+) -> crate::native::SldprtNative {
+    crate::native::SldprtNative {
+        feature_histories: vec![FeatureHistory {
+            id: "history".into(),
+            part_name: None,
+            properties: BTreeMap::new(),
+            content: Vec::new(),
+            configurations,
+            features: Vec::new(),
+        }],
+        feature_input_lanes: lanes,
+        ..crate::native::SldprtNative::default()
+    }
+}
+
+mod configuration_identity;
+mod diagnostics;
+mod equations;
+mod extrusion_profile;
+mod feature_operations;
+mod metadata;
+mod sketch_bind;
+mod sketch_relations;
+mod tree_binding;

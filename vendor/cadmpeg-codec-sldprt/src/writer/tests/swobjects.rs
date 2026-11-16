@@ -1,0 +1,1303 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Semantic writer tests.
+#![allow(clippy::unwrap_used)]
+
+use cadmpeg_test_support::{edit, EditableDecodeResult};
+
+use cadmpeg_ir::codec::write::target::TargetRequest;
+use cadmpeg_ir::codec::write::EncodeInput;
+use std::io::Cursor;
+
+use cadmpeg_ir::codec::write::Encoder;
+use cadmpeg_ir::codec::{Codec, DecodeOptions};
+
+use crate::test_support::appearance::material_payload;
+use crate::test_support::appearance::sldprt_with_body_and_material;
+use crate::test_support::container::make_block;
+use crate::test_support::container::sldprt_with_body;
+use crate::test_support::native::sldprt_native;
+use crate::test_support::parasolid::triangle_body;
+use crate::SldprtCodec;
+
+#[test]
+fn semantic_writer_replays_unchanged_swobjects_payload() {
+    let mut payload = material_payload("Steel", [32, 64, 128]);
+    payload.extend([0xde, 0xad, 0xbe, 0xef]);
+    let mut source = sldprt_with_body(&triangle_body());
+    source.extend(make_block(0x40, "SWObjects", &payload));
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let mut decoded = EditableDecodeResult::from(decoded);
+    decoded
+        .ir_mut()
+        .source
+        .as_mut()
+        .unwrap()
+        .attributes
+        .remove(cadmpeg_ir::hash::DOCUMENT_LOCAL_DIGEST_ATTRIBUTE);
+
+    let mut encoded = Vec::new();
+    let path = crate::test_support::plan_fixture_write_with_native_envelope(
+        decoded.ir(),
+        decoded.source_fidelity(),
+        &mut encoded,
+    )
+    .unwrap();
+    assert!(matches!(
+        path,
+        cadmpeg_ir::report::export::WritePath::Patched { .. }
+    ));
+    let regenerated = EditableDecodeResult::from(
+        SldprtCodec
+            .decode(&mut Cursor::new(encoded), &DecodeOptions::default())
+            .unwrap(),
+    );
+    let retained = regenerated
+        .source_fidelity()
+        .retained_records()
+        .values()
+        .find(|record| record.stream() == "SWObjects")
+        .unwrap();
+    assert_eq!(retained.data(), Some(payload.as_slice()));
+}
+
+#[test]
+fn semantic_writer_rejects_edits_to_retained_swobjects_semantics() {
+    let source = sldprt_with_body_and_material(&triangle_body(), "Steel", [32, 64, 128]);
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let mut decoded = EditableDecodeResult::from(decoded);
+    decoded.ir_mut().model.appearances[0].base_color =
+        Some(cadmpeg_ir::topology::Color::new(1.0, 0.0, 0.0, 1.0).expect("valid color"));
+
+    let error = crate::test_support::plan_inherited_write(
+        decoded.ir(),
+        decoded.source_fidelity(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot edit retained SWObjects semantics"),
+        "{error}"
+    );
+}
+
+#[test]
+fn encoder_writes_authored_with_retained_native_envelope_ir() {
+    let mut ir = cadmpeg_ir::examples::unit_cube().expect("unit cube fixture is admitted");
+    ir.model.bodies[0].name = None;
+    ir.model.faces.iter_mut().for_each(|face| face.name = None);
+    ir.model
+        .edges
+        .iter_mut()
+        .for_each(|edge| edge.set_param_range(None));
+
+    let mut encoded = Vec::new();
+    let report = crate::test_support::plan_fixture_with_native_envelope(
+        EncodeInput::new(&ir, None),
+        TargetRequest::Inherit,
+    )
+    .and_then(|plan| plan.write_to(&mut encoded))
+    .unwrap();
+    // Geometry is authored in the explicit retained envelope.
+    assert!(matches!(
+        report.write_path(),
+        cadmpeg_ir::report::export::WritePath::Patched { .. }
+    ));
+    let scan = crate::test_support::container::scan(&encoded);
+    assert_eq!(scan.blocks.len(), 2);
+    assert_eq!(scan.directory.len(), 2);
+    let names: std::collections::BTreeSet<_> = scan
+        .blocks
+        .iter()
+        .map(|block| block.section.name().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["Contents/Config-0-Partition", "Contents/Keywords-0"])
+    );
+    let keywords = scan
+        .blocks
+        .iter()
+        .find(|block| block.section.name() == Some("Contents/Keywords-0"))
+        .unwrap();
+    assert_eq!(keywords.payload, b"<Keywords></Keywords>");
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(encoded), &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(decoded.ir().model.bodies.len(), 1);
+    assert_eq!(decoded.ir().model.faces.len(), 6);
+    assert_eq!(decoded.ir().model.edges.len(), 12);
+    assert_eq!(decoded.ir().model.vertices.len(), 8);
+}
+
+#[test]
+fn semantic_writer_emits_face_records_deterministically() {
+    use cadmpeg_ir::topology::Color;
+
+    let mut ir = cadmpeg_ir::examples::unit_cube().expect("unit cube fixture is admitted");
+    ir.model.bodies[0].name = None;
+    ir.model.faces.iter_mut().for_each(|face| face.name = None);
+    ir.model
+        .edges
+        .iter_mut()
+        .for_each(|edge| edge.set_param_range(None));
+    for (index, face) in ir.model.faces.iter_mut().enumerate() {
+        face.color = Some(
+            Color::new(
+                f32::from(u16::try_from(index).expect("index fits u16")) / 10.0,
+                f32::from(u16::try_from(index + 1).expect("index fits u16")) / 10.0,
+                f32::from(u16::try_from(index + 2).expect("index fits u16")) / 10.0,
+                1.0,
+            )
+            .expect("valid color"),
+        );
+    }
+
+    let mut expected = None;
+    for _ in 0..4 {
+        let mut encoded = Vec::new();
+        crate::test_support::plan_fixture_with_native_envelope(
+            EncodeInput::new(&ir, None),
+            TargetRequest::Inherit,
+        )
+        .and_then(|plan| plan.write_to(&mut encoded))
+        .unwrap();
+        if let Some(expected) = &expected {
+            assert_eq!(expected, &encoded);
+        } else {
+            expected = Some(encoded);
+        }
+    }
+}
+
+#[test]
+fn encoder_rejects_source_less_unresolved_extrusion_profile() {
+    use cadmpeg_ir::features::{
+        BooleanOp, ExtrudeExtent, ExtrudeSide, Feature, FeatureDefinition, FeatureId,
+        FeatureOperation, LinearTermination, PlanarProfileRef, ProfileRef,
+    };
+
+    let mut ir = cadmpeg_ir::examples::unit_cube().expect("unit cube fixture is admitted");
+    ir.model.features.push(Feature {
+        product_definition: None,
+        id: FeatureId::mint("synthetic:test:feature#extrude").expect("identity grammar"),
+        ordinal: 0,
+        name: Some("Extrude".into()),
+        suppressed: Some(false),
+        dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+        source_properties: std::collections::BTreeMap::new(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+            FeatureDefinition::Operation(FeatureOperation::Extrude {
+                profile: ProfileRef::Planar(PlanarProfileRef::Unresolved(
+                    "native:missing-owner".into(),
+                )),
+                direction: cadmpeg_ir::features::ExtrudeDirection::ProfileNormal {},
+                start: cadmpeg_ir::features::ExtrudeStart::ProfilePlane {},
+                extent: ExtrudeExtent::OneSided {
+                    side: ExtrudeSide {
+                        termination: LinearTermination::Blind {
+                            length: cadmpeg_ir::scalar::NonZeroLength::new(10.0).unwrap(),
+                        },
+                        draft: None,
+                    },
+                },
+                op: BooleanOp::Join,
+                solid: None,
+                face_maker: None,
+                inner_wire_taper: None,
+                length_along_profile_normal: None,
+                allow_multi_profile_faces: None,
+            }),
+        ),
+        native_ref: None,
+    });
+
+    let error = SldprtCodec
+        .plan(EncodeInput::new(&ir, None), TargetRequest::Inherit)
+        .and_then(|plan| plan.write_to(&mut Vec::new()))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("requires retained extrusion profile data"));
+}
+
+#[test]
+fn encoder_writes_authored_with_retained_native_envelope_line_sketches() {
+    use cadmpeg_ir::math::{Point2, Point3, Vector3};
+    use cadmpeg_ir::sketches::{
+        Sketch, SketchConstraint, SketchConstraintDefinitionInput, SketchConstraintId,
+        SketchEntity, SketchEntityId, SketchEntityUse, SketchGeometry, SketchGeometryDefinition,
+        SketchId, SketchLocus,
+    };
+    use cadmpeg_ir::{
+        features::{
+            AngularTermination, BooleanOp, ExtrudeExtent, ExtrudeSide, Feature, FeatureDefinition,
+            FeatureId, FeatureOperation, LinearTermination, PathRef, PlanarProfileRef, ProfileRef,
+            RevolveExtent,
+        },
+        scalar::Angle,
+    };
+
+    let mut ir = cadmpeg_ir::examples::unit_cube().expect("unit cube fixture is admitted");
+    ir.model.bodies[0].name = None;
+    ir.model.faces.iter_mut().for_each(|face| face.name = None);
+    ir.model
+        .edges
+        .iter_mut()
+        .for_each(|edge| edge.set_param_range(None));
+    let sketch_id = SketchId::mint("synthetic:test:sketch#profile").unwrap();
+    let points = [
+        Point2::new(0.0, 0.0),
+        Point2::new(10.0, 0.0),
+        Point2::new(0.0, 10.0),
+    ];
+    let entity_ids = (0..3)
+        .map(|index| {
+            SketchEntityId::mint(format!("synthetic:test:sketch-entity#line-{index}")).unwrap()
+        })
+        .collect::<Vec<_>>();
+    for index in 0..3 {
+        ir.model.sketch_entities.push(SketchEntity::new(
+            entity_ids[index].clone(),
+            sketch_id.clone(),
+            SketchGeometry::try_from(SketchGeometryDefinition::Line {
+                start: points[index],
+                end: points[(index + 1) % 3],
+            })
+            .unwrap(),
+        ));
+    }
+    for index in 0..3 {
+        ir.model.sketch_constraints.push(SketchConstraint {
+            id: SketchConstraintId::mint(format!("synthetic:test:constraint#coincident-{index}"))
+                .unwrap(),
+            sketch: sketch_id.clone(),
+            definition: cadmpeg_ir::sketches::SketchConstraintDefinition::try_from(
+                SketchConstraintDefinitionInput::CoincidentLoci {
+                    loci: vec![
+                        SketchLocus::End(entity_ids[index].clone()),
+                        SketchLocus::Start(entity_ids[(index + 1) % 3].clone()),
+                    ],
+                },
+            )
+            .unwrap(),
+            name: None,
+            driving: None,
+            active: None,
+            virtual_space: None,
+            visible: None,
+            orientation: None,
+            label_distance: None,
+            label_position: None,
+            metadata: None,
+            native_ref: None,
+        });
+    }
+    for (suffix, definition) in [
+        (
+            "fixed",
+            SketchConstraintDefinitionInput::Fixed {
+                entity: entity_ids[1].clone(),
+            },
+        ),
+        (
+            "horizontal",
+            SketchConstraintDefinitionInput::Horizontal {
+                entity: entity_ids[0].clone(),
+            },
+        ),
+        (
+            "vertical",
+            SketchConstraintDefinitionInput::Vertical {
+                entity: entity_ids[2].clone(),
+            },
+        ),
+    ] {
+        ir.model.sketch_constraints.push(SketchConstraint {
+            id: SketchConstraintId::mint(format!("synthetic:test:constraint#{suffix}")).unwrap(),
+            sketch: sketch_id.clone(),
+            definition: cadmpeg_ir::sketches::SketchConstraintDefinition::try_from(definition)
+                .unwrap(),
+            name: None,
+            driving: None,
+            active: None,
+            virtual_space: None,
+            visible: None,
+            orientation: None,
+            label_distance: None,
+            label_position: None,
+            metadata: None,
+            native_ref: None,
+        });
+    }
+    ir.model.sketch_entities.push(SketchEntity::new(
+        SketchEntityId::mint("synthetic:test:sketch-entity#point").unwrap(),
+        sketch_id.clone(),
+        SketchGeometry::try_from(SketchGeometryDefinition::Point {
+            position: Point2::new(4.0, 5.0),
+        })
+        .unwrap(),
+    ));
+    ir.model.sketches.push(Sketch {
+        id: sketch_id.clone(),
+        name: Some("Profile".into()),
+        configuration: None,
+        visible: None,
+        placement: cadmpeg_ir::sketches::SketchPlacement::try_resolved(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        )
+        .unwrap(),
+        profiles: cadmpeg_ir::sketches::SketchProfiles::try_from(vec![entity_ids
+            .iter()
+            .cloned()
+            .map(|entity| SketchEntityUse {
+                entity,
+                reversed: false,
+            })
+            .collect()])
+        .unwrap(),
+        native_ref: None,
+    });
+    let sketch_feature_id =
+        FeatureId::mint("synthetic:test:feature#profile").expect("identity grammar");
+    ir.model.features.push(Feature {
+        product_definition: None,
+        id: sketch_feature_id.clone(),
+        ordinal: 0,
+        name: Some("Profile".into()),
+        suppressed: Some(false),
+        dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+        source_properties: std::collections::BTreeMap::new(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+            FeatureDefinition::Operation(FeatureOperation::Sketch {
+                sketch: cadmpeg_ir::features::SketchFeatureBinding::Planar(Some(sketch_id.clone())),
+            }),
+        ),
+        native_ref: None,
+    });
+    let profile = cadmpeg_ir::features::PlanarProfileRef::Sketch(sketch_id.clone());
+    let path = PathRef::Sketch(sketch_id.clone());
+    let generated = [
+        FeatureDefinition::Operation(FeatureOperation::Revolve {
+            construction: cadmpeg_ir::features::RevolveConstruction::Resolved {
+                profile: profile.clone(),
+                axis: cadmpeg_ir::features::RevolutionAxis {
+                    origin: cadmpeg_ir::features::FinitePoint3::new(Point3::new(0.0, 0.0, 0.0))
+                        .unwrap(),
+                    direction: cadmpeg_ir::features::FeatureDirection3::new(Vector3::new(
+                        0.0, 1.0, 0.0,
+                    ))
+                    .unwrap(),
+                    reference: None,
+                },
+                extent: RevolveExtent::OneSided {
+                    termination: AngularTermination::Angle {
+                        angle: cadmpeg_ir::scalar::PositiveAngle::new(1.2).unwrap(),
+                    },
+                },
+                solid: Some(true),
+                face_maker: None,
+                fuse_order: None,
+                allow_multi_profile_faces: None,
+            },
+            op: BooleanOp::NewBody,
+        }),
+        FeatureDefinition::Operation(FeatureOperation::Sweep {
+            shape: cadmpeg_ir::features::SweepShape::sheet_sections(
+                cadmpeg_ir::features::SweepMode::Solid {
+                    op: cadmpeg_ir::features::SolidSweepOperation::Join,
+                },
+                cadmpeg_ir::features::SweepSection::Profile(profile.clone()),
+                Vec::new(),
+            ),
+            path: Some(path.clone()),
+            orientation: None,
+            transition: None,
+            transformation: None,
+            path_tangent: false,
+            linearize: false,
+            twist: Some(Angle::new(0.3).unwrap()),
+            path_extent: None,
+            guide_rail: None,
+            taper: None,
+            scale: Some(cadmpeg_ir::scalar::PositiveReal::new(1.5).unwrap()),
+            allow_multi_profile_faces: None,
+        }),
+        FeatureDefinition::Operation(FeatureOperation::Loft {
+            sections: vec![
+                cadmpeg_ir::features::LoftSection::Profile(ProfileRef::Planar(profile.clone())),
+                cadmpeg_ir::features::LoftSection::Profile(ProfileRef::Planar(profile.clone())),
+            ],
+            guidance: cadmpeg_ir::features::LoftGuidance::Guides(vec![path]),
+            op: BooleanOp::NewBody,
+            closed: false,
+            solid: true,
+            ruled: false,
+            linearize: false,
+            max_degree: None,
+            allow_multi_profile_faces: None,
+        }),
+        FeatureDefinition::Operation(FeatureOperation::Rib {
+            construction: cadmpeg_ir::features::RibConstruction {
+                profile: Some(profile),
+                direction: Some(
+                    cadmpeg_ir::features::FeatureDirection3::new(Vector3::new(0.0, 0.0, 1.0))
+                        .unwrap(),
+                ),
+                thickness: Some(cadmpeg_ir::scalar::PositiveLength::new(2.5).unwrap()),
+                side: Some(cadmpeg_ir::features::RibSide::Centered),
+                draft: cadmpeg_ir::features::RibDraft::Angle(
+                    cadmpeg_ir::scalar::SlopeAngle::new(0.1).unwrap(),
+                ),
+            },
+            op: BooleanOp::Join,
+        }),
+    ];
+    for (index, definition) in generated.into_iter().enumerate() {
+        ir.model.features.push(Feature {
+            product_definition: None,
+            id: FeatureId::mint(format!("synthetic:test:feature#profile-op-{index}"))
+                .expect("identity grammar"),
+            ordinal: cadmpeg_core::decode::u64_from_index(index) + 2,
+            name: Some(format!("Profile op {index}")),
+            suppressed: Some(false),
+            dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+            source_properties: std::collections::BTreeMap::new(),
+            source_tag: None,
+            source_text: None,
+            source_content: cadmpeg_ir::features::FeatureContent::default(),
+            evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(definition),
+            native_ref: None,
+        });
+    }
+    let extrude_feature_id =
+        FeatureId::mint("synthetic:test:feature#extrude").expect("identity grammar");
+    ir.model.features.push(Feature {
+        product_definition: None,
+        id: extrude_feature_id.clone(),
+        ordinal: 1,
+        name: Some("Boss".into()),
+        suppressed: Some(false),
+        dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+        source_properties: std::collections::BTreeMap::new(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+            FeatureDefinition::Operation(FeatureOperation::Extrude {
+                profile: ProfileRef::Planar(PlanarProfileRef::Sketch(sketch_id)),
+                direction: cadmpeg_ir::features::ExtrudeDirection::Explicit {
+                    vector: cadmpeg_ir::features::FeatureDirection3::new(Vector3::new(
+                        0.0, 0.0, 1.0,
+                    ))
+                    .unwrap(),
+                    source: None,
+                },
+                start: cadmpeg_ir::features::ExtrudeStart::ProfilePlane {},
+                extent: ExtrudeExtent::OneSided {
+                    side: ExtrudeSide {
+                        termination: LinearTermination::Blind {
+                            length: cadmpeg_ir::scalar::NonZeroLength::new(12.0).unwrap(),
+                        },
+                        draft: None,
+                    },
+                },
+                op: BooleanOp::Join,
+                solid: Some(true),
+                face_maker: None,
+                inner_wire_taper: None,
+                length_along_profile_normal: None,
+                allow_multi_profile_faces: None,
+            }),
+        ),
+        native_ref: None,
+    });
+    ir.model
+        .set_feature_regeneration_parent(&(extrude_feature_id), &(sketch_feature_id))
+        .unwrap();
+
+    let mut encoded = Vec::new();
+    crate::test_support::plan_fixture_with_native_envelope(
+        EncodeInput::new(&ir, None),
+        TargetRequest::Inherit,
+    )
+    .and_then(|plan| plan.write_to(&mut encoded))
+    .unwrap();
+    let scan = crate::test_support::container::scan(&encoded);
+    assert!(scan.blocks.iter().any(|block| {
+        block
+            .section
+            .name()
+            .is_some_and(|section| section == "Contents/Config-0-ResolvedFeatures")
+    }));
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(encoded), &DecodeOptions::default())
+        .unwrap();
+    let mut decoded = EditableDecodeResult::from(decoded);
+    let marker_lane = &sldprt_native(decoded.ir()).feature_input_lanes[0];
+    assert_eq!(
+        marker_lane
+            .sketch_entities
+            .iter()
+            .filter(|marker| marker.coordinates_m.is_some())
+            .count(),
+        7
+    );
+    let marker_relations = marker_lane
+        .sketch_entities
+        .iter()
+        .filter(|marker| matches!(marker.kind(), crate::records::SketchInputKind::Relation(_)))
+        .collect::<Vec<_>>();
+    assert_eq!(marker_relations.len(), 3);
+    assert!(marker_relations
+        .iter()
+        .all(|marker| marker.links().len() == 2
+            && marker
+                .links
+                .as_ref()
+                .map(crate::records::SketchInputLinks::selector)
+                == Some(0)));
+    assert!(marker_relations
+        .iter()
+        .all(|marker| marker.links().iter().all(|link| marker_lane
+            .sketch_entities
+            .iter()
+            .any(|candidate| candidate.id() == link.entity_ref
+                && candidate.local_id() == Some(u32::from(link.local_id))))));
+    assert_eq!(decoded.ir().model.sketches.len(), 1);
+    assert_eq!(decoded.ir().model.sketches[0].profiles.len(), 1);
+    assert_eq!(decoded.ir().model.sketches[0].profiles[0].len(), 3);
+    assert_eq!(decoded.ir().model.sketch_entities.len(), 4);
+    assert_eq!(
+        decoded.ir().model.sketch_constraints.len(),
+        6,
+        "{:?}",
+        decoded.ir().model.sketch_constraints
+    );
+    assert!(decoded
+        .ir()
+        .model
+        .sketch_constraints
+        .iter()
+        .any(|constraint| {
+            matches!(
+                constraint.definition.kind(),
+                SketchConstraintDefinitionInput::Horizontal { .. }
+            )
+        }));
+    assert!(decoded
+        .ir()
+        .model
+        .sketch_constraints
+        .iter()
+        .any(|constraint| {
+            matches!(
+                constraint.definition.kind(),
+                SketchConstraintDefinitionInput::Vertical { .. }
+            )
+        }));
+    assert!(decoded
+        .ir()
+        .model
+        .sketch_constraints
+        .iter()
+        .any(|constraint| {
+            matches!(
+                constraint.definition.kind(),
+                SketchConstraintDefinitionInput::Fixed { .. }
+            )
+        }));
+    assert_eq!(
+        decoded
+            .ir()
+            .model
+            .sketch_entities
+            .iter()
+            .filter(|entity| matches!(
+                *entity.geometry.definition(),
+                SketchGeometryDefinition::Line { .. }
+            ))
+            .count(),
+        3
+    );
+    assert!(decoded.ir().model.sketch_entities.iter().any(
+        |entity| matches!(*entity.geometry.definition(),
+            SketchGeometryDefinition::Point { position }
+                if (position.u - 4.0).abs() < 1.0e-12
+                    && (position.v - 5.0).abs() < 1.0e-12
+        )
+    ));
+    assert!(decoded.ir().model.features.iter().any(|feature| matches!(
+        feature.evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Sketch {
+            sketch: cadmpeg_ir::features::SketchFeatureBinding::Planar(Some(_))
+        })
+    )));
+    assert!(decoded.ir().model.features.iter().any(|feature| matches!(
+        feature.evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Extrude {
+            profile: ProfileRef::Planar(PlanarProfileRef::Sketch(_)),
+            extent: ExtrudeExtent::OneSided {
+                side: ExtrudeSide {
+                    termination: LinearTermination::Blind {
+                        length: actual_length
+                    },
+                    ..
+                }
+            },
+            op: BooleanOp::Join,
+            ..
+        }) if actual_length.get() == 12.0
+    )));
+    assert!(decoded.ir().model.features.iter().any(|feature| matches!(
+        feature.evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Revolve { .. })
+    )));
+    assert!(decoded.ir().model.features.iter().any(|feature| matches!(
+        feature.evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Sweep { .. })
+    )));
+    assert!(decoded.ir().model.features.iter().any(|feature| matches!(
+        feature.evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Loft { .. })
+    )));
+    assert!(decoded.ir().model.features.iter().any(|feature| matches!(
+        feature.evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Rib { .. })
+    )));
+    {
+        let mut ir_edit = decoded.ir_mut();
+        let point = ir_edit
+            .model
+            .sketch_entities
+            .iter_mut()
+            .find(|entity| {
+                matches!(
+                    entity.geometry.definition(),
+                    SketchGeometryDefinition::Point { .. }
+                )
+            })
+            .unwrap();
+        edit::replace(&mut point.geometry, |previous| {
+            let mut definition = previous.definition().to_raw();
+            {
+                let definition: &mut cadmpeg_ir::sketches::SketchGeometryDefinition =
+                    &mut definition;
+
+                let SketchGeometryDefinition::Point { position } = definition else {
+                    panic!("point geometry")
+                };
+                position.u = 7.0;
+                position.v = 8.0;
+            };
+            definition.try_into()
+        })
+        .unwrap();
+    }
+    let mut rewritten = Vec::new();
+    crate::test_support::plan_inherited_write(
+        decoded.ir(),
+        decoded.source_fidelity(),
+        &mut rewritten,
+    )
+    .unwrap();
+    let rewritten = SldprtCodec
+        .decode(&mut Cursor::new(rewritten), &DecodeOptions::default())
+        .unwrap();
+    assert!(rewritten.ir().model.sketch_entities.iter().any(
+        |entity| matches!(*entity.geometry.definition(),
+            SketchGeometryDefinition::Point { position }
+                if (position.u - 7.0).abs() < 1.0e-12
+                    && (position.v - 8.0).abs() < 1.0e-12
+        )
+    ));
+}
+
+#[test]
+fn encoder_writes_authored_with_retained_native_envelope_spatial_point_and_line_sketches() {
+    use cadmpeg_ir::features::{Feature, FeatureDefinition, FeatureId, FeatureOperation};
+    use cadmpeg_ir::math::Point3;
+    use cadmpeg_ir::sketches::{
+        SpatialSketch, SpatialSketchEntity, SpatialSketchEntityId, SpatialSketchGeometry,
+        SpatialSketchGeometryDefinition, SpatialSketchId,
+    };
+
+    let mut ir = cadmpeg_ir::examples::unit_cube().expect("unit cube fixture is admitted");
+    ir.model.bodies[0].name = None;
+    ir.model.faces.iter_mut().for_each(|face| face.name = None);
+    ir.model
+        .edges
+        .iter_mut()
+        .for_each(|edge| edge.set_param_range(None));
+    let sketch_id = SpatialSketchId::mint("synthetic:test:spatial-sketch#path").unwrap();
+    let entity_id =
+        SpatialSketchEntityId::mint("synthetic:test:spatial-sketch-entity#line").unwrap();
+    let start = Point3::new(1.25, -2.5, 3.75);
+    let end = Point3::new(4.5, 5.25, -6.0);
+    let second_start = Point3::new(-7.0, 8.5, 9.25);
+    let second_end = Point3::new(10.0, -11.5, 12.75);
+    let point = Point3::new(-13.0, 14.25, 15.5);
+    ir.model.spatial_sketches.push(SpatialSketch {
+        id: sketch_id.clone(),
+        name: Some("Spatial path".into()),
+        configuration: Some("0".into()),
+        visible: None,
+        profiles: Vec::new(),
+        native_ref: None,
+    });
+    ir.model
+        .spatial_sketch_entities
+        .push(SpatialSketchEntity::new(
+            SpatialSketchEntityId::mint("synthetic:test:spatial-sketch-entity#a-point").unwrap(),
+            sketch_id.clone(),
+            SpatialSketchGeometry::try_from(SpatialSketchGeometryDefinition::Point {
+                position: point,
+            })
+            .unwrap(),
+        ));
+    ir.model
+        .spatial_sketch_entities
+        .push(SpatialSketchEntity::new(
+            entity_id,
+            sketch_id.clone(),
+            SpatialSketchGeometry::try_from(SpatialSketchGeometryDefinition::Line { start, end })
+                .unwrap(),
+        ));
+    ir.model
+        .spatial_sketch_entities
+        .push(SpatialSketchEntity::new(
+            SpatialSketchEntityId::mint("synthetic:test:spatial-sketch-entity#second-line")
+                .unwrap(),
+            sketch_id.clone(),
+            SpatialSketchGeometry::try_from(SpatialSketchGeometryDefinition::Line {
+                start: second_start,
+                end: second_end,
+            })
+            .unwrap(),
+        ));
+    ir.model.features.push(Feature {
+        product_definition: None,
+        id: FeatureId::mint("synthetic:test:feature#spatial-path").expect("identity grammar"),
+        ordinal: 0,
+        name: Some("Spatial path".into()),
+        suppressed: Some(false),
+        dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+        source_properties: std::collections::BTreeMap::new(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+            FeatureDefinition::Operation(FeatureOperation::SpatialSketch {
+                sketch: Some(sketch_id),
+            }),
+        ),
+        native_ref: None,
+    });
+
+    let mut encoded = Vec::new();
+    crate::test_support::plan_fixture_with_native_envelope(
+        EncodeInput::new(&ir, None),
+        TargetRequest::Inherit,
+    )
+    .and_then(|plan| plan.write_to(&mut encoded))
+    .unwrap();
+    let regenerated = SldprtCodec
+        .decode(&mut Cursor::new(encoded), &DecodeOptions::default())
+        .unwrap();
+    let mut regenerated = EditableDecodeResult::from(regenerated);
+
+    assert_eq!(regenerated.ir().model.spatial_sketches.len(), 1);
+    assert_eq!(regenerated.ir().model.spatial_sketch_entities.len(), 3);
+    assert!(
+        matches!(*regenerated.ir().model.spatial_sketch_entities[0].geometry.definition(),
+            SpatialSketchGeometryDefinition::Point { position }
+                if (position.x - point.x).abs() < 1.0e-12
+                    && (position.y - point.y).abs() < 1.0e-12
+                    && (position.z - point.z).abs() < 1.0e-12
+        )
+    );
+    assert!(
+        matches!(*regenerated.ir().model.spatial_sketch_entities[1].geometry.definition(),
+            SpatialSketchGeometryDefinition::Line {
+                start: regenerated_start,
+                end: regenerated_end,
+            } if regenerated_start == start && regenerated_end == end
+        )
+    );
+    assert!(
+        matches!(*regenerated.ir().model.spatial_sketch_entities[2].geometry.definition(),
+            SpatialSketchGeometryDefinition::Line {
+                start: regenerated_start,
+                end: regenerated_end,
+            } if regenerated_start == second_start && regenerated_end == second_end
+        )
+    );
+    assert!(matches!(
+        regenerated.ir().model.features[0].evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::SpatialSketch { sketch: Some(_) })
+    ));
+
+    let edited_start = Point3::new(13.0, 14.0, 15.0);
+    let edited_end = Point3::new(-16.0, 17.0, 18.0);
+    let edited_point = Point3::new(19.0, -20.0, 21.5);
+    regenerated.ir_mut().model.spatial_sketch_entities[0].geometry =
+        SpatialSketchGeometry::try_from(SpatialSketchGeometryDefinition::Point {
+            position: edited_point,
+        })
+        .unwrap();
+    regenerated.ir_mut().model.spatial_sketch_entities[2].geometry =
+        SpatialSketchGeometry::try_from(SpatialSketchGeometryDefinition::Line {
+            start: edited_start,
+            end: edited_end,
+        })
+        .unwrap();
+    let mut rewritten = Vec::new();
+    crate::test_support::plan_inherited_write(
+        regenerated.ir(),
+        regenerated.source_fidelity(),
+        &mut rewritten,
+    )
+    .unwrap();
+    let rewritten = SldprtCodec
+        .decode(&mut Cursor::new(rewritten), &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(rewritten.ir().model.spatial_sketch_entities.len(), 3);
+    assert!(
+        matches!(*rewritten.ir().model.spatial_sketch_entities[0].geometry.definition(),
+            SpatialSketchGeometryDefinition::Point { position }
+                if (position.x - edited_point.x).abs() < 1.0e-12
+                    && (position.y - edited_point.y).abs() < 1.0e-12
+                    && (position.z - edited_point.z).abs() < 1.0e-12
+        )
+    );
+    assert!(
+        matches!(*rewritten.ir().model.spatial_sketch_entities[2].geometry.definition(),
+            SpatialSketchGeometryDefinition::Line { start, end }
+                if start == edited_start && end == edited_end
+        )
+    );
+}
+
+#[test]
+fn encoder_rejects_unrepresentable_source_less_sketch_constraints() {
+    use cadmpeg_ir::math::{Point2, Point3, Vector3};
+    use cadmpeg_ir::sketches::{
+        Sketch, SketchConstraint, SketchConstraintDefinitionInput, SketchConstraintId,
+        SketchEntity, SketchEntityId, SketchEntityUse, SketchGeometry, SketchGeometryDefinition,
+        SketchId,
+    };
+
+    let mut ir = cadmpeg_ir::examples::unit_cube().expect("unit cube fixture is admitted");
+    let sketch_id = SketchId::mint("synthetic:test:sketch#profile").unwrap();
+    let entity_id = SketchEntityId::mint("synthetic:test:sketch-entity#line").unwrap();
+    ir.model.sketches.push(Sketch {
+        id: sketch_id.clone(),
+        name: Some("Profile".into()),
+        configuration: None,
+        visible: None,
+        placement: cadmpeg_ir::sketches::SketchPlacement::try_resolved(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        )
+        .unwrap(),
+        profiles: cadmpeg_ir::sketches::SketchProfiles::try_from(vec![vec![SketchEntityUse {
+            entity: entity_id.clone(),
+            reversed: false,
+        }]])
+        .unwrap(),
+        native_ref: None,
+    });
+    ir.model.sketch_entities.push(SketchEntity::new(
+        entity_id.clone(),
+        sketch_id.clone(),
+        SketchGeometry::try_from(SketchGeometryDefinition::Line {
+            start: Point2::new(0.0, 0.0),
+            end: Point2::new(1.0, 0.0),
+        })
+        .unwrap(),
+    ));
+    ir.model.sketch_constraints.push(SketchConstraint {
+        id: SketchConstraintId::mint("synthetic:test:constraint#horizontal").unwrap(),
+        sketch: sketch_id,
+        definition: cadmpeg_ir::sketches::SketchConstraintDefinition::try_from(
+            SketchConstraintDefinitionInput::Horizontal { entity: entity_id },
+        )
+        .unwrap(),
+        name: None,
+        driving: None,
+        active: None,
+        virtual_space: None,
+        visible: None,
+        orientation: None,
+        label_distance: None,
+        label_position: None,
+        metadata: None,
+        native_ref: None,
+    });
+
+    let error = SldprtCodec
+        .plan(EncodeInput::new(&ir, None), TargetRequest::Inherit)
+        .and_then(|plan| plan.write_to(&mut Vec::new()))
+        .unwrap_err();
+    assert!(matches!(error, cadmpeg_core::CodecError::NotImplemented(_)));
+    assert!(error
+        .to_string()
+        .contains("requires an owning sketch feature"));
+}
+
+/// A finite millimetre length whose product with the length scale is not
+/// finite has no source-unit value.
+#[test]
+fn the_metadata_projection_refuses_a_length_that_overflows_in_source_units() {
+    use cadmpeg_ir::attributes::{AttributeTarget, AttributeValue, SourceAttribute};
+
+    let attribute = SourceAttribute {
+        id: cadmpeg_ir::ids::AttributeId::mint("sldprt:metadata:default_reference_plane#0")
+            .unwrap(),
+        target: AttributeTarget::Document,
+        name: "default_reference_plane".into(),
+        values: vec![
+            AttributeValue::vector([1.0e10, 2.0, 3.0]).unwrap(),
+            AttributeValue::vector([0.0, 0.0, 1.0, 1.0, 0.0, 0.0]).unwrap(),
+        ],
+    };
+    assert!(crate::writer::MetadataRecord::project(&attribute, 0.001, |_| Ok(())).is_ok());
+    let Err(error) = crate::writer::MetadataRecord::project(&attribute, 1.0e300, |_| Ok(())) else {
+        panic!("an overflowing origin has no source-unit value");
+    };
+    assert_eq!(
+        error.to_string(),
+        "malformed container: invalid default reference plane"
+    );
+}
+
+/// The retained `SWObjects` section `payload` after the patch writer states
+/// the document attribute `name` with `values` in the record at byte zero.
+fn patched_retained_metadata(
+    name: &str,
+    values: Vec<cadmpeg_ir::attributes::AttributeValue>,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, cadmpeg_core::CodecError> {
+    use cadmpeg_ir::attributes::{AttributeTarget, SourceAttribute};
+
+    let id = format!("sldprt:metadata:{name}#0:0");
+    let mut ir = cadmpeg_ir::CadIr::empty();
+    ir.model.attributes.push(SourceAttribute {
+        id: cadmpeg_ir::ids::AttributeId::mint(&id).unwrap(),
+        target: AttributeTarget::Document,
+        name: name.into(),
+        values,
+    });
+    let mut annotations = cadmpeg_ir::annotations::Annotations::default();
+    crate::annotations::note(
+        &mut annotations,
+        id,
+        &cadmpeg_ir::stream_name!("SWObjects"),
+        0,
+        "metadata",
+        cadmpeg_ir::Exactness::ByteExact,
+    )?;
+    let mut sections = vec![("SWObjects".to_owned(), payload)];
+    crate::writer::patch_retained_swobjects_metadata(&ir, &annotations, &mut sections, 1.0)?;
+    Ok(sections.remove(0).1)
+}
+
+/// The patch writer refuses `values` for `name` against `payload` with
+/// `expected`.
+fn assert_patch_refusal(
+    name: &str,
+    values: Vec<cadmpeg_ir::attributes::AttributeValue>,
+    payload: &[u8],
+    expected: &str,
+) {
+    let Err(error) = patched_retained_metadata(name, values, payload.to_vec()) else {
+        panic!("{name} is refused");
+    };
+    assert_eq!(error.to_string(), expected);
+}
+
+/// A unit name too long for its length byte, in a record whose token does
+/// not match, is refused for the token first.
+#[test]
+fn a_retained_unit_name_is_refused_for_its_token_before_its_length() {
+    assert_patch_refusal(
+        "source_linear_unit_name",
+        vec![cadmpeg_ir::attributes::AttributeValue::String(
+            "u".repeat(200),
+        )],
+        b"moLengthUserUnitsXc\xff\xfe\xff\x02I\x00",
+        "malformed container: retained SLDPRT metadata token does not match its provenance",
+    );
+}
+
+/// An empty unit name, in a record whose marker does not match, is refused
+/// for the marker first.
+#[test]
+fn a_retained_unit_name_is_refused_for_its_marker_before_its_emptiness() {
+    assert_patch_refusal(
+        "source_linear_unit_name",
+        vec![cadmpeg_ir::attributes::AttributeValue::String(String::new())],
+        b"moLengthUserUnits_c\x00\x00\x00\x02I\x00",
+        "malformed container: retained SLDPRT unit-name marker does not match its provenance",
+    );
+}
+
+/// A unit name too long for its length byte, in a record truncated before
+/// that byte, is refused for the truncation first.
+#[test]
+fn a_retained_unit_name_is_refused_for_its_truncation_before_its_length() {
+    assert_patch_refusal(
+        "source_linear_unit_name",
+        vec![cadmpeg_ir::attributes::AttributeValue::String(
+            "u".repeat(200),
+        )],
+        b"moLengthUserUnits_c\xff\xfe\xff",
+        "malformed container: truncated retained SLDPRT unit name",
+    );
+}
+
+/// A part identity outside `u32`, in a record whose token does not match,
+/// is refused for the token first.
+#[test]
+fn a_retained_part_record_is_refused_for_its_token_before_its_identity() {
+    assert_patch_refusal(
+        "part_record",
+        vec![
+            cadmpeg_ir::attributes::AttributeValue::Integer(-1),
+            cadmpeg_ir::attributes::AttributeValue::Integer(1),
+        ],
+        &[b"moPartXc".as_slice(), &[0; 16]].concat(),
+        "malformed container: retained SLDPRT metadata token does not match its provenance",
+    );
+}
+
+/// Neither retained edits nor fresh generation may assign unsupported manager fields.
+#[test]
+fn configuration_manager_metadata_cannot_be_patched_or_generated() {
+    use cadmpeg_ir::attributes::{AttributeTarget, AttributeValue, SourceAttribute};
+    let message = "SLDPRT configuration-manager edits and generation require an owned version-specific serializer and proven scalar roles";
+    let values = vec![
+        AttributeValue::Integer(1),
+        AttributeValue::Integer(3),
+        AttributeValue::Integer(0),
+    ];
+    assert_patch_refusal(
+        "configuration_manager",
+        values.clone(),
+        &[b"moConfigurationMgr_c".as_slice(), &[0; 125]].concat(),
+        &cadmpeg_core::CodecError::NotImplemented(message.into()).to_string(),
+    );
+    let attribute = SourceAttribute {
+        id: cadmpeg_ir::ids::AttributeId::mint("sldprt:metadata:configuration_manager#0:0")
+            .unwrap(),
+        target: AttributeTarget::Document,
+        name: "configuration_manager".into(),
+        values,
+    };
+    assert!(matches!(
+        crate::writer::MetadataRecord::project(&attribute, 0.001, |_| {
+            panic!("unsupported scalar roles cannot reach a retained-byte patch")
+        }),
+        Err(cadmpeg_core::CodecError::NotImplemented(_))
+    ));
+}
+
+#[test]
+fn retained_part_edits_require_root_ownership_and_preserve_scalar_form() {
+    use cadmpeg_ir::attributes::{AttributeTarget, AttributeValue, SourceAttribute};
+    for (payload, offset, values) in [
+        (
+            b"unqlite\xa5class\xa8moPart_c\0\0\0\0\0\0\0\0\0\0\0\0".to_vec(),
+            14,
+            vec![AttributeValue::Integer(17), AttributeValue::Integer(19)],
+        ),
+        (
+            [
+                b"\xff\xff\x01\x00\x08\x00moPart_c".as_slice(),
+                &7u32.to_le_bytes(),
+                b"\xff\xff\x01\x00\x0a\x00moHeader_c",
+            ]
+            .concat(),
+            6,
+            vec![AttributeValue::Integer(17), AttributeValue::Integer(19)],
+        ),
+    ] {
+        let mut ir = cadmpeg_ir::CadIr::empty();
+        let id = "sldprt:metadata:part_record#0:6";
+        ir.model.attributes.push(SourceAttribute {
+            id: cadmpeg_ir::ids::AttributeId::mint(id).unwrap(),
+            target: AttributeTarget::Document,
+            name: "part_record".into(),
+            values,
+        });
+        let mut annotations = cadmpeg_ir::annotations::Annotations::default();
+        crate::annotations::note(
+            &mut annotations,
+            id,
+            &cadmpeg_ir::stream_name!("SWObjects"),
+            offset,
+            "moPart_c",
+            cadmpeg_ir::Exactness::ByteExact,
+        )
+        .unwrap();
+        let mut sections = vec![("SWObjects".to_owned(), payload.clone())];
+        let error =
+            crate::writer::patch_retained_swobjects_metadata(&ir, &annotations, &mut sections, 1.0)
+                .unwrap_err();
+        assert!(matches!(error, cadmpeg_core::CodecError::NotImplemented(_)));
+        assert_eq!(sections[0].1, payload);
+    }
+}
+
+#[test]
+fn generated_part_metadata_requires_retained_root_serializer() {
+    use cadmpeg_ir::attributes::{AttributeTarget, AttributeValue, SourceAttribute};
+    let mut ir = cadmpeg_ir::CadIr::empty();
+    ir.model.attributes.push(SourceAttribute {
+        id: cadmpeg_ir::ids::AttributeId::mint("sldprt:metadata:part_record#0:6").unwrap(),
+        target: AttributeTarget::Document,
+        name: "part_record".into(),
+        values: vec![AttributeValue::Integer(17)],
+    });
+    let error = crate::writer::metadata_payloads(&ir, 1.0, false).unwrap_err();
+    assert!(matches!(error, cadmpeg_core::CodecError::NotImplemented(_)));
+    assert!(error.to_string().contains("Part generation requires"));
+    assert!(crate::writer::metadata_payloads(&ir, 1.0, true)
+        .unwrap()
+        .0
+        .is_empty());
+}
+
+#[test]
+fn retained_configuration_manager_accepts_only_the_unchanged_raw_tuple() {
+    use cadmpeg_ir::attributes::AttributeValue;
+    let mut payload = b"moConfigurationMgr_c".to_vec();
+    let mut body = [0; 125];
+    body[66..70].copy_from_slice(&17u32.to_le_bytes());
+    body[107] = 3;
+    body[117..125].copy_from_slice(&132_537_600_000_000_000u64.to_le_bytes());
+    payload.extend(body);
+    let values = vec![
+        AttributeValue::Integer(17),
+        AttributeValue::Integer(3),
+        AttributeValue::Integer(132_537_600_000_000_000),
+    ];
+    assert_eq!(
+        patched_retained_metadata("configuration_manager", values.clone(), payload.clone())
+            .unwrap(),
+        payload,
+    );
+    for lane in 0..3 {
+        let mut edited = values.clone();
+        let AttributeValue::Integer(value) = &mut edited[lane] else {
+            panic!("integer lane")
+        };
+        *value += 1;
+        assert_patch_refusal(
+            "configuration_manager", edited, &payload,
+            &cadmpeg_core::CodecError::NotImplemented("SLDPRT configuration-manager edits and generation require an owned version-specific serializer and proven scalar roles".into()).to_string(),
+        );
+    }
+}
+
+#[test]
+fn configuration_manager_retention_is_checked_at_the_writer_entry() {
+    use cadmpeg_ir::attributes::{AttributeTarget, AttributeValue};
+    let source = crate::test_support::container::sldprt_with_body_and_envelope(&triangle_body());
+    let original = crate::test_support::container::scan(&source)
+        .blocks
+        .into_iter()
+        .find(|block| block.section.name() == Some("SWObjects"))
+        .unwrap()
+        .payload;
+    let manager_at = original
+        .windows(b"moConfigurationMgr_c".len())
+        .position(|bytes| bytes == b"moConfigurationMgr_c")
+        .unwrap();
+    let decoded = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let (baseline, _, fidelity) = decoded.into_parts();
+    for change in 0..6 {
+        let mut ir = baseline.clone();
+        if change == 1 {
+            let bbox = ir
+                .model
+                .attributes
+                .iter_mut()
+                .find(|a| a.name == "bounding_envelope")
+                .unwrap();
+            let AttributeValue::Vector(values) = &mut bbox.values[0] else {
+                panic!("vector")
+            };
+            values[0] = cadmpeg_ir::scalar::FiniteReal::new(11.0).unwrap();
+        } else if (2..5).contains(&change) {
+            let manager = ir
+                .model
+                .attributes
+                .iter_mut()
+                .find(|a| a.name == "configuration_manager")
+                .unwrap();
+            let AttributeValue::Integer(value) = &mut manager.values[change - 2] else {
+                panic!("integer")
+            };
+            *value += 1;
+        } else if change == 5 {
+            let body = ir.model.bodies[0].id.clone();
+            ir.model
+                .attributes
+                .iter_mut()
+                .find(|a| a.name == "configuration_manager")
+                .unwrap()
+                .target = AttributeTarget::Body(body);
+        }
+        let records = crate::source_records(&ir, &fidelity).unwrap();
+        let mut written = Vec::new();
+        let result = crate::writer::write_semantic_with_records(
+            &ir,
+            &fidelity.annotations,
+            &records,
+            &mut written,
+        );
+        if change >= 2 {
+            assert!(result.is_err());
+            continue;
+        }
+        result.unwrap();
+        let current = crate::test_support::container::scan(&written)
+            .blocks
+            .into_iter()
+            .find(|block| block.section.name() == Some("SWObjects"))
+            .unwrap()
+            .payload;
+        if change == 0 {
+            assert_eq!(current, original);
+        }
+        assert_eq!(
+            &current[manager_at..manager_at + 145],
+            &original[manager_at..manager_at + 145]
+        );
+    }
+    assert!(crate::writer::write_semantic_with_records(
+        &baseline,
+        &fidelity.annotations,
+        &[],
+        &mut Vec::new(),
+    )
+    .is_err());
+}

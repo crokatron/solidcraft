@@ -664,7 +664,20 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
             }));
     app.viewport.mouse = hover.filter(|_| inside);
     // Sketch snap suppression is set once in `viewport::show` from preferences.
-    middle_double_click(app, ui, inside);
+    let function_active = app.dialog.is_some() || app.tool.is_some() || app.tree.occurrence_move.is_some();
+    if function_active && inside && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) {
+        if app.dialog.is_some() {
+            crate::dialogs::middle_click(app);
+        } else if app.tree.occurrence_move.is_some() {
+            crate::browser_prompts::confirm_occurrence_move(app, crate::ui_kit::Action::Apply);
+        } else {
+            crate::tools::confirm_tool(app, crate::ui_kit::Action::Apply);
+        }
+        app.viewport.middle_clicked = false;
+    } else if !function_active {
+        middle_double_click(app, ui, inside);
+    }
+
     // The 3D mouse's motion this frame, with what this page's camera may do.
     device(app, rect, caps);
 

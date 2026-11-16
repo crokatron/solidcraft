@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Borrowed SWP104 branch and reference serialization.
+
+use cadmpeg_ir::native::bytes::NativeBytes;
+
+use super::FeatureSwp104LeadingBranch;
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct ReferenceView<'a> {
+    ordinal: u32,
+    #[serde(flatten)]
+    token: &'a crate::om::reference_index::PayloadIndexToken,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_block: Option<&'a str>,
+    source_offset: u64,
+}
+
+struct MembersView<'a>(&'a FeatureSwp104LeadingBranch);
+
+impl Serialize for MembersView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let branch = self.0;
+        let mut sequence = serializer.serialize_seq(Some(branch.members.len()))?;
+        let mut at = branch.source_offset + branch.members_offset();
+        for (ordinal, reference) in branch.members.as_slice().iter().enumerate() {
+            sequence.serialize_element(&ReferenceView {
+                ordinal: u32::try_from(ordinal).map_err(serde::ser::Error::custom)?,
+                token: &reference.token,
+                data_block: reference.data_block.as_deref(),
+                source_offset: at,
+            })?;
+            at += cadmpeg_core::decode::u64_from_index(reference.token.raw().len());
+        }
+        sequence.end()
+    }
+}
+
+impl Serialize for FeatureSwp104LeadingBranch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut wire = serializer.serialize_map(None)?;
+        wire.serialize_entry("id", &self.id)?;
+        wire.serialize_entry("operation_label", &self.operation_label)?;
+        wire.serialize_entry("parameter_class_index", &self.parameter_class_index)?;
+        wire.serialize_entry("scalars", &self.scalars.map(|scalar| scalar.value().get()))?;
+        wire.serialize_entry(
+            "raw_scalars",
+            &self.scalars.map(|scalar| NativeBytes::from(scalar.raw())),
+        )?;
+        wire.serialize_entry("leading_zero", &self.leading_zero)?;
+        wire.serialize_entry("profile_class_index", &self.profile_class_index)?;
+        wire.serialize_entry("declared_count", &self.members.declared_count())?;
+        if let Some(count) = self.state_lane.witnessed_count() {
+            wire.serialize_entry("witnessed_count", &count)?;
+        }
+        wire.serialize_entry("state_lane", &NativeBytes::from(self.state_lane.bytes()))?;
+        wire.serialize_entry("members", &MembersView(self))?;
+        let successor_offset = self.source_offset
+            + self.members_offset()
+            + self
+                .members
+                .as_slice()
+                .iter()
+                .map(|reference| cadmpeg_core::decode::u64_from_index(reference.token.raw().len()))
+                .sum::<u64>()
+            + self.state_len()
+            + 3;
+        wire.serialize_entry(
+            "successor",
+            &ReferenceView {
+                ordinal: u32::from(self.members.declared_count() - 1),
+                token: &self.successor.token,
+                data_block: self.successor.data_block.as_deref(),
+                source_offset: successor_offset,
+            },
+        )?;
+        wire.serialize_entry("byte_len", &self.byte_len())?;
+        wire.serialize_entry("source_offset", &self.source_offset)?;
+        wire.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadmpeg_test_support::native_serialization::assert_native_limit;
+
+    #[test]
+    fn swp104_branch_borrowed_bytes_and_limit() {
+        let mut payload = vec![33, 0, 0, 1, 0];
+        for _ in 0..4 {
+            payload.extend([47, 164, 122, 225, 71, 174, 20, 123]);
+        }
+        payload.extend([35, 1, 2, 240, 255]);
+        payload.extend([0; 5]);
+        payload.extend([255, 1, 2, 241, 1, 0, 0]);
+        let record =
+            crate::om::operation_record::OperationPayload::new(&payload, 200, "SWP104").unwrap();
+        let source = crate::om::swp104_payload_leading_branch(record)
+            .unwrap()
+            .unwrap();
+        let branch = FeatureSwp104LeadingBranch::from_source(
+            "nx:feature:swp104#0".to_owned(),
+            "operation".to_owned(),
+            1200,
+            source,
+            |token| Some(format!("block#{}", token.value())),
+        )
+        .unwrap();
+        let borrowed = serde_json::to_vec(&branch).unwrap();
+        let owned = serde_json::to_vec(&super::super::FeatureSwp104LeadingBranchWire::from(
+            branch.clone(),
+        ))
+        .unwrap();
+        assert_eq!(borrowed, owned);
+        assert_native_limit(&branch, serde_json::to_value(&branch).unwrap());
+    }
+}

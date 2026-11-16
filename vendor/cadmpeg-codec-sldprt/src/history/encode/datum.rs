@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Datum-plane, axis, point, and coordinate-system write encoders.
+
+use super::super::literals::{valid_direction, valid_plane_frame};
+use super::format::{format_length_like, format_point3_mm, format_vector3};
+use super::support::require_same_family;
+use super::{NeutralFeatureEncoder, NeutralFeatureEncoding};
+use crate::history::classify::is_offset_plane;
+use cadmpeg_core::CodecError;
+use cadmpeg_ir::math::{Point3, Vector3};
+use cadmpeg_ir::{
+    features::{DatumPlaneReference, FinitePoint3, FiniteVector3, PrincipalPlane},
+    scalar::Length,
+};
+
+impl NeutralFeatureEncoder<'_, '_, '_> {
+    pub(super) fn encode_datum_principal_plane(
+        &self,
+        plane: PrincipalPlane,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        let principal_planes_by_record = self.principal_planes_by_record;
+        Ok({
+            let record = existing.ok_or_else(|| {
+                CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} requires a retained principal-plane record",
+                    feature.id
+                ))
+            })?;
+            if principal_planes_by_record.get(&record.id) != Some(&plane) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes its principal-plane role",
+                    feature.id
+                )));
+            }
+            NeutralFeatureEncoding {
+                kind: record.kind.clone(),
+                parameters: record.parameters.clone(),
+                properties: feature.source_properties.clone(),
+            }
+        })
+    }
+
+    pub(super) fn encode_datum_plane_unresolved(
+        &self,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        Err(CodecError::NotImplemented(format!(
+            "SLDPRT feature {} has unresolved datum-plane construction",
+            feature.id
+        )))
+    }
+
+    pub(super) fn encode_datum_plane(
+        &self,
+        frame: &cadmpeg_ir::features::FeatureDatumPlaneFrame,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            if !valid_plane_frame(frame.normal().get(), frame.u_axis().get()) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported reference-plane semantics",
+                    feature.id
+                )));
+            }
+            require_same_family(existing, &feature.id, &["ReferencePlane"])?;
+            let mut properties = feature.source_properties.clone();
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Origin"),
+                format_point3_mm(frame.origin()),
+            );
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Normal"),
+                format_vector3(frame.normal().into()),
+            );
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("UAxis"),
+                format_vector3(frame.u_axis().into()),
+            );
+            NeutralFeatureEncoding {
+                kind: existing
+                    .map_or_else(|| "ReferencePlane".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_datum_offset_plane(
+        &self,
+        reference: Option<&DatumPlaneReference>,
+        distance: Length,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        let parent_sources = self.parent_sources;
+        Ok({
+            if existing.is_some_and(|record| !is_offset_plane(record)) {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes operation family",
+                    feature.id
+                )));
+            }
+            let mut properties = feature.source_properties.clone();
+            match reference {
+                Some(DatumPlaneReference::Feature { feature: reference }) => {
+                    let source = parent_sources.get(reference).ok_or_else(|| {
+                        CodecError::malformed(format_args!(
+                            "SLDPRT feature {} references a missing datum plane",
+                            feature.id
+                        ))
+                    })?;
+                    let key = if properties.contains_key("Plane")
+                        && !properties.contains_key("Reference")
+                    {
+                        cadmpeg_core::nonblank_literal!("Plane")
+                    } else {
+                        cadmpeg_core::nonblank_literal!("Reference")
+                    };
+                    properties.insert(key, source.clone());
+                }
+                Some(
+                    DatumPlaneReference::Face { .. } | DatumPlaneReference::ResolvedPlane { .. },
+                ) => {
+                    let Some(record) = existing else {
+                        return Err(CodecError::NotImplemented(format!(
+                            "SLDPRT feature {} cannot create a face-supported datum plane",
+                            feature.id
+                        )));
+                    };
+                    properties = record.properties.clone();
+                }
+                None if existing.is_some() => {}
+                None => {
+                    return Err(CodecError::NotImplemented(format!(
+                        "SLDPRT feature {} has an unresolved datum-plane reference",
+                        feature.id
+                    )));
+                }
+            }
+            let mut parameters = existing
+                .map(|record| record.parameters.clone())
+                .unwrap_or_default();
+            parameters.insert(
+                cadmpeg_core::nonblank_literal!("D1"),
+                format_length_like(
+                    distance,
+                    existing
+                        .and_then(|record| record.parameters.get("D1"))
+                        .map(String::as_str),
+                ),
+            );
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "Plane".into(), |record| record.kind.clone()),
+                parameters,
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_datum_axis(
+        &self,
+        origin: &Point3,
+        direction: &Vector3,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let Some(direction) =
+                FiniteVector3::new(*direction).filter(|direction| valid_direction(direction.get()))
+            else {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported reference-axis semantics",
+                    feature.id
+                )));
+            };
+            let Some(origin) = FinitePoint3::new(*origin) else {
+                return Err(CodecError::malformed(format_args!(
+                    "SLDPRT feature {} has a non-finite reference-axis origin",
+                    feature.id
+                )));
+            };
+            require_same_family(existing, &feature.id, &["ReferenceAxis"])?;
+            let mut properties = feature.source_properties.clone();
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Origin"),
+                format_point3_mm(origin),
+            );
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Direction"),
+                format_vector3(direction),
+            );
+            NeutralFeatureEncoding {
+                kind: existing.map_or_else(|| "ReferenceAxis".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_datum_point(
+        &self,
+        position: &Point3,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            let Some(position) = FinitePoint3::new(*position) else {
+                return Err(CodecError::NotImplemented(format!(
+                    "SLDPRT feature {} changes unsupported reference-point semantics",
+                    feature.id
+                )));
+            };
+            require_same_family(existing, &feature.id, &["ReferencePoint"])?;
+            let mut properties = feature.source_properties.clone();
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Position"),
+                format_point3_mm(position),
+            );
+            NeutralFeatureEncoding {
+                kind: existing
+                    .map_or_else(|| "ReferencePoint".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+
+    pub(super) fn encode_datum_coordinate_system(
+        &self,
+        frame: &cadmpeg_ir::features::FeatureCoordinateFrame,
+    ) -> Result<NeutralFeatureEncoding, CodecError> {
+        let feature = self.feature;
+        let existing = self.existing;
+        Ok({
+            require_same_family(
+                existing,
+                &feature.id,
+                &["CoordinateSystem", "ReferenceCoordinateSystem"],
+            )?;
+            let mut properties = feature.source_properties.clone();
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("Origin"),
+                format_point3_mm(frame.origin()),
+            );
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("XAxis"),
+                format_vector3(frame.x_axis().into()),
+            );
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("YAxis"),
+                format_vector3(frame.y_axis().into()),
+            );
+            properties.insert(
+                cadmpeg_core::nonblank_literal!("ZAxis"),
+                format_vector3(frame.z_axis().into()),
+            );
+            NeutralFeatureEncoding {
+                kind: existing
+                    .map_or_else(|| "CoordinateSystem".into(), |record| record.kind.clone()),
+                parameters: existing
+                    .map(|record| record.parameters.clone())
+                    .unwrap_or_default(),
+                properties,
+            }
+        })
+    }
+}

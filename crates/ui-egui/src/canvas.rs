@@ -16,6 +16,7 @@ use solidcraft_engine::geom::prelude::*;
 
 use crate::SolveApp;
 use crate::dialogs::{Dialog, Kind};
+use crate::dialogs_surface::Surf;
 use crate::viewport::{Proj, projected_polygon};
 use solidcraft_theme::Tokens;
 
@@ -25,6 +26,27 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
     let st = crate::open_meshing::session_world(&app.session);
     let item = anchor_item(app, d);
     let Some(first) = &item else { return section_plane(d) };
+    if let Sel::Edge { body, index, point } = first {
+        match &d.kind {
+            Kind::Surface(Surf::Extrude { edge, .. }) => {
+                let dir = match edge.method {
+                    crate::dialogs_surface::CUSTOM_VECTOR => crate::dialogs_surface::direction_vector(&edge.vector),
+                    _ => edge_pull_direction(app, d, body, *index, *point, edge.method == crate::dialogs_surface::EXTEND_FACE),
+                };
+                return Some((*point, dir.map(|n| if edge.flip && edge.method != crate::dialogs_surface::EXTEND_FACE { -n } else { n })));
+            }
+            Kind::Surface(Surf::Ruled { mode: 3, vector, flip, .. }) => {
+                let dir = d
+                    .inputs
+                    .get(2)
+                    .and_then(|i| i.items.first())
+                    .and_then(|s| crate::dialogs::axis_of(app, s).map(|a| a.1))
+                    .or_else(|| crate::dialogs_surface::direction_vector(vector));
+                return Some((*point, dir.map(|n| if *flip { -n } else { n })));
+            }
+            _ => {}
+        }
+    }
     let (at, normal) = match first {
         Sel::Profile { sketch, index } => {
             let ss = st.sketch(*sketch)?;
@@ -55,6 +77,9 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
         Sel::SketchCurve { id, sketch } => {
             let ss = match sketch {
                 Some(k) => st.sketch(*k)?,
+                None if matches!(d.kind, Kind::Surface(Surf::Extrude { .. })) => {
+                    st.sketch(crate::dialogs::picks_sketch(app, &d.inputs.first()?.items, None)?)?
+                }
                 None => st.sketches.iter().rev().find(|ss| ss.sketch.curve_index(id).is_some())?,
             };
             let pts = ss.sketch.polyline(ss.sketch.curve_index(id)?);
@@ -67,8 +92,8 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
                     let n = if *flip && !crate::sketch_modify_ui::offset_symmetric(*mode) { -tangent.perp() } else { tangent.perp() };
                     Some(ss.plane.to_world(mid + n) - ss.plane.to_world(mid))
                 }
-                // A thin extrude's curves extrude along their sketch's normal.
-                Kind::Extrude { .. } => Some(ss.plane.normal()),
+                // Thin solid and surface extrusions both follow the source sketch's normal.
+                Kind::Extrude { .. } | Kind::Surface(Surf::Extrude { .. }) => Some(ss.plane.normal()),
                 _ => None,
             };
             (ss.plane.to_world(mid), dir)
@@ -95,6 +120,18 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             let from = reference_height(app, d, "From Object", &plane, at).unwrap_or(0.0);
             let offset = if start.trim().is_empty() { 0.0 } else { crate::length_input::eval(&app.session.doc, start, ValueKind::Length).ok()? };
             (at + n * (from + offset), Some(n))
+        }
+        Kind::Surface(Surf::Extrude { .. }) => {
+            let n = normal?;
+            let offset = d
+                .extra
+                .get("start_offset")
+                .and_then(|v| v.as_str())
+                .map(|s| crate::length_input::eval(&app.session.doc, s, ValueKind::Length))
+                .transpose()
+                .ok()?
+                .unwrap_or(0.0);
+            (at + n * offset, Some(n))
         }
         // A hole on a curved face drills against the face's normal where it was picked.
         Kind::Hole { .. } if matches!(first, Sel::Face { .. }) => {
@@ -230,6 +267,25 @@ fn edge_sides(m: &Mesh, index: usize, p: Vec3) -> Option<Vec<(Vec3, Vec3)>> {
         .collect()
 }
 
+/// A normal pull follows the chosen incident face. Natural extension runs in its tangent
+/// plane, across the edge and out of the existing face.
+fn edge_pull_direction(app: &SolveApp, d: &Dialog, body: &str, edge: usize, at: Vec3, extend: bool) -> Option<Vec3> {
+    let st = crate::open_meshing::session_world(&app.session);
+    let mesh = st.body(body)?.mesh();
+    let adjacent = mesh.edge_faces.get(edge)?;
+    let face = match d.inputs.get(1).and_then(|i| i.items.first()) {
+        Some(Sel::Face { body: selected, index, .. }) if selected == body => adjacent.iter().position(|&f| f as usize == *index)?,
+        _ => 0,
+    };
+    let (normal, interior) = *edge_sides(&mesh, edge, at)?.get(face)?;
+    if !extend {
+        return Some(normal);
+    }
+    let seg = mesh.edges.get(edge)?.windows(2).min_by(|a, b| at.dist_to_segment(a[0], a[1]).total_cmp(&at.dist_to_segment(b[0], b[1])))?;
+    let across = normal.cross(seg[1] - seg[0]).normalized()?;
+    Some(if across.dot(at - interior) < 0.0 { -across } else { across })
+}
+
 /// The outward direction between the two faces at an edge: the mean of their normals.
 fn edge_bisector(m: &Mesh, index: usize, p: Vec3) -> Option<Vec3> {
     edge_sides(m, index, p)?.iter().fold(Vec3::ZERO, |sum, (n, _)| sum + *n).normalized()
@@ -323,7 +379,9 @@ pub(crate) fn chamfer_face_dirs(app: &SolveApp, d: &Dialog, at: Vec3) -> Option<
 pub(crate) fn owns_pointer(app: &SolveApp, proj: &Proj, p: Pos2) -> bool {
     // The triad only registers an egui hit widget after a handle is under the pointer.
     // Test its geometry before navigation, including the first frame entering a handle.
-    crate::joint_handles::owns_pointer(app, proj, p)
+    crate::scan_alignment_ui::owns_pointer(app, proj, p)
+        || crate::mesh_cut_handles::owns_pointer(app, proj, p)
+        || crate::joint_handles::owns_pointer(app, proj, p)
         || app.dialog.as_ref().and_then(|d| crate::dialogs_move::triad(app, d)).is_some_and(|t| crate::gizmo::contains_pointer(proj, &t, p))
         || app
             .dialog
@@ -349,6 +407,16 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         crate::browser::occurrence_triad(app, ui, painter, proj);
     }
     let Some(mut d) = app.dialog.take() else { return };
+    if matches!(d.kind, Kind::MeshEdit { command: "mesh.align_plane_to_csys", .. }) {
+        crate::scan_alignment_ui::draw_ring(app, &mut d, ui, painter, proj);
+        app.dialog = Some(d);
+        return;
+    }
+    if matches!(d.kind, Kind::MeshEdit { command: "mesh.trim_plane" | "mesh.section", .. }) {
+        crate::mesh_cut_handles::show(app, &mut d, ui, painter, proj);
+        app.dialog = Some(d);
+        return;
+    }
     if matches!(d.kind, Kind::Assembly(_)) {
         crate::dialogs_assembly::overlay(app, painter, proj, &mut d);
         app.dialog = Some(d);
@@ -378,11 +446,14 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         let triad_id = egui::Id::unique("sc_move_triad");
         if let Some(t) = crate::dialogs_move::triad(app, &d) {
             if let Some(g) = crate::gizmo::show(ui, painter, proj, triad_id, &t, snap_step(app.cam.half_height())) {
-                crate::dialogs_move::drag(app, &mut d, g);
+                if !(g.started && g.handle == crate::gizmo::Handle::Ball && crate::move_handle_snap::begin_drag(ui.ctx())) {
+                    crate::dialogs_move::drag(app, &mut d, g);
+                }
                 dragging = true;
             } else if let Some(handle) = crate::gizmo::take_click(ui, triad_id) {
                 // A click on a handle, with no drag, still shows the value it drives.
                 crate::dialogs_move::show_handle_value(&mut d, handle);
+                crate::move_handle_snap::handle_click(ui.ctx(), handle);
             }
         }
         // Read the triad again after the drag, so the box follows it in the same frame. Move
@@ -396,6 +467,9 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         let mut place = box_place(app, proj);
         if let Some(t) = triad.as_ref() {
             place.handles = crate::gizmo::handles_region(proj, t);
+        }
+        if let Some(markers) = crate::move_handle_snap::markers_region(ui.ctx(), proj) {
+            place.handles = Some(place.handles.map_or(markers, |handles| handles.union(markers)));
         }
         let at = triad.map(|t| t.center).or_else(|| anchor(app, &d).map(|(base, _)| base));
         // Tab and Shift+Tab in the box show the next or previous value (Y after X; #4776),
@@ -434,12 +508,67 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         && let Some(bs) = proj.to_screen(base)
     {
         draw(app, ui, painter, proj, &mut d, base, bs, dir);
+        edge_direction_csys(ui, painter, proj, &mut d, base, bs, app.cam.half_height());
     }
     app.dialog = Some(d);
     // The placement handles (a Single hole's among them), over the depth arrow's stem: a press
     // on a marker moves the feature.
     crate::place_gizmo::show(app, ui, painter, proj);
     crate::hole_place::marks(app, painter, proj);
+}
+
+/// Offset the CSYS from the distance arrow so a pull along a principal axis still has
+/// independent controls for its direction and its length.
+fn edge_direction_csys(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, d: &mut Dialog, base: Vec3, bs: Pos2, half_height: f64) {
+    if !matches!(d.inputs.first().and_then(|i| i.items.first()), Some(Sel::Edge { .. })) {
+        return;
+    }
+    let vector = match &mut d.kind {
+        Kind::Surface(Surf::Extrude { edge, .. }) if edge.method == crate::dialogs_surface::CUSTOM_VECTOR => &mut edge.vector,
+        Kind::Surface(Surf::Ruled { mode: 3, vector, .. }) => vector,
+        _ => return,
+    };
+    let view = proj.rect;
+    let side = if bs.x - view.left() > 230.0 { -1.0 } else { 1.0 };
+    let pivot = bs + vec2(side * 138.0, 0.0);
+    let Some(center) = crate::gizmo::on_plane(proj, pivot, base, proj.cam.basis().2) else { return };
+    painter.line_segment([bs, pivot], Stroke::new(1.0, Tokens::get().manipulator.gamma_multiply(0.6)));
+    let id = egui::Id::unique("sc_edge_extrude_csys");
+    let triad = crate::gizmo::Triad { center, axes: [Vec3::X, Vec3::Y, Vec3::Z], translate: true, rotate: true };
+    let drag = crate::gizmo::show(ui, painter, proj, id, &triad, snap_step(half_height));
+    let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+    let v = if let Some(g) = drag {
+        let original = crate::dialogs_surface::direction_vector(vector).unwrap_or(Vec3::Z);
+        let start = id.with("initial direction");
+        if g.started {
+            ui.data_mut(|s| s.insert_temp(start, original));
+        }
+        let initial = ui.data(|s| s.get_temp::<Vec3>(start)).unwrap_or(original);
+        match g.change {
+            crate::gizmo::Change::Rotate { axis, angle } => crate::gizmo::apply(&crate::gizmo::rotation(axes[axis], angle), initial),
+            crate::gizmo::Change::Translate(delta) => match g.handle {
+                crate::gizmo::Handle::Axis(i) => {
+                    if delta.dot(axes[i]) < 0.0 {
+                        -axes[i]
+                    } else {
+                        axes[i]
+                    }
+                }
+                // The ball and plane handles move the tip of a unit direction in their drag plane.
+                _ => initial + delta / (half_height * 0.2).max(1e-9),
+            },
+        }
+    } else if let Some(crate::gizmo::Handle::Axis(i)) = crate::gizmo::take_click(ui, id) {
+        axes[i]
+    } else {
+        return;
+    };
+    if let Some(v) = v.normalized() {
+        *vector = [v.x, v.y, v.z].map(|n| format!("{n:.9}"));
+        if let Some(input) = d.inputs.get_mut(2) {
+            input.items.clear();
+        }
+    }
 }
 
 struct MoveRotation {
@@ -572,6 +701,7 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
     } else {
         None
     };
+    let edge_pull = matches!(d.inputs.first().and_then(|i| i.items.first()), Some(Sel::Edge { .. }));
     let sign = match (to_span, &d.kind) {
         (Some(span), _) => {
             if span < 0.0 {
@@ -581,9 +711,11 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             }
         }
         (_, Kind::Extrude { direction: 1 | crate::dialogs::TWO_SIDES_REVERSED, .. }) => -1.0,
+        (_, Kind::Surface(Surf::Extrude { direction: crate::dialogs_surface::FLIPPED, .. })) if !edge_pull => -1.0,
         _ => 1.0,
     };
-    let symmetric = to_span.is_none() && matches!(d.kind, Kind::Extrude { direction: 2, .. });
+    let surface_symmetric = !edge_pull && matches!(d.kind, Kind::Surface(Surf::Extrude { direction: crate::dialogs_surface::SYMMETRIC, .. }));
+    let symmetric = to_span.is_none() && (surface_symmetric || matches!(d.kind, Kind::Extrude { direction: 2, .. }));
     let symmetric_scale = if symmetric {
         d.extra
             .get("convention")
@@ -604,6 +736,7 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
         | Kind::OffsetPlane { .. }
         | Kind::OffsetFaces { .. }
         | Kind::PatternRect { .. } => true,
+        Kind::Surface(Surf::Extrude { .. }) => !edge_pull,
         Kind::SketchModify(crate::sketch_modify_ui::Mod::Move { .. } | crate::sketch_modify_ui::Mod::PatternRect { .. }) => true,
         Kind::SketchModify(crate::sketch_modify_ui::Mod::Offset { mode, .. }) => !crate::sketch_modify_ui::offset_symmetric(*mode),
         _ => false,
@@ -882,8 +1015,29 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
                 let step = snap_step(half_height);
                 *value = format_len_drag(&app.session.doc, (v - baseline) / symmetric_scale, step, decimals);
             }
-            if symmetric && let Some(bt) = proj.to_screen(base - n * half) {
-                arrow(painter, bs, bt, t.manipulator);
+            if symmetric {
+                let mut reverse = original_shown.clone();
+                drag_arrow(
+                    &app.session.doc,
+                    ui,
+                    painter,
+                    proj,
+                    base,
+                    bs,
+                    -n,
+                    half,
+                    signed,
+                    egui::Id::unique("sc_manipulator2"),
+                    half_height,
+                    clear,
+                    decimals,
+                    &mut reverse,
+                );
+                if reverse != original_shown
+                    && let Ok(v) = crate::length_input::eval(&app.session.doc, &reverse, ValueKind::Length)
+                {
+                    *value = format_len_drag(&app.session.doc, v / symmetric_scale, snap_step(half_height), decimals);
+                }
             }
             if clear == 0.0 {
                 painter.circle(bs, 3.5, t.manipulator, Stroke::new(1.0, Color32::WHITE));
@@ -1207,10 +1361,24 @@ fn drag_arrow_to(
     let ArrowLine { base, bs, n, l, signed, clear_px } = line;
     let mut stopped = None;
     let t = Tokens::get();
-    let min = f64::from(40.0 + clear_px) * 2.0 * half_height / f64::from(proj.rect.height().max(1.0));
+    let units_per_pixel = 2.0 * half_height / f64::from(proj.rect.height().max(1.0));
+    let min = f64::from(40.0 + clear_px) * units_per_pixel;
+    // An axis aimed into or out of the screen projects to a point. Draw a vertical
+    // grip there and map vertical pointer travel to depth at the current zoom.
+    let facing = n.dot(proj.ray(bs).1);
+    let end_on = facing.abs() > 0.995;
+    let position = |p: Pos2| {
+        if end_on { Some(f64::from(p.y - bs.y) * units_per_pixel * facing.signum()) } else { along(proj, p, base, n) }
+    };
     let tip = |length: f64| {
         let shown = if length.abs() < min { min * if length < 0.0 { -1.0 } else { 1.0 } } else { length };
-        proj.to_screen(base + n * shown)
+        if end_on {
+            let travel = (shown / units_per_pixel) as f32;
+            let reach = (proj.rect.height() * 0.25).max(40.0 + clear_px);
+            Some(bs + vec2(0.0, travel.clamp(-reach, reach) * facing.signum() as f32))
+        } else {
+            proj.to_screen(base + n * shown)
+        }
     };
     let mut ts = tip(l)?;
     // Where the drawn arrow starts: the base, or past the cleared marker.
@@ -1230,7 +1398,12 @@ fn drag_arrow_to(
     // How far along the arrow the press was short of its end: the drag keeps that gap.
     let grab = id.with("stem grab");
     if r.drag_started() {
-        let gap = on_stem.zip(r.interact_pointer_pos()).and_then(|(_, p)| along(proj, p, base, n)).map(|v| v - l);
+        let gap = if end_on {
+            ui.input(|i| i.pointer.press_origin()).and_then(position)
+        } else {
+            on_stem.zip(r.interact_pointer_pos()).and_then(|(_, p)| position(p))
+        }
+        .map(|v| v - l);
         ui.data_mut(|d| {
             if let Some(g) = gap.filter(|g| g.is_finite()) {
                 d.insert_temp(grab, g);
@@ -1241,7 +1414,7 @@ fn drag_arrow_to(
     }
     if r.dragged()
         && let Some(p) = r.interact_pointer_pos()
-        && let Some(v) = along(proj, p, base, n)
+        && let Some(v) = position(p)
     {
         crate::tool_modifiers::set_manipulator_dragging(true);
         let v = v - ui.data(|d| d.get_temp::<f64>(grab)).unwrap_or(0.0);

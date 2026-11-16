@@ -155,7 +155,7 @@ pub struct ModelFace {
     /// Whether the name follows the face's exact history; `false` when it was worked out from
     /// the geometry, which an edit earlier in the timeline can fool.
     pub exact: bool,
-    /// Its area (mm²).
+    /// Its area (mmÂ²).
     pub area: f64,
     /// Its centroid, which isn't always on the face.
     pub centroid: [f64; 3],
@@ -238,8 +238,8 @@ pub enum ThreadHand {
     Both,
 }
 
-/// A thread form: ISO metric 60°, metric trapezoidal 30°, Acme 29°, metric buttress 3°/30°,
-/// buttress inch 7°/45°, square, and the 55° and 60° pipe threads.
+/// A thread form: ISO metric 60Â°, metric trapezoidal 30Â°, Acme 29Â°, metric buttress 3Â°/30Â°,
+/// buttress inch 7Â°/45Â°, square, and the 55Â° and 60Â° pipe threads.
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadForm {
@@ -600,9 +600,9 @@ pub enum BodyOutcome {
 pub struct BodyFigures {
     /// Whether it encloses a volume.
     pub closed: bool,
-    /// Its volume (mm³); `null` unless it is closed.
+    /// Its volume (mmÂ³); `null` unless it is closed.
     pub volume_mm3: Option<f64>,
-    /// Its surface area (mm²).
+    /// Its surface area (mmÂ²).
     pub area_mm2: f64,
     /// Its centre of mass at uniform density; `null` unless it is closed.
     pub center_of_mass: Option<[f64; 3]>,
@@ -659,7 +659,7 @@ pub struct DocumentSketch {
     /// Its feature id.
     pub id: u64,
     pub name: String,
-    /// Its remaining degrees of freedom (0: fully constrained).
+    /// Remaining planar degrees of freedom. Spatial freedom is reported separately when available.
     pub dof: usize,
     pub status: SketchStatus,
     /// How many curves it has.
@@ -982,7 +982,7 @@ pub enum ListedMaterial {
     /// A built-in material.
     BuiltIn {
         name: String,
-        /// Its density (g/cm³).
+        /// Its density (g/cmÂ³).
         density_g_cm3: f64,
     },
     /// One this design defines, with `user` true, its look and its physical card when it has
@@ -1009,7 +1009,7 @@ pub struct MaterialAssignParams {
     #[serde(default, deserialize_with = "body_names", skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "material_bodies_schema")]
     pub bodies: Option<Vec<String>>,
-    /// The material's name (Steel, Aluminum, ABS Plastic, …, or one made with `material.create`;
+    /// The material's name (Steel, Aluminum, ABS Plastic, â€¦, or one made with `material.create`;
     /// `material.list` lists them). Letter case and spaces at either end don't matter.
     #[serde(default, deserialize_with = "material_name", skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "material_schema")]
@@ -1086,7 +1086,7 @@ pub struct SketchInspected {
     #[schemars(with = "Map<String, Value>")]
     pub plane: Value,
     pub status: SketchStatus,
-    /// Its remaining degrees of freedom (0: fully constrained).
+    /// Remaining planar degrees of freedom. Spatial freedom is reported separately when available.
     pub dof: usize,
     pub fully_constrained: bool,
     /// The constraints still violated after a failed solve.
@@ -1094,6 +1094,14 @@ pub struct SketchInspected {
     pub curves: Vec<SketchCurve>,
     pub points: Vec<SketchPoint>,
     pub constraints: Vec<SketchConstraint>,
+    /// Persistent 3D relations: id, kind, a/b wire fit-point references, and tangent direction.
+    #[schemars(with = "Vec<Map<String, Value>>")]
+    pub wire_constraints: Vec<Value>,
+    /// Instantaneous spatial degrees of freedom including rigid motion; null means analysis unavailable.
+    pub spatial_dof: Option<usize>,
+    /// Local rank, mobility directions per fit point, and any unavailable-analysis reason.
+    #[schemars(with = "Map<String, Value>")]
+    pub spatial_freedom: Value,
     pub profiles: Vec<SketchProfile>,
     /// Planar closed loops the 3D sketch curves take part in, in planes of their own (#741):
     /// each has `index`, `area_mm2`, `plane` (origin and unit normal), `centroid`, `curves`, `holes`.
@@ -1200,7 +1208,7 @@ pub struct SketchPoint {
 }
 
 /// A constraint or dimension: its id, its kind's name and the kind's own fields (`type`, then
-/// the points and curves it ties, a value…), as saved.
+/// the points and curves it ties, a valueâ€¦), as saved.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SketchConstraint {
     pub id: String,
@@ -1258,3 +1266,22 @@ pub struct WireArcInfo {
 #[cfg(test)]
 #[path = "inspect_tests.rs"]
 mod tests;
+
+/// List full coordinate frames usable as Move handles and CSYS alignment targets.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinateFramesParams {}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CoordinateFramesResult {
+    pub frames: Vec<crate::origins::CoordinateFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub param_warnings: Vec<String>,
+}
+
+#[derive(Debug,Deserialize,JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GeometrySnapParams {pub pick:crate::geometry_snap::GeometryPick,pub mode:crate::geometry_snap::SnapMode}
+#[derive(Debug,Deserialize,JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GeometryIntersectionParams {pub a:crate::geometry_snap::GeometryPick,pub b:crate::geometry_snap::GeometryPick}

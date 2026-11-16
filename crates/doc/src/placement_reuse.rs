@@ -95,7 +95,7 @@ pub(super) fn local_geometry(f: &Feature, components: &std::collections::HashMap
         | FeatureKind::Cylinder { base: _, axis: _, radius: _, height: _, operation: Operation::NewBody, references: _ }
         | FeatureKind::Sphere { center: _, radius: _, operation: Operation::NewBody }
         | FeatureKind::Torus { center: _, major: _, minor: _, operation: Operation::NewBody }
-        | FeatureKind::Import { file: _, step: _, components: _, skip: _ }
+        | FeatureKind::Import { file: _, step: _, components: _, skip: _, meshes: _ }
         | FeatureKind::MeshImport { file: _, meshes: _ } => true,
         FeatureKind::Sketch { plane, sketch } => sketch.links.is_empty() && sketch.wires.is_empty() && local_plane(plane, 0),
         FeatureKind::Extrude { sketch, profiles: _, extent, operation: Operation::NewBody, targets: _, thin: _ } => {
@@ -238,21 +238,30 @@ fn same_feature(a: &Feature, b: &Feature) -> bool {
         && *link_faces == b.link_faces
         && match (kind, &b.kind) {
             (FeatureKind::MeshImport { file: a, meshes }, FeatureKind::MeshImport { file: b, meshes: other }) => {
-                a == b
-                    && meshes.len() == other.len()
-                    && meshes.iter().zip(other).all(|(a, b)| {
-                        let crate::MeshData { name, positions, triangles, corner_normals, color } = a;
-                        *name == b.name
-                            && *color == b.color
-                            && Arc::ptr_eq(positions, &b.positions)
-                            && Arc::ptr_eq(triangles, &b.triangles)
-                            && Arc::ptr_eq(corner_normals, &b.corner_normals)
-                    })
+                a == b && same_mesh_storage(meshes, other)
             }
             (
-                FeatureKind::Import { file: a, step, components, skip },
-                FeatureKind::Import { file: b, step: other, components: other_components, skip: other_skip },
-            ) => a == b && Arc::ptr_eq(step, other) && components == other_components && skip == other_skip,
+                FeatureKind::Import { file: a, step, components, skip, meshes },
+                FeatureKind::Import { file: b, step: other, components: other_components, skip: other_skip, meshes: other_meshes },
+            ) => {
+                a == b && Arc::ptr_eq(step, other) && components == other_components && skip == other_skip && same_mesh_storage(meshes, other_meshes)
+            }
             (a, b) => a == b,
         }
+}
+
+fn same_mesh_storage(a: &[crate::MeshData], b: &[crate::MeshData]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.name == b.name
+                && a.color == b.color
+                && match (&a.appearance, &b.appearance) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+                && Arc::ptr_eq(&a.positions, &b.positions)
+                && Arc::ptr_eq(&a.triangles, &b.triangles)
+                && Arc::ptr_eq(&a.corner_normals, &b.corner_normals)
+        })
 }

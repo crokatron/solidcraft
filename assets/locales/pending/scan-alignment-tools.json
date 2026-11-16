@@ -1,0 +1,17 @@
+{
+  "en": {
+    "cmd.mesh.align_landmarks": "Landmark Align",
+    "help.mesh.align_landmarks": "Pick three corresponding pairs of surface points on the moving and fixed scans. A rigid fit aligns the landmarks and reports the remaining error.",
+    "cmd.mesh.align_datum": "Align to Datum",
+    "help.mesh.align_datum": "Pick an origin, a point on positive X and a point toward positive Y on one scan to place it in world coordinates.",
+    "cmd.mesh.align_coarse": "Auto Align",
+    "help.mesh.align_coarse": "Choose the moving and fixed scan for automatic coarse rigid registration. Use Fine Align Scans to refine the result.",
+    "scan_ui.alignment": "Alignment",
+    "scan_ui.landmark_align": "Landmark Align",
+    "scan_ui.align_to_datum": "Align to Datum",
+    "scan_ui.auto_align": "Auto Align",
+    "cmd.mesh.align_plane_to_csys": "Align Plane to CSYS",
+    "help.mesh.align_plane_to_csys": "Place a scan so its chosen construction plane coincides with world XY, XZ or YZ. Flip normal to reverse the direction.",
+    "scan_ui.align_plane_to_csys": "Align Plane to CSYS"
+  }
+}

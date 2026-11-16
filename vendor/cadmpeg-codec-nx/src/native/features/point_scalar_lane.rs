@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Cross-block point scalar lane with derived physical positions.
+
+use cadmpeg_ir::native::bytes::NativeBytes;
+
+use crate::om::scalar::ShiftedBinary64;
+use serde::{Deserialize, Serialize};
+
+/// Exact cross-block scalar lane selected by a point-construction header.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "FeaturePointConstructionScalarLaneWire")]
+pub(in crate::native) struct FeaturePointConstructionScalarLane {
+    pub(in crate::native) id: String,
+    pub(in crate::native) operation_label: String,
+    pub(super) construction_header: String,
+    pub(super) data_blocks: [String; 2],
+    pub(super) scalars: [ShiftedBinary64; 6],
+    pub(super) positions: PointScalarPositions,
+}
+
+#[derive(Serialize)]
+struct FeaturePointConstructionScalarLaneRef<'a> {
+    id: &'a str,
+    operation_label: &'a str,
+    construction_header: &'a str,
+    data_blocks: &'a [String; 2],
+    values: [f64; 6],
+    raw_values: [NativeBytes<[u8; 8]>; 6],
+    source_offsets: [u64; 6],
+}
+
+impl Serialize for FeaturePointConstructionScalarLane {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        FeaturePointConstructionScalarLaneRef {
+            id: &self.id,
+            operation_label: &self.operation_label,
+            construction_header: &self.construction_header,
+            data_blocks: &self.data_blocks,
+            values: self.scalars.map(|scalar| scalar.value().get()),
+            raw_values: (self.scalars.map(ShiftedBinary64::raw)).map(Into::into),
+            source_offsets: self.positions.source_offsets(),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Physical positions of the preceding block tail and the target block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PointScalarPositions {
+    first_source_offset: u64,
+    target_source_offset: u64,
+}
+
+impl PointScalarPositions {
+    pub(super) fn new(first_source_offset: u64, target_source_offset: u64) -> Result<Self, String> {
+        first_source_offset
+            .checked_add(3)
+            .ok_or("source_offsets[0]: span overflow")?;
+        target_source_offset
+            .checked_add(64)
+            .ok_or("source_offsets: target span overflow")?;
+        Ok(Self {
+            first_source_offset,
+            target_source_offset,
+        })
+    }
+
+    fn source_offsets(self) -> [u64; 6] {
+        std::array::from_fn(|slot| {
+            if slot == 0 {
+                self.first_source_offset
+            } else {
+                self.target_source_offset + 5 + (cadmpeg_core::decode::u64_from_index(slot) - 1) * 8
+            }
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct FeaturePointConstructionScalarLaneWire {
+    /// Globally unique point-construction scalar-lane identity.
+    id: String,
+    /// Owning `POINT` operation label.
+    operation_label: String,
+    /// Header selecting this lane.
+    construction_header: String,
+    /// Preceding and target data blocks in byte order.
+    data_blocks: [String; 2],
+    /// Six finite scalar values in byte order.
+    values: [f64; 6],
+    /// Exact shifted-binary64 encodings in byte order.
+    raw_values: [NativeBytes<[u8; 8]>; 6],
+    /// Absolute file offsets of the six scalar markers.
+    source_offsets: [u64; 6],
+}
+
+#[cfg(test)]
+impl From<FeaturePointConstructionScalarLane> for FeaturePointConstructionScalarLaneWire {
+    fn from(lane: FeaturePointConstructionScalarLane) -> Self {
+        let source_offsets = lane.positions.source_offsets();
+        Self {
+            id: lane.id,
+            operation_label: lane.operation_label,
+            construction_header: lane.construction_header,
+            data_blocks: lane.data_blocks,
+            values: lane.scalars.map(|scalar| scalar.value().get()),
+            raw_values: (lane.scalars.map(ShiftedBinary64::raw)).map(Into::into),
+            source_offsets,
+        }
+    }
+}
+
+impl TryFrom<FeaturePointConstructionScalarLaneWire> for FeaturePointConstructionScalarLane {
+    type Error = String;
+
+    fn try_from(wire: FeaturePointConstructionScalarLaneWire) -> Result<Self, Self::Error> {
+        let [first, second, third, fourth, fifth, sixth] = std::array::from_fn::<_, 6, _>(|i| {
+            ShiftedBinary64::from_wire(wire.values[i], *wire.raw_values[i])
+                .map_err(|error| format!("values/raw_values[{i}]: {error}"))
+        });
+        let scalars = [first?, second?, third?, fourth?, fifth?, sixth?];
+        let target_source_offset = wire.source_offsets[1]
+            .checked_sub(5)
+            .ok_or("source_offsets[1]: target prefix underflow")?;
+        let positions = PointScalarPositions::new(wire.source_offsets[0], target_source_offset)?;
+        let lane = Self {
+            id: wire.id,
+            operation_label: wire.operation_label,
+            construction_header: wire.construction_header,
+            data_blocks: wire.data_blocks,
+            scalars,
+            positions,
+        };
+        if lane.positions.source_offsets() != wire.source_offsets {
+            return Err("source_offsets: inconsistent point scalar lane positions".into());
+        }
+        Ok(lane)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FeaturePointConstructionScalarLane, FeaturePointConstructionScalarLaneWire};
+
+    const WIRE: &str = r#"{"id":"nx:feature:point-scalar#0","operation_label":"operation","construction_header":"header","data_blocks":["first","second"],"values":[1.0,2.0,3.0,4.0,5.0,6.0],"raw_values":["2ff0000000000000","3000000000000000","3008000000000000","3010000000000000","3014000000000000","3018000000000000"],"source_offsets":[100,110,118,126,134,142]}"#;
+
+    #[test]
+    fn point_scalar_borrowed_wire_preserves_bytes() {
+        let record: FeaturePointConstructionScalarLane = serde_json::from_str(WIRE).unwrap();
+        assert_eq!(serde_json::to_vec(&record).unwrap(), WIRE.as_bytes());
+        assert_eq!(
+            serde_json::to_vec(&record).unwrap(),
+            serde_json::to_vec(&FeaturePointConstructionScalarLaneWire::from(
+                record.clone()
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn point_scalar_native_limit_refuses_before_clone() {
+        let record: FeaturePointConstructionScalarLane = serde_json::from_str(WIRE).unwrap();
+        cadmpeg_test_support::native_serialization::assert_native_limit(
+            &record,
+            serde_json::from_str::<serde_json::Value>(WIRE).unwrap(),
+        );
+    }
+
+    #[test]
+    fn point_scalar_lane_requires_derived_positions_and_complete_physical_spans() {
+        let wire: serde_json::Value = serde_json::from_str(
+            r#"{"id":"lane","operation_label":"operation","construction_header":"header",
+                "data_blocks":["first","second"],"values":[1.0,2.0,3.0,4.0,5.0,6.0],
+                "raw_values":["2ff0000000000000","3000000000000000","3008000000000000",
+                              "3010000000000000","3014000000000000","3018000000000000"],
+                "source_offsets":[100,110,118,126,134,142]}"#,
+        )
+        .unwrap();
+        for slot in 2..6 {
+            let mut invalid = wire.clone();
+            invalid["source_offsets"][slot] =
+                serde_json::json!(wire["source_offsets"][slot].as_u64().unwrap() + 1);
+            let error =
+                serde_json::from_value::<FeaturePointConstructionScalarLane>(invalid).unwrap_err();
+            assert!(error.to_string().contains("source_offsets"));
+        }
+        for offsets in [
+            [u64::MAX - 2, 110, 118, 126, 134, 142],
+            [100, 4, 12, 20, 28, 36],
+            [
+                100,
+                u64::MAX - 58,
+                u64::MAX - 50,
+                u64::MAX - 42,
+                u64::MAX - 34,
+                u64::MAX - 26,
+            ],
+        ] {
+            let mut invalid = wire.clone();
+            invalid["source_offsets"] = serde_json::json!(offsets);
+            let error =
+                serde_json::from_value::<FeaturePointConstructionScalarLane>(invalid).unwrap_err();
+            assert!(error.to_string().contains("source_offsets"));
+        }
+        let mut boundary = wire;
+        boundary["source_offsets"] = serde_json::json!([
+            u64::MAX - 3,
+            u64::MAX - 59,
+            u64::MAX - 51,
+            u64::MAX - 43,
+            u64::MAX - 35,
+            u64::MAX - 27
+        ]);
+        let lane: FeaturePointConstructionScalarLane =
+            serde_json::from_value(boundary.clone()).unwrap();
+        assert_eq!(serde_json::to_value(lane).unwrap(), boundary);
+    }
+}

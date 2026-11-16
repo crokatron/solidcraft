@@ -1,0 +1,1199 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Extract and classify Parasolid streams in an NX part payload.
+//!
+//! [`extract_streams`] scans the canonical `/Root/UG_PART/UG_PART` file span for
+//! valid zlib headers. An inflated `PS 00 00` prologue identifies Parasolid
+//! neutral-binary data and supplies its subtype and optional `SCH_` schema token.
+//! Legacy CFB parts use [`extract_legacy_streams`] to split the same prologue
+//! from clear `UG_PART/UG_PART` sections or inflate it from text-wrapped
+//! sections. Other inflated payloads are classified
+//! as [`StreamKind::Preview`].
+
+#![deny(clippy::disallowed_methods)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
+
+use cadmpeg_container::compression::inflate_zlib_member;
+use cadmpeg_core::bytes::{contains, find};
+use cadmpeg_core::decode::{ByteRange, DecodeContext, ExpandSpec, View};
+use cadmpeg_core::CodecError;
+
+pub(crate) mod attribute_action;
+use attribute_action::AttributeAction;
+
+pub(crate) mod attribute_field;
+use attribute_field::AttributeField;
+
+pub(crate) mod value_records;
+
+mod attribute_nodes;
+
+pub(crate) mod unicode_value;
+
+pub(crate) mod counted_values;
+pub(crate) mod current_partition;
+
+use cadmpeg_core::printable::PrintableString;
+
+pub(crate) mod entity_references;
+pub(crate) mod name_references;
+use entity_references::EntityReferences;
+use name_references::NameReferences;
+
+use crate::container::Container;
+use crate::grouping::group_pairs;
+use cadmpeg_parasolid::pointer::read_at as read_xmt;
+use cadmpeg_parasolid::records::{node_type, PrimaryRecords};
+use cadmpeg_parasolid::xmt::{NonNullXmt, XmtTarget};
+
+/// Classification of an inflated payload in the part stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StreamKind {
+    /// A Parasolid `(partition)` body snapshot.
+    Partition,
+    /// A Parasolid `(deltas)` edit overlay.
+    Deltas,
+    /// A retained Parasolid body without a recognized partition or deltas label.
+    /// This summary kind does not select the CHART or LIMIT row layout.
+    Plain,
+    /// An inflated non-Parasolid payload, such as preview or metadata data.
+    Preview,
+}
+
+impl StreamKind {
+    /// Return the stable label used in summaries and reports.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            StreamKind::Partition => "partition",
+            StreamKind::Deltas => "deltas",
+            StreamKind::Plain => "plain",
+            StreamKind::Preview => "preview",
+        }
+    }
+
+    /// Return whether this kind contains Parasolid neutral-binary records.
+    pub(crate) fn is_parasolid(self) -> bool {
+        !matches!(self, StreamKind::Preview)
+    }
+}
+
+/// Parasolid stream record subtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParasolidSubtype {
+    /// Body snapshot.
+    Partition,
+    /// Edit overlay.
+    Deltas,
+    /// A recognized TRANSMIT body without a named subtype.
+    Plain,
+    /// A retained Parasolid payload without a recognized transmit description.
+    Unresolved,
+}
+
+impl ParasolidSubtype {
+    pub(crate) fn chart_point_layout(self) -> Option<crate::intersection::ChartPointLayout> {
+        match self {
+            Self::Partition | Self::Plain => Some(crate::intersection::ChartPointLayout::Xyz3),
+            Self::Deltas => Some(crate::intersection::ChartPointLayout::Ext11),
+            Self::Unresolved => None,
+        }
+    }
+}
+
+/// Classified stream body and its Parasolid schema.
+#[derive(Debug, Clone)]
+pub(crate) enum StreamBody {
+    /// Parasolid records.
+    Parasolid {
+        /// Record subtype.
+        subtype: ParasolidSubtype,
+        /// Schema token.
+        schema: Option<cadmpeg_parasolid::OwnedSchemaToken>,
+    },
+    /// Non-Parasolid payload.
+    Preview,
+}
+
+impl StreamBody {
+    fn kind(&self) -> StreamKind {
+        match self {
+            Self::Parasolid {
+                subtype: ParasolidSubtype::Partition,
+                ..
+            } => StreamKind::Partition,
+            Self::Parasolid {
+                subtype: ParasolidSubtype::Deltas,
+                ..
+            } => StreamKind::Deltas,
+            Self::Parasolid {
+                subtype: ParasolidSubtype::Plain | ParasolidSubtype::Unresolved,
+                ..
+            } => StreamKind::Plain,
+            Self::Preview => StreamKind::Preview,
+        }
+    }
+}
+
+/// A located and inflated stream from the canonical part payload.
+#[derive(Debug, Clone)]
+pub(crate) struct Stream {
+    /// Byte offset of the stream start in the source file.
+    ///
+    /// Modern and text-wrapped legacy streams start at a zlib header. Clear
+    /// legacy streams start at a Parasolid transmit header.
+    pub(crate) file_offset: usize,
+    /// Source bytes consumed by the stream at `file_offset`.
+    ///
+    /// For a zlib member this is the compressed member length. For a clear
+    /// legacy section it is the section length. The physical extent
+    /// `[file_offset, file_offset + consumed)` is source-owned.
+    pub(crate) consumed: u64,
+    /// Whether `[file_offset, file_offset + consumed)` holds a zlib member;
+    /// otherwise it holds the stream bytes as stored.
+    pub(crate) compressed: bool,
+    /// Inflated bytes.
+    pub(crate) inflated: Vec<u8>,
+    /// Payload classification.
+    pub(crate) body: StreamBody,
+}
+
+impl Stream {
+    /// Stream classification.
+    pub(crate) fn kind(&self) -> StreamKind {
+        self.body.kind()
+    }
+
+    /// Parasolid schema token.
+    pub(crate) fn schema_token(&self) -> Option<&cadmpeg_parasolid::OwnedSchemaToken> {
+        match &self.body {
+            StreamBody::Parasolid { schema, .. } => schema.as_ref(),
+            StreamBody::Preview => None,
+        }
+    }
+}
+
+/// Owner-flag layouts admitted by the attribute-definition grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegalOwnerFlags {
+    /// Fourteen flags in the compact definition layout.
+    Fourteen([bool; 14]),
+    /// Sixteen flags in the extended definition layout.
+    Sixteen([bool; 16]),
+}
+
+impl LegalOwnerFlags {
+    pub(crate) fn as_slice(&self) -> &[bool] {
+        match self {
+            Self::Fourteen(flags) => flags,
+            Self::Sixteen(flags) => flags,
+        }
+    }
+
+    /// Fixed-width native JSON representation, padded after the source flags.
+    pub(crate) fn padded(self) -> [u8; 16] {
+        let mut padded = [0; 16];
+        for (byte, flag) in padded.iter_mut().zip(self.as_slice()) {
+            *byte = u8::from(*flag);
+        }
+        padded
+    }
+}
+
+impl TryFrom<&[u8]> for LegalOwnerFlags {
+    type Error = &'static str;
+    fn try_from(flags: &[u8]) -> Result<Self, Self::Error> {
+        if !flags.iter().all(|flag| matches!(flag, 0 | 1)) {
+            return Err("legal_owner_flags must be binary");
+        }
+        if let Ok(flags) = <[u8; 16]>::try_from(flags) {
+            Ok(Self::Sixteen(flags.map(|flag| flag == 1)))
+        } else if let Ok(flags) = <[u8; 14]>::try_from(flags) {
+            Ok(Self::Fourteen(flags.map(|flag| flag == 1)))
+        } else {
+            Err("attribute owner flags require fourteen or sixteen bytes")
+        }
+    }
+}
+
+/// One Parasolid type-80 attribute definition joined to its type-79 identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttributeDefinition<'a> {
+    /// Inflated-stream offset of the `00 50` definition tag.
+    pub(crate) offset: usize,
+    /// Stream-local definition record identity.
+    pub(crate) xmt: NonNullXmt,
+    /// Optional stream-local next-definition target.
+    pub(crate) next_definition_xmt: Option<XmtTarget>,
+    /// Stream-local type-79 identifier identity.
+    pub(crate) identifier_xmt: NonNullXmt,
+    /// Inflated-stream offset of the resolved `00 4f` identifier tag.
+    pub(crate) identifier_offset: usize,
+    /// Exact printable class name.
+    pub(crate) name: PrintableString<&'a str>,
+    /// Numeric attribute type identifier.
+    pub(crate) type_id: NonZeroU32,
+    /// Ordered actions for the eight logged event families.
+    pub(crate) action_codes: [AttributeAction; 8],
+    /// Optional stream-local field-name-list target.
+    pub(crate) field_names_xmt: Option<XmtTarget>,
+    /// Ordered legal-owner flags.
+    pub(crate) legal_owner_flags: LegalOwnerFlags,
+    /// One serialized field code for every declared field.
+    pub(crate) field_codes: Vec<AttributeField>,
+}
+
+/// One framed type-81 Parasolid entity/attribute-list record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entity51Record {
+    /// Inflated-stream offset of the `00 51` tag.
+    pub(crate) offset: usize,
+    /// Exact framed record length.
+    pub(crate) byte_len: usize,
+    /// Stream-local record identity.
+    pub(crate) xmt: NonNullXmt,
+    /// Serialized sequence value.
+    pub(crate) sequence: NonZeroU32,
+    /// Stream-local type-80 attribute-definition identity.
+    pub(crate) definition_xmt: u32,
+    /// Five fixed leading stream-local references.
+    pub(crate) leading_references: [u32; 5],
+    /// Variable trailing stream-local references counted by `flags`.
+    pub(crate) trailing_references: EntityReferences,
+}
+
+/// One counted type-99 attribute field-name record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FieldNamesRecord {
+    /// Inflated-stream offset of the `00 63` tag.
+    pub(crate) offset: usize,
+    /// Exact framed record length.
+    pub(crate) byte_len: usize,
+    /// Stream-local record identity.
+    pub(crate) xmt: NonNullXmt,
+    /// Ordered stream-local character or Unicode value references.
+    pub(crate) name_xmts: NameReferences,
+}
+
+/// The node sequence of a stream that a terminator ends.
+fn terminated_nodes(bytes: &[u8]) -> Option<PrimaryRecords<'_>> {
+    PrimaryRecords::read(bytes)
+        .ok()
+        .flatten()
+        .filter(PrimaryRecords::is_terminated)
+}
+
+/// Decode unique snapshot values.
+pub(crate) fn referenced_value_records(
+    bytes: &[u8],
+) -> Result<value_records::EntityValueRecords<'_>, CodecError> {
+    let primary = terminated_nodes(bytes);
+    let offsets = value_offsets(bytes, primary.as_ref());
+    match primary {
+        Some(primary) => value_records::entity_value_records_of_nodes(
+            bytes,
+            &primary,
+            &offsets.into_iter().collect(),
+        ),
+        None => value_records::entity_value_records_at(bytes, offsets),
+    }
+}
+
+/// Locate unique snapshot values.
+#[cfg(test)]
+pub(crate) fn referenced_value_record_offsets(bytes: &[u8]) -> Vec<usize> {
+    value_offsets(bytes, terminated_nodes(bytes).as_ref())
+}
+
+/// Locate the value records that unique owners reference.
+///
+/// An identity that frames more than one value record, or more than one
+/// owning record, is a historical sequence rather than a snapshot and names
+/// no value here.
+fn value_offsets(bytes: &[u8], primary: Option<&PrimaryRecords<'_>>) -> Vec<usize> {
+    let references = referenced_value_xmts(bytes, primary);
+    let mut candidates = BTreeMap::<u32, Vec<usize>>::new();
+    match primary {
+        Some(primary) => {
+            for node in primary.nodes() {
+                if VALUE_NODE_TYPES.contains(&node.kind()) && references.contains(&node.index()) {
+                    candidates
+                        .entry(node.index())
+                        .or_default()
+                        .push(node.range().start);
+                }
+            }
+        }
+        None => candidates = value_records::value_record_candidates(bytes, &references),
+    }
+    candidates
+        .into_values()
+        .filter(|positions| positions.len() == 1)
+        .flatten()
+        .collect()
+}
+
+/// The node types of attribute values.
+const VALUE_NODE_TYPES: [u16; 9] = [
+    node_type::INT_VALUES,
+    node_type::REAL_VALUES,
+    node_type::CHAR_VALUES,
+    node_type::POINT_VALUES,
+    node_type::VECTOR_VALUES,
+    node_type::AXIS_VALUES,
+    node_type::TAG_VALUES,
+    node_type::DIRECTION_VALUES,
+    node_type::UNICODE_VALUES,
+];
+
+fn referenced_value_xmts(bytes: &[u8], primary: Option<&PrimaryRecords<'_>>) -> BTreeSet<u32> {
+    let mut referenced = BTreeSet::new();
+    let entities = group_pairs(
+        entity_51_records_in(bytes, primary)
+            .into_iter()
+            .map(|record| (u32::from(record.xmt), record)),
+    );
+    for records in entities.into_values() {
+        if records.len() != 1 {
+            continue;
+        }
+        for record in records {
+            referenced.extend(record.trailing_references.into_values());
+        }
+    }
+    let field_names = group_pairs(
+        field_names_records_in(bytes, primary)
+            .into_iter()
+            .map(|record| (u32::from(record.xmt), record)),
+    );
+    let definitions = group_pairs(
+        attribute_definitions_in(bytes, primary)
+            .into_iter()
+            .map(|record| (u32::from(record.xmt), record)),
+    );
+    let mut referenced_lists = BTreeSet::new();
+    for records in definitions.into_values() {
+        if records.len() != 1 {
+            continue;
+        }
+        for record in records {
+            if let Some(xmt) = record.field_names_xmt {
+                referenced_lists.insert(u32::from(xmt));
+            }
+        }
+    }
+    for (xmt, records) in field_names {
+        if !referenced_lists.contains(&xmt) || records.len() != 1 {
+            continue;
+        }
+        for record in records {
+            referenced.extend(
+                record
+                    .name_xmts
+                    .as_slice()
+                    .iter()
+                    .map(|xmt| u32::from(*xmt)),
+            );
+        }
+    }
+    referenced
+}
+
+/// Decode counted type-99 attribute field-name records.
+pub(crate) fn field_names_records(bytes: &[u8]) -> Vec<FieldNamesRecord> {
+    field_names_records_in(bytes, terminated_nodes(bytes).as_ref())
+}
+
+fn field_names_records_in(
+    bytes: &[u8],
+    primary: Option<&PrimaryRecords<'_>>,
+) -> Vec<FieldNamesRecord> {
+    if let Some(primary) = primary {
+        return attribute_nodes::field_names(primary);
+    }
+    let mut records = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if let Some(record) = field_names_record_at(bytes, offset) {
+            offset += record.byte_len;
+            records.push(record);
+        } else {
+            offset += 1;
+        }
+    }
+    records
+}
+
+fn field_names_record_at(bytes: &[u8], offset: usize) -> Option<FieldNamesRecord> {
+    let mut at = offset.checked_add(2)?;
+    (bytes.get(offset..at) == Some(&[0, 0x63])).then_some(())?;
+    if bytes.get(at) == Some(&0xff) {
+        at += 1;
+    }
+    let count = usize::try_from(View::u32_be_at(bytes, at)?).ok()?;
+    at += 4;
+    let xmt = NonNullXmt::try_from(read_xmt(bytes, &mut at)?).ok()?;
+    // Each reference requires at least two source bytes.
+    (count <= bytes.len().checked_sub(at)? / 2).then_some(())?;
+    let mut name_xmts = Vec::new();
+    for _ in 0..count {
+        name_xmts.push(NonNullXmt::try_from(read_xmt(bytes, &mut at)?).ok()?);
+    }
+    Some(FieldNamesRecord {
+        offset,
+        byte_len: at - offset,
+        xmt,
+        name_xmts: NameReferences::try_from(name_xmts).ok()?,
+    })
+}
+
+/// Decode framed type-81 entity/attribute-list records.
+pub(crate) fn entity_51_records(bytes: &[u8]) -> Vec<Entity51Record> {
+    entity_51_records_in(bytes, terminated_nodes(bytes).as_ref())
+}
+
+fn entity_51_records_in(bytes: &[u8], primary: Option<&PrimaryRecords<'_>>) -> Vec<Entity51Record> {
+    if let Some(primary) = primary {
+        return attribute_nodes::attributes(primary);
+    }
+    let mut records = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let Some(frame) = entity_51_frame_at(bytes, offset) else {
+            offset += 1;
+            continue;
+        };
+        if let Some(record) = entity_51_record_from_frame(bytes, frame) {
+            let Some(next) = frame.next_offset() else {
+                break;
+            };
+            records.push(record);
+            offset = next;
+        } else {
+            offset += 1;
+        }
+    }
+    records
+}
+
+/// The XMTs of type-81 records that the stream frames and the decoder omits.
+///
+/// In a terminated node sequence these are the `ATTRIBUTE` nodes without a
+/// decoded record. Elsewhere they are the type-81 headers whose references do
+/// not frame to a decoded record of that XMT.
+pub(crate) fn omitted_entity_51_xmts(bytes: &[u8]) -> BTreeSet<u32> {
+    let primary = terminated_nodes(bytes);
+    let decoded = entity_51_records_in(bytes, primary.as_ref())
+        .into_iter()
+        .map(|record| u32::from(record.xmt))
+        .collect::<BTreeSet<_>>();
+    let framed = match &primary {
+        Some(primary) => primary
+            .nodes()
+            .filter(|node| node.kind() == node_type::ATTRIBUTE)
+            .map(|node| node.index())
+            .collect::<BTreeSet<_>>(),
+        None => (0..bytes.len())
+            .filter_map(|offset| entity_51_header_at(bytes, offset))
+            .map(|header| u32::from(header.xmt))
+            .collect(),
+    };
+    framed.difference(&decoded).copied().collect()
+}
+
+#[derive(Clone, Copy)]
+struct Entity51Frame {
+    offset: usize,
+    end: usize,
+    xmt: NonNullXmt,
+    sequence: NonZeroU32,
+    definition_xmt: u32,
+    references_at: usize,
+    reference_count: usize,
+    shared_terminal: bool,
+}
+
+impl Entity51Frame {
+    fn next_offset(self) -> Option<usize> {
+        if self.shared_terminal {
+            self.end.checked_sub(1)
+        } else {
+            Some(self.end)
+        }
+    }
+}
+
+/// The fields of a type-81 record before its references.
+struct Entity51Header {
+    xmt: NonNullXmt,
+    sequence: NonZeroU32,
+    definition_xmt: u32,
+    references_at: usize,
+    reference_count: usize,
+}
+
+fn entity_51_header_at(bytes: &[u8], offset: usize) -> Option<Entity51Header> {
+    let mut at = offset.checked_add(2)?;
+    (bytes.get(offset..at) == Some(&[0x00, 0x51])).then_some(())?;
+    if bytes.get(at) == Some(&0xff) {
+        at += 1;
+    }
+    let flags = View::u32_be_at(bytes, at)?;
+    at += 4;
+    let xmt = NonNullXmt::try_from(read_xmt(bytes, &mut at)?).ok()?;
+    let sequence = NonZeroU32::new(View::u32_be_at(bytes, at)?)?;
+    at += 4;
+    let definition_xmt = read_xmt(bytes, &mut at)?;
+    (1..=0x20).contains(&flags).then_some(())?;
+    Some(Entity51Header {
+        xmt,
+        sequence,
+        definition_xmt,
+        references_at: at,
+        reference_count: usize::try_from(flags).ok()?.checked_add(5)?,
+    })
+}
+
+fn entity_51_frame_at(bytes: &[u8], offset: usize) -> Option<Entity51Frame> {
+    let header = entity_51_header_at(bytes, offset)?;
+    let mut at = header.references_at;
+    let (end, shared_terminal) = entity_51_reference_end(bytes, &mut at, header.reference_count)?;
+    Some(Entity51Frame {
+        offset,
+        end,
+        xmt: header.xmt,
+        sequence: header.sequence,
+        definition_xmt: header.definition_xmt,
+        references_at: header.references_at,
+        reference_count: header.reference_count,
+        shared_terminal,
+    })
+}
+
+fn entity_51_record_from_frame(bytes: &[u8], frame: Entity51Frame) -> Option<Entity51Record> {
+    let mut at = frame.references_at;
+    let prefixed = bytes.get(at) == Some(&1);
+    let mut leading_references = [0; 5];
+    for reference in &mut leading_references {
+        if prefixed {
+            matches!(bytes.get(at), Some(0 | 1)).then_some(())?;
+            at += 1;
+        }
+        *reference = read_xmt(bytes, &mut at)?;
+    }
+    let mut trailing = Vec::new();
+    for _ in 5..frame.reference_count {
+        if prefixed {
+            matches!(bytes.get(at), Some(0 | 1)).then_some(())?;
+            at += 1;
+        }
+        trailing.push(read_xmt(bytes, &mut at)?);
+    }
+    Some(Entity51Record {
+        offset: frame.offset,
+        byte_len: frame.end - frame.offset,
+        xmt: frame.xmt,
+        sequence: frame.sequence,
+        definition_xmt: frame.definition_xmt,
+        leading_references,
+        trailing_references: EntityReferences::new(trailing).ok()?,
+    })
+}
+
+fn entity_51_reference_end(bytes: &[u8], at: &mut usize, count: usize) -> Option<(usize, bool)> {
+    if bytes.get(*at) == Some(&1) {
+        let mut prefixed_at = *at;
+        for _ in 0..count {
+            matches!(bytes.get(prefixed_at), Some(0 | 1)).then_some(())?;
+            prefixed_at += 1;
+            read_xmt(bytes, &mut prefixed_at)?;
+        }
+        matches!(bytes.get(prefixed_at), Some(0 | 1)).then_some(())?;
+        *at = prefixed_at + 1;
+        return Some((*at, true));
+    }
+    for _ in 0..count {
+        read_xmt(bytes, at)?;
+    }
+    Some((*at, false))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttributeIdentifier<'a> {
+    offset: usize,
+    xmt: NonNullXmt,
+    name: PrintableString<&'a str>,
+}
+
+/// Index type-79 identifiers by XMT; a repeated XMT indexes no identifier.
+///
+/// Candidate names overlap, but a name is printable ASCII and every tag starts
+/// with a zero byte, so a name check stops before the next candidate's tag.
+fn attribute_identifiers(bytes: &[u8]) -> BTreeMap<u32, Option<AttributeIdentifier<'_>>> {
+    let mut index = BTreeMap::new();
+    for offset in 0..bytes.len() {
+        let candidate = (|| {
+            let mut at = offset.checked_add(2)?;
+            (bytes.get(offset..at) == Some(&[0x00, 0x4f])).then_some(())?;
+            if bytes.get(at) == Some(&0xff) {
+                at += 1;
+            }
+            let name_len = usize::try_from(View::u32_be_at(bytes, at)?).ok()?;
+            at += 4;
+            let xmt = NonNullXmt::try_from(read_xmt(bytes, &mut at)?).ok()?;
+            let name_end = at.checked_add(name_len)?;
+            Some(AttributeIdentifier {
+                offset,
+                xmt,
+                name: PrintableString::from_bytes(bytes.get(at..name_end)?).ok()?,
+            })
+        })();
+        if let Some(identifier) = candidate {
+            match index.entry(u32::from(identifier.xmt)) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(identifier));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Decode complete type-80 attribute definitions and resolve their type-79
+/// identifiers.
+///
+/// Candidate field codes overlap, but codes are 0 through 10 and a type-80 tag
+/// is `00 50`, so a field-code check stops before the next candidate's tag.
+pub(crate) fn attribute_definitions(bytes: &[u8]) -> Vec<AttributeDefinition<'_>> {
+    attribute_definitions_in(bytes, terminated_nodes(bytes).as_ref())
+}
+
+fn attribute_definitions_in<'a>(
+    bytes: &'a [u8],
+    primary: Option<&PrimaryRecords<'_>>,
+) -> Vec<AttributeDefinition<'a>> {
+    if let Some(primary) = primary {
+        return attribute_nodes::definitions(bytes, primary);
+    }
+    let identifiers = attribute_identifiers(bytes);
+    let mut records = Vec::new();
+    for offset in 0..bytes.len() {
+        let candidate = (|| {
+            let mut at = offset.checked_add(2)?;
+            (bytes.get(offset..at) == Some(&[0x00, 0x50])).then_some(())?;
+            if bytes.get(at) == Some(&0xff) {
+                at += 1;
+            }
+            let field_count = View::u32_be_at(bytes, at)?;
+            at += 4;
+            let xmt = NonNullXmt::try_from(read_xmt(bytes, &mut at)?).ok()?;
+            let next_definition_xmt = XmtTarget::from_wire(read_xmt(bytes, &mut at)?);
+            let identifier_xmt = NonNullXmt::try_from(read_xmt(bytes, &mut at)?).ok()?;
+            let type_id = NonZeroU32::new(View::u32_be_at(bytes, at)?)?;
+            at += 4;
+            let mut action_codes = [AttributeAction::Code0; 8];
+            for (action, byte) in action_codes.iter_mut().zip(bytes.get(at..at + 8)?) {
+                *action = AttributeAction::try_from(*byte).ok()?;
+            }
+            at += 8;
+            let field_names_xmt = XmtTarget::from_wire(read_xmt(bytes, &mut at)?);
+            let identifier = identifiers.get(&u32::from(identifier_xmt))?.as_ref()?;
+            let field_count_usize = usize::try_from(field_count).ok()?;
+            let (legal_owner_flags, field_codes) =
+                [16_usize, 14].into_iter().find_map(|flag_count| {
+                    let flags = bytes.get(at..at.checked_add(flag_count)?)?;
+                    let legal_owner_flags = LegalOwnerFlags::try_from(flags).ok()?;
+                    let field_codes_start = at.checked_add(flag_count)?;
+                    let field_codes_end = field_codes_start.checked_add(field_count_usize)?;
+                    let field_codes = bytes.get(field_codes_start..field_codes_end)?;
+                    if flag_count == 14 && !attribute_definition_boundary(bytes, field_codes_end) {
+                        return None;
+                    }
+                    field_codes
+                        .iter()
+                        .try_for_each(|code| AttributeField::try_from(*code).map(|_| ()).ok())?;
+                    Some((legal_owner_flags, field_codes))
+                })?;
+            let mut fields = Vec::new();
+            for code in field_codes {
+                fields.push(AttributeField::try_from(*code).ok()?);
+            }
+            Some(AttributeDefinition {
+                offset,
+                xmt,
+                next_definition_xmt,
+                identifier_xmt,
+                identifier_offset: identifier.offset,
+                name: identifier.name,
+                type_id,
+                action_codes,
+                field_names_xmt,
+                legal_owner_flags,
+                field_codes: fields,
+            })
+        })();
+        if let Some(record) = candidate {
+            records.push(record);
+        }
+    }
+    records
+}
+
+fn attribute_definition_boundary(bytes: &[u8], offset: usize) -> bool {
+    offset
+        .checked_add(2)
+        .and_then(|end| bytes.get(offset..end))
+        .is_some_and(|tag| tag[0] == 0 && (0x4f..=0x63).contains(&tag[1]))
+}
+
+/// Locates, inflates, and classifies zlib streams in `/Root/UG_PART/UG_PART`.
+pub(crate) fn extract_streams<'a>(
+    ctx: &DecodeContext<'a>,
+    root: View<'a>,
+    container: &Container,
+) -> Result<Vec<Stream>, CodecError> {
+    let Some((part_offset, part_size)) = container
+        .entries
+        .iter()
+        .find(|entry| entry.name == "/Root/UG_PART/UG_PART")
+        .and_then(crate::container::DirEntry::file_span)
+    else {
+        return Ok(Vec::new());
+    };
+    let (Ok(start), Ok(size)) = (usize::try_from(part_offset), usize::try_from(part_size)) else {
+        return Ok(Vec::new());
+    };
+    let Some(end) = start.checked_add(size) else {
+        return Ok(Vec::new());
+    };
+    let part_view = ctx.register_slice(
+        root,
+        ByteRange {
+            start: cadmpeg_core::decode::u64_from_index(start),
+            end: cadmpeg_core::decode::u64_from_index(end),
+        },
+    )?;
+    let part = part_view.window();
+
+    let mut streams = Vec::new();
+    if container.segment_index().is_some() {
+        let mut seen = BTreeMap::new();
+
+        for wrapper in container.segment_stream_wrappers() {
+            let Some(offset) = wrapper.zlib_offset.checked_sub(start) else {
+                continue;
+            };
+            if offset
+                .checked_add(2)
+                .and_then(|end| part.get(offset..end))
+                .is_none_or(|header| !is_zlib_header(header[0], header[1]))
+            {
+                continue;
+            }
+            if !match seen.entry(offset) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(wrapper.compressed_byte_len);
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(_) => false,
+            } {
+                if seen.get(&offset) != Some(&wrapper.compressed_byte_len) {
+                    return Err(CodecError::malformed(format_args!(
+                        "conflicting indexed NX member lengths at file offset {}",
+                        start + offset
+                    )));
+                }
+                continue;
+            }
+            let compressed_end =
+                offset
+                    .checked_add(wrapper.compressed_byte_len)
+                    .ok_or_else(|| {
+                        CodecError::Malformed("indexed NX member extent overflows".into())
+                    })?;
+            let overlaps_preceding = seen
+                .range(..offset)
+                .next_back()
+                .is_some_and(|(&previous, &length)| length > offset - previous);
+            let overlaps_following = seen
+                .range(offset..)
+                .nth(1)
+                .is_some_and(|(&following, _)| following < compressed_end);
+            if overlaps_preceding || overlaps_following {
+                return Err(CodecError::Malformed(
+                    "overlapping indexed NX members".into(),
+                ));
+            }
+            let source = part_view.child(offset, compressed_end).ok_or_else(|| {
+                CodecError::Malformed("indexed NX member exceeds its part payload".into())
+            })?;
+            let Some((inflated, consumed)) = inflate_stream(ctx, source)? else {
+                return Err(CodecError::malformed(format_args!(
+                    "invalid indexed zlib member at file offset {}",
+                    start + offset
+                )));
+            };
+            if consumed != cadmpeg_core::decode::u64_from_index(wrapper.compressed_byte_len) {
+                return Err(CodecError::malformed(format_args!(
+                    "indexed zlib member length at file offset {} differs from its wrapper",
+                    start + offset
+                )));
+            }
+            let body = classify(&inflated);
+            ctx.charge_entities(1, "admit NX streams")?;
+            streams.push(Stream {
+                file_offset: start + offset,
+                consumed,
+                compressed: true,
+                inflated,
+                body,
+            });
+        }
+        let indexed_count = streams.len();
+        append_unindexed_structural_streams(ctx, part_view, start, &mut streams)?;
+        for at in indexed_count..streams.len() {
+            let offset = streams[at].file_offset;
+            if let Some(insertion) = streams[..at]
+                .iter()
+                .position(|stream| stream.file_offset > offset)
+            {
+                streams[insertion..=at].rotate_right(1);
+            }
+        }
+        return Ok(streams);
+    }
+
+    append_all_zlib_streams(ctx, part_view, start, &mut streams, false)?;
+    Ok(streams)
+}
+
+fn append_all_zlib_streams<'a>(
+    ctx: &DecodeContext<'a>,
+    part_view: View<'a>,
+    file_start: usize,
+    streams: &mut Vec<Stream>,
+    structural_only: bool,
+) -> Result<(), CodecError> {
+    let part = part_view.window();
+    let mut seen = BTreeMap::new();
+
+    for stream in streams.iter() {
+        match seen.entry(stream.file_offset) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(stream.consumed);
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        };
+    }
+    let mut i = 0usize;
+    while i + 2 <= part.len() {
+        if is_zlib_header(part[i], part[i + 1]) {
+            let file_offset = file_start + i;
+            let following = seen.range(file_offset..).next();
+            if let Some((&offset, &consumed)) =
+                following.filter(|(offset, _)| **offset == file_offset)
+            {
+                i += packed_member_advance(offset, consumed)?;
+                continue;
+            }
+            let source_end = following.map_or(part_view.end(), |(&offset, _)| offset - file_start);
+            let source = part_view.child(i, source_end).ok_or_else(|| {
+                CodecError::Malformed("NX member offset exceeds its part payload".into())
+            })?;
+            if let Some((inflated, consumed)) = inflate_stream(ctx, source)? {
+                let body = classify(&inflated);
+                if match seen.entry(file_offset) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(consumed);
+                        true
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => false,
+                } && (!structural_only || structural_stream_candidate(body.kind(), &inflated)?)
+                {
+                    ctx.charge_entities(1, "admit NX streams")?;
+                    streams.push(Stream {
+                        file_offset,
+                        consumed,
+                        compressed: true,
+                        inflated,
+                        body,
+                    });
+                }
+                i += packed_member_advance(file_offset, consumed)?;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn append_unindexed_structural_streams<'a>(
+    ctx: &DecodeContext<'a>,
+    part_view: View<'a>,
+    file_start: usize,
+    streams: &mut Vec<Stream>,
+) -> Result<(), CodecError> {
+    append_all_zlib_streams(ctx, part_view, file_start, streams, true)
+}
+
+fn structural_stream_candidate(kind: StreamKind, inflated: &[u8]) -> Result<bool, CodecError> {
+    if !kind.is_parasolid() {
+        return Ok(false);
+    }
+    if kind != StreamKind::Deltas {
+        return Ok(cadmpeg_parasolid::records::PrimaryRecords::read(inflated)?
+            .is_some_and(|primary| !primary.records().is_empty()));
+    }
+    let owner = cadmpeg_parasolid::records::DeltasRecords::read(inflated)?;
+    Ok(owner.events().iter().any(|event| {
+        matches!(
+            event.content(),
+            cadmpeg_parasolid::records::deltas::EventContent::PartitionPrefix(_)
+        )
+    }))
+}
+
+/// Locate the Parasolid transmit sections in a legacy `UG_PART/UG_PART`
+/// stream: its clear sections, or, when it holds none, its text-wrapped
+/// sections.
+///
+/// Legacy NX stores multiple self-describing Parasolid sections consecutively.
+/// A section begins with `PS`, its big-endian description length, and a
+/// printable `TRANSMIT FILE` description. Only those complete transmit headers
+/// are admitted as boundaries; arbitrary `PS\0\0` bytes in the payload do not
+/// split a stream.
+pub(crate) fn extract_legacy_streams<'a>(
+    ctx: &DecodeContext<'a>,
+    part: View<'a>,
+) -> Result<Vec<Stream>, CodecError> {
+    let bytes = part.window();
+    let mut streams = Vec::new();
+    let mut search = 0;
+    while let Some(start) = legacy_stream_start(bytes, search) {
+        let next = start
+            .checked_add(4)
+            .and_then(|next| legacy_stream_start(bytes, next));
+        let end = next.unwrap_or(bytes.len());
+        let payload = bytes.get(start..end).ok_or_else(|| {
+            CodecError::Malformed("legacy Parasolid stream range escapes payload".into())
+        })?;
+        let inflated = payload.to_vec();
+        let body = classify(&inflated);
+        let consumed = u64::try_from(payload.len()).map_err(|_| {
+            CodecError::Malformed("legacy Parasolid stream length exceeds u64".into())
+        })?;
+        let file_offset = part.start().checked_add(start).ok_or_else(|| {
+            CodecError::Malformed("legacy Parasolid stream offset overflow".into())
+        })?;
+        ctx.charge_entities(1, "admit NX streams")?;
+        streams.push(Stream {
+            file_offset,
+            consumed,
+            compressed: false,
+            inflated,
+            body,
+        });
+        let Some(next) = next else {
+            break;
+        };
+        search = next;
+    }
+    if streams.is_empty() {
+        append_text_wrapped_streams(ctx, part, &mut streams)?;
+    }
+    Ok(streams)
+}
+
+/// The text-header terminator of a text-wrapped transmit section.
+const TEXT_HEADER_END: &[u8] = b"**END_OF_HEADER";
+
+/// Inflate the text-wrapped transmit sections of a legacy part payload
+/// (spec §2.4): after `**END_OF_HEADER`, zero or more `*` to the line end,
+/// the newline, an optional `+`, and one zlib member. The search resumes
+/// after each inflated member.
+fn append_text_wrapped_streams<'a>(
+    ctx: &DecodeContext<'a>,
+    part: View<'a>,
+    streams: &mut Vec<Stream>,
+) -> Result<(), CodecError> {
+    let bytes = part.window();
+    let mut search = 0;
+    while let Some(relative) = bytes
+        .get(search..)
+        .and_then(|rest| find(rest, TEXT_HEADER_END))
+    {
+        let Some(after) = search
+            .checked_add(relative)
+            .and_then(|at| at.checked_add(TEXT_HEADER_END.len()))
+        else {
+            break;
+        };
+        search = after;
+        let Some(rest) = bytes.get(after..) else {
+            break;
+        };
+        let stars = rest.iter().take_while(|byte| **byte == b'*').count();
+        if rest.get(stars) != Some(&b'\n') {
+            continue;
+        }
+        let mut start = after + stars + 1;
+        if bytes.get(start) == Some(&b'+') {
+            start += 1;
+        }
+        if !bytes
+            .get(start..start + 2)
+            .is_some_and(|header| is_zlib_header(header[0], header[1]))
+        {
+            continue;
+        }
+        let absolute = part.start().checked_add(start).ok_or_else(|| {
+            CodecError::Malformed("text-wrapped Parasolid member offset overflow".into())
+        })?;
+        let source = part.child(absolute, part.end()).ok_or_else(|| {
+            CodecError::Malformed("text-wrapped Parasolid member escapes payload".into())
+        })?;
+        let Some((inflated, consumed)) = inflate_stream(ctx, source)? else {
+            continue;
+        };
+        search = usize::try_from(consumed)
+            .ok()
+            .and_then(|length| start.checked_add(length))
+            .ok_or_else(|| {
+                CodecError::Malformed("text-wrapped Parasolid member length overflow".into())
+            })?;
+        let body = classify(&inflated);
+        ctx.charge_entities(1, "admit NX streams")?;
+        streams.push(Stream {
+            file_offset: absolute,
+            consumed,
+            compressed: true,
+            inflated,
+            body,
+        });
+    }
+    Ok(())
+}
+
+fn legacy_stream_start(bytes: &[u8], mut search: usize) -> Option<usize> {
+    loop {
+        let relative = find(bytes.get(search..)?, b"PS\x00\x00")?;
+        let start = search.checked_add(relative)?;
+        if legacy_transmit_header(bytes, start) {
+            return Some(start);
+        }
+        search = start.checked_add(4)?;
+    }
+}
+
+fn legacy_transmit_header(bytes: &[u8], start: usize) -> bool {
+    let description = (|| {
+        let description_len = View::u32_be_at(bytes, start.checked_add(2)?)?;
+        let description_len = usize::try_from(description_len).ok()?;
+        let description_start = start.checked_add(6)?;
+        let description_end = description_start.checked_add(description_len)?;
+        bytes.get(description_start..description_end)
+    })();
+    description.is_some_and(|description| {
+        description
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+            && contains(description, b"TRANSMIT FILE")
+    })
+}
+
+/// The shortest zlib member: the two-byte header, the two bytes a final empty
+/// deflate block needs, and the four-byte Adler-32 trailer.
+///
+/// `inflate_zlib_member` returns only on the decompressor's `StreamEnd`, so it
+/// read a complete member and nothing shorter than this is one.
+const MIN_ZLIB_MEMBER_LEN: usize = 8;
+
+/// The distance the packed-member scan advances past the member at
+/// `file_offset` whose decompressor reported `consumed` source bytes.
+///
+/// The report comes from the decompressor, not from a byte of the file, so it
+/// is read rather than assumed: a count this file cannot address, or one below
+/// the shortest zlib member, is a malformed member and is refused by name.
+fn packed_member_advance(file_offset: usize, consumed: u64) -> Result<usize, CodecError> {
+    let advance = usize::try_from(consumed).map_err(|_| {
+        CodecError::malformed(format_args!(
+            "nx packed member at {file_offset} reports {consumed} consumed source bytes, \
+             which this file cannot address"
+        ))
+    })?;
+    if advance < MIN_ZLIB_MEMBER_LEN {
+        return Err(CodecError::malformed(format_args!(
+            "nx packed member at {file_offset} reports {advance} consumed source bytes, \
+             below the {MIN_ZLIB_MEMBER_LEN} a zlib member holds"
+        )));
+    }
+    Ok(advance)
+}
+
+fn inflate_stream<'a>(
+    ctx: &DecodeContext<'a>,
+    source: View<'a>,
+) -> Result<Option<(Vec<u8>, u64)>, CodecError> {
+    let (view, consumed) = match inflate_zlib_member(ctx, source, ExpandSpec::Unknown) {
+        Ok(result) => result,
+        Err(error @ CodecError::ResourceLimit(_)) => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let Ok(consumed) = u64::try_from(consumed) else {
+        return Ok(None);
+    };
+    let inflated = view.window().to_vec();
+    Ok(Some((inflated, consumed)))
+}
+
+/// A zlib header has compression method 8 and a 16-bit header divisible by
+/// 31. NX uses the standard `78 01`, `78 9c`, and `78 da` variants, but the
+/// predicate accepts every standards-conforming FLG byte rather than treating a
+/// compression level as a format discriminator.
+fn is_zlib_header(cmf: u8, flg: u8) -> bool {
+    cmf & 0x0f == 8 && cmf >> 4 <= 7 && ((u16::from(cmf) << 8) | u16::from(flg)).is_multiple_of(31)
+}
+
+/// Classify an inflated payload from its prologue text and read the schema token.
+pub(crate) fn classify(inflated: &[u8]) -> StreamBody {
+    if !inflated.starts_with(b"PS\x00\x00") {
+        return StreamBody::Preview;
+    }
+    let window = &inflated[..inflated.len().min(512)];
+    let description = View::u32_be_at(inflated, 2)
+        .and_then(|count| usize::try_from(count).ok())
+        .and_then(|count| inflated.get(6..6usize.checked_add(count)?))
+        .filter(|description| {
+            description
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+        });
+    let subtype = if description.is_some_and(cadmpeg_parasolid::records::is_partition_description) {
+        ParasolidSubtype::Partition
+    } else if description.is_some_and(|description| {
+        description == b": TRANSMIT FILE (deltas)"
+            || description.starts_with(b": TRANSMIT FILE (deltas) ")
+    }) {
+        ParasolidSubtype::Deltas
+    } else if description
+        .is_some_and(|description| description.starts_with(b": TRANSMIT FILE created "))
+    {
+        ParasolidSubtype::Plain
+    } else {
+        ParasolidSubtype::Unresolved
+    };
+    StreamBody::Parasolid {
+        subtype,
+        schema: cadmpeg_parasolid::find_schema_token(window)
+            .map(cadmpeg_parasolid::OwnedSchemaToken::from),
+    }
+}
+
+#[cfg(test)]
+mod tests;

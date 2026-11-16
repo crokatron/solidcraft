@@ -46,7 +46,10 @@ fn boss_and_skirt(s: &mut Session) -> [f64; 3] {
 
 #[test]
 fn schemas_and_the_key_check_agree() {
-    assert_keys(input_schema_for::<MatchSurfaceParams>(), &["body", "edges", "faces", "name", "order", "participants", "target"]);
+    assert_keys(
+        input_schema_for::<MatchSurfaceParams>(),
+        &["body", "cross_scale", "edges", "faces", "name", "order", "participants", "reverse_target", "source_edges", "target"],
+    );
 }
 
 /// A call that fails today gets the same message in strict. The handler looks both bodies up

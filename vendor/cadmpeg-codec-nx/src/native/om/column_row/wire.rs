@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Existing flat wire fields for complete column-row frames.
+
+use cadmpeg_ir::native::bytes::NativeBytes;
+
+use super::{
+    DataBlockIndexRow, DataBlockLinkedIndexRow, DataBlockTargetIndexRow, Deserialize, IndexRow,
+    LinkedRow, Serialize, TargetRow,
+};
+use crate::om::compact::CompactIndexTarget;
+use crate::om::compact::{atom, row_indices};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct DataBlockIndexRowWire {
+    /// Globally unique row identity.
+    id: String,
+    /// Zero-based indexed-section ordinal within the container.
+    section_ordinal: u32,
+    /// Zero-based row order within the section's column storage.
+    ordinal: u32,
+    /// First non-null compact index.
+    first_index: u32,
+    /// Exact serialized leading-index token.
+    raw_first_index: NativeBytes<Vec<u8>>,
+    /// Serialized `03` or `07` row flag.
+    flag: u8,
+    /// Four ordered non-null compact indices after the row flag.
+    indices: [u32; 4],
+    /// Exact serialized four-index tokens in row order.
+    raw_indices: [NativeBytes<Vec<u8>>; 4],
+    /// Four same-section blocks addressed by the compact indices.
+    data_blocks: [String; 4],
+    /// Directory entry containing the offset-only store.
+    source_entry: String,
+    /// Column block containing the row's opening byte.
+    opening_data_block: String,
+    /// Byte offset of the row opening within `opening_data_block`.
+    opening_block_offset: u32,
+    /// Absolute file offset of the opening discriminator.
+    source_offset: u64,
+    /// Absolute file offset of the first compact index.
+    first_index_source_offset: u64,
+    /// Four ordered absolute file offsets of the compact indices.
+    index_source_offsets: [u64; 4],
+}
+
+impl TryFrom<DataBlockIndexRowWire> for DataBlockIndexRow {
+    type Error = String;
+    fn try_from(wire: DataBlockIndexRowWire) -> Result<Self, Self::Error> {
+        let [a, b, c, d] = row_indices(&wire.indices, &wire.raw_indices);
+        let [a_block, b_block, c_block, d_block] = wire.data_blocks;
+        let indices = [
+            CompactIndexTarget {
+                atom: a?,
+                target: a_block,
+            },
+            CompactIndexTarget {
+                atom: b?,
+                target: b_block,
+            },
+            CompactIndexTarget {
+                atom: c?,
+                target: c_block,
+            },
+            CompactIndexTarget {
+                atom: d?,
+                target: d_block,
+            },
+        ];
+        let first = atom(
+            wire.first_index,
+            &wire.raw_first_index,
+            "first_index/raw_first_index",
+        )?;
+        let flag = crate::om::discriminators::LinkedIndexFlag::try_from(wire.flag)
+            .map_err(|_| "flag: must be 3 or 7")?;
+        let frame = IndexRow::<String, u64>::new(first, flag, indices, wire.source_offset)
+            .ok_or("source_offset: row extent overflows")?;
+        if frame.first_index().offset != wire.first_index_source_offset {
+            return Err("first_index_source_offset differs from the row layout".into());
+        }
+        if frame.indices().map(|index| index.offset) != wire.index_source_offsets {
+            return Err("index_source_offsets differ from the row layout".into());
+        }
+        Ok(Self {
+            frame,
+            id: wire.id,
+            section_ordinal: wire.section_ordinal,
+            ordinal: wire.ordinal,
+            source_entry: wire.source_entry,
+            opening_data_block: wire.opening_data_block,
+            opening_block_offset: wire.opening_block_offset,
+        })
+    }
+}
+#[cfg(test)]
+impl From<DataBlockIndexRow> for DataBlockIndexRowWire {
+    fn from(value: DataBlockIndexRow) -> Self {
+        Self {
+            id: value.id,
+            section_ordinal: value.section_ordinal,
+            ordinal: value.ordinal,
+            source_entry: value.source_entry,
+            opening_data_block: value.opening_data_block,
+            opening_block_offset: value.opening_block_offset,
+            source_offset: value.frame.offset(),
+            first_index: value.frame.first_index().atom.value(),
+            raw_first_index: (value.frame.first_index().atom.raw().to_vec()).into(),
+            first_index_source_offset: value.frame.first_index().offset,
+            indices: value.frame.indices().map(|index| index.atom.value()),
+            raw_indices: (value.frame.indices().map(|index| index.atom.raw().to_vec()))
+                .map(Into::into),
+            index_source_offsets: value.frame.indices().map(|index| index.offset),
+            data_blocks: value.frame.indices().map(|index| index.target.clone()),
+            flag: u8::from(value.frame.flag()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct DataBlockLinkedIndexRowWire {
+    /// Globally unique row identity.
+    id: String,
+    /// Zero-based indexed-section ordinal within the container.
+    section_ordinal: u32,
+    /// Zero-based row order within the section's column storage.
+    ordinal: u32,
+    /// Unresolved leading compact index.
+    first_index: u32,
+    /// Exact serialized leading-index token.
+    raw_first_index: NativeBytes<Vec<u8>>,
+    /// Serialized `16`, `17`, or `18` discriminator.
+    discriminator: crate::om::discriminators::LinkedIndexDiscriminator,
+    /// Target compact block index.
+    target_index: u32,
+    /// Exact serialized target-index token.
+    raw_target_index: NativeBytes<Vec<u8>>,
+    /// Three compact block indices after `ff ff 90 fe`.
+    indices: [u32; 3],
+    /// Exact serialized post-marker tokens in row order.
+    raw_indices: [NativeBytes<Vec<u8>>; 3],
+    /// Target block followed by the three post-marker blocks.
+    data_blocks: [String; 4],
+    /// Serialized `03` or `07` flag.
+    flag: crate::om::discriminators::LinkedIndexFlag,
+    /// Serialized `04` or `07` mode.
+    mode: crate::om::discriminators::IndexRowMode,
+    /// Directory entry containing the store.
+    source_entry: String,
+    /// Column block containing the row's opening byte.
+    opening_data_block: String,
+    /// Byte offset of the row opening within `opening_data_block`.
+    opening_block_offset: u32,
+    /// Absolute file offset of the opening discriminator.
+    source_offset: u64,
+    /// Absolute file offset of the leading compact index.
+    first_index_source_offset: u64,
+    /// Absolute file offset of the target compact index.
+    target_index_source_offset: u64,
+    /// Absolute file offsets of the three post-marker indices.
+    index_source_offsets: [u64; 3],
+}
+
+impl TryFrom<DataBlockLinkedIndexRowWire> for DataBlockLinkedIndexRow {
+    type Error = String;
+    fn try_from(wire: DataBlockLinkedIndexRowWire) -> Result<Self, Self::Error> {
+        let [a, b, c] = row_indices(&wire.indices, &wire.raw_indices);
+        let [target_block, a_block, b_block, c_block] = wire.data_blocks;
+        let indices = [
+            CompactIndexTarget {
+                atom: a?,
+                target: a_block,
+            },
+            CompactIndexTarget {
+                atom: b?,
+                target: b_block,
+            },
+            CompactIndexTarget {
+                atom: c?,
+                target: c_block,
+            },
+        ];
+        let first = atom(
+            wire.first_index,
+            &wire.raw_first_index,
+            "first_index/raw_first_index",
+        )?;
+        let target = CompactIndexTarget {
+            atom: atom(
+                wire.target_index,
+                &wire.raw_target_index,
+                "target_index/raw_target_index",
+            )?,
+            target: target_block,
+        };
+        let frame = LinkedRow::<String, u64>::new(
+            first,
+            wire.discriminator,
+            target,
+            indices,
+            wire.flag,
+            wire.mode,
+            wire.source_offset,
+        )
+        .ok_or("source_offset: row extent overflows")?;
+        if frame.first_index().offset != wire.first_index_source_offset {
+            return Err("first_index_source_offset differs from the row layout".into());
+        }
+        if frame.target_index().offset != wire.target_index_source_offset {
+            return Err("target_index_source_offset differs from the row layout".into());
+        }
+        if frame.indices().map(|index| index.offset) != wire.index_source_offsets {
+            return Err("index_source_offsets differ from the row layout".into());
+        }
+        Ok(Self {
+            frame,
+            id: wire.id,
+            section_ordinal: wire.section_ordinal,
+            ordinal: wire.ordinal,
+            source_entry: wire.source_entry,
+            opening_data_block: wire.opening_data_block,
+            opening_block_offset: wire.opening_block_offset,
+        })
+    }
+}
+#[cfg(test)]
+impl From<DataBlockLinkedIndexRow> for DataBlockLinkedIndexRowWire {
+    fn from(value: DataBlockLinkedIndexRow) -> Self {
+        Self {
+            id: value.id,
+            section_ordinal: value.section_ordinal,
+            ordinal: value.ordinal,
+            source_entry: value.source_entry,
+            opening_data_block: value.opening_data_block,
+            opening_block_offset: value.opening_block_offset,
+            source_offset: value.frame.offset(),
+            first_index: value.frame.first_index().atom.value(),
+            raw_first_index: (value.frame.first_index().atom.raw().to_vec()).into(),
+            first_index_source_offset: value.frame.first_index().offset,
+            target_index: value.frame.target_index().atom.value(),
+            raw_target_index: (value.frame.target_index().atom.raw().to_vec()).into(),
+            target_index_source_offset: value.frame.target_index().offset,
+            indices: value.frame.indices().map(|index| index.atom.value()),
+            raw_indices: (value.frame.indices().map(|index| index.atom.raw().to_vec()))
+                .map(Into::into),
+            index_source_offsets: value.frame.indices().map(|index| index.offset),
+            data_blocks: [
+                value.frame.target_index().target.clone(),
+                value.frame.indices()[0].target.clone(),
+                value.frame.indices()[1].target.clone(),
+                value.frame.indices()[2].target.clone(),
+            ],
+            discriminator: value.frame.discriminator(),
+            flag: value.frame.flag(),
+            mode: value.frame.mode(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct DataBlockTargetIndexRowWire {
+    /// Globally unique row identity.
+    id: String,
+    /// Zero-based indexed-section ordinal within the container.
+    section_ordinal: u32,
+    /// Zero-based row order within the section's column storage.
+    ordinal: u32,
+    /// Target compact block index.
+    target_index: u32,
+    /// Exact serialized target-index token.
+    raw_target_index: NativeBytes<Vec<u8>>,
+    /// Three compact block indices after `ff ff 90 fe`.
+    indices: [u32; 3],
+    /// Exact serialized post-marker tokens in row order.
+    raw_indices: [NativeBytes<Vec<u8>>; 3],
+    /// Target block followed by the three post-marker blocks.
+    data_blocks: [String; 4],
+    /// Serialized `04` or `07` mode.
+    mode: crate::om::discriminators::IndexRowMode,
+    /// Directory entry containing the store.
+    source_entry: String,
+    /// Column block containing the row's opening byte.
+    opening_data_block: String,
+    /// Byte offset of the row opening within `opening_data_block`.
+    opening_block_offset: u32,
+    /// Absolute file offset of the opening discriminator.
+    source_offset: u64,
+    /// Absolute file offset of the target compact index.
+    target_index_source_offset: u64,
+    /// Absolute file offsets of the three post-marker indices.
+    index_source_offsets: [u64; 3],
+}
+
+impl TryFrom<DataBlockTargetIndexRowWire> for DataBlockTargetIndexRow {
+    type Error = String;
+    fn try_from(wire: DataBlockTargetIndexRowWire) -> Result<Self, Self::Error> {
+        let [a, b, c] = row_indices(&wire.indices, &wire.raw_indices);
+        let [target_block, a_block, b_block, c_block] = wire.data_blocks;
+        let indices = [
+            CompactIndexTarget {
+                atom: a?,
+                target: a_block,
+            },
+            CompactIndexTarget {
+                atom: b?,
+                target: b_block,
+            },
+            CompactIndexTarget {
+                atom: c?,
+                target: c_block,
+            },
+        ];
+        let target = CompactIndexTarget {
+            atom: atom(
+                wire.target_index,
+                &wire.raw_target_index,
+                "target_index/raw_target_index",
+            )?,
+            target: target_block,
+        };
+        let frame = TargetRow::<String, u64>::new(target, indices, wire.mode, wire.source_offset)
+            .ok_or("source_offset: row extent overflows")?;
+        if frame.target_index().offset != wire.target_index_source_offset {
+            return Err("target_index_source_offset differs from the row layout".into());
+        }
+        if frame.indices().map(|index| index.offset) != wire.index_source_offsets {
+            return Err("index_source_offsets differ from the row layout".into());
+        }
+        Ok(Self {
+            frame,
+            id: wire.id,
+            section_ordinal: wire.section_ordinal,
+            ordinal: wire.ordinal,
+            source_entry: wire.source_entry,
+            opening_data_block: wire.opening_data_block,
+            opening_block_offset: wire.opening_block_offset,
+        })
+    }
+}
+#[cfg(test)]
+impl From<DataBlockTargetIndexRow> for DataBlockTargetIndexRowWire {
+    fn from(value: DataBlockTargetIndexRow) -> Self {
+        Self {
+            id: value.id,
+            section_ordinal: value.section_ordinal,
+            ordinal: value.ordinal,
+            source_entry: value.source_entry,
+            opening_data_block: value.opening_data_block,
+            opening_block_offset: value.opening_block_offset,
+            source_offset: value.frame.offset(),
+            target_index: value.frame.target_index().atom.value(),
+            raw_target_index: (value.frame.target_index().atom.raw().to_vec()).into(),
+            target_index_source_offset: value.frame.target_index().offset,
+            indices: value.frame.indices().map(|index| index.atom.value()),
+            raw_indices: (value.frame.indices().map(|index| index.atom.raw().to_vec()))
+                .map(Into::into),
+            index_source_offsets: value.frame.indices().map(|index| index.offset),
+            data_blocks: [
+                value.frame.target_index().target.clone(),
+                value.frame.indices()[0].target.clone(),
+                value.frame.indices()[1].target.clone(),
+                value.frame.indices()[2].target.clone(),
+            ],
+            mode: value.frame.mode(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::DataBlockIndexRow;
+    use super::super::DataBlockLinkedIndexRow;
+    use super::super::DataBlockTargetIndexRow;
+    use crate::test_support::test_wire::check_wire;
+
+    #[test]
+    fn column_rows_keep_wire_order_and_reject_mismatched_tokens() {
+        check_wire::<DataBlockIndexRow>(
+            r#"{"id":"row","section_ordinal":0,"ordinal":0,"first_index":1,"raw_first_index":"01","flag":3,"indices":[2,3,4,5],"raw_indices":["02","03","04","05"],"data_blocks":["a","b","c","d"],"source_entry":"entry","opening_data_block":"opening","opening_block_offset":0,"source_offset":10,"first_index_source_offset":13,"index_source_offsets":[17,18,19,20]}"#,
+            "raw_first_index",
+            serde_json::json!("ff"),
+        );
+        check_wire::<DataBlockLinkedIndexRow>(
+            r#"{"id":"row","section_ordinal":0,"ordinal":0,"first_index":1,"raw_first_index":"01","discriminator":22,"target_index":2,"raw_target_index":"02","indices":[3,4,5],"raw_indices":["03","04","05"],"data_blocks":["a","b","c","d"],"flag":3,"mode":4,"source_entry":"entry","opening_data_block":"opening","opening_block_offset":0,"source_offset":10,"first_index_source_offset":12,"target_index_source_offset":16,"index_source_offsets":[21,22,23]}"#,
+            "raw_target_index",
+            serde_json::json!("03"),
+        );
+        check_wire::<DataBlockTargetIndexRow>(
+            r#"{"id":"row","section_ordinal":0,"ordinal":0,"target_index":2,"raw_target_index":"02","indices":[3,4,5],"raw_indices":["03","04","05"],"data_blocks":["a","b","c","d"],"mode":7,"source_entry":"entry","opening_data_block":"opening","opening_block_offset":0,"source_offset":10,"target_index_source_offset":15,"index_source_offsets":[20,21,22]}"#,
+            "raw_indices",
+            serde_json::json!(["03", "04", "06"]),
+        );
+    }
+}

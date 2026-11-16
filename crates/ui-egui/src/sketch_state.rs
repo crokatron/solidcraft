@@ -27,6 +27,7 @@ pub(crate) enum SketchState {
     /// Degrees of freedom remain.
     Under(usize),
     Full,
+    Spatial,
     /// The constraints conflict (the solve failed).
     Conflict,
 }
@@ -37,6 +38,12 @@ impl SketchState {
             SketchState::Conflict
         } else if ss.sketch.curves.is_empty() && ss.sketch.wires.is_empty() {
             SketchState::Empty
+        } else if crate::sketch_palette::has_spatial_geometry(&ss.sketch) {
+            match crate::spatial_freedom::remaining(&ss.sketch, ss.report.dof) {
+                Some(0) => SketchState::Full,
+                Some(n) => SketchState::Under(n),
+                None => SketchState::Spatial,
+            }
         } else if ss.report.dof == 0 {
             SketchState::Full
         } else {
@@ -50,7 +57,7 @@ impl SketchState {
     pub(crate) fn ink(self, t: &Tokens) -> Option<Color32> {
         match self {
             SketchState::Empty => None,
-            SketchState::Under(_) => Some(t.sketch),
+            SketchState::Under(_) | SketchState::Spatial => Some(t.sketch),
             SketchState::Full => Some(t.sketch_fixed),
             SketchState::Conflict => Some(t.error),
         }
@@ -65,6 +72,7 @@ impl SketchState {
                 &[("count", &dof.to_string())],
             ),
             SketchState::Full => solidcraft_ui_text::tr("ui.fully_constrained").to_string(),
+            SketchState::Spatial => solidcraft_ui_text::tr("ui.spatial_dof_unknown").to_string(),
             SketchState::Conflict => solidcraft_ui_text::tr("ui.constraints_conflict").to_string(),
         }
     }

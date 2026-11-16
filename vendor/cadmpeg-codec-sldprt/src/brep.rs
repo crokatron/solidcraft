@@ -1,0 +1,989 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Parasolid B-rep record decoding.
+//!
+//! This module resolves topology and geometry carriers by stream-local
+//! attribute id. [`decode`] handles one stream; [`decode_bodies`] combines
+//! related partition and deltas streams before building the graph.
+//!
+//! The decoded chain connects face bridges to support surfaces and loop heads,
+//! coedges to edge uses and curves, and vertex uses to world points. Supported
+//! carriers include lines, circles, ellipses, planes, cylinders, cones, spheres,
+//! tori, NURBS curves and surfaces, and recursive offset surfaces. The decoder
+//! converts model-space metres to millimetres and leaves dimensionless vectors
+//! and ratios unchanged.
+//!
+//! [`Brep::stats`] counts carriers and grouping that could not be transferred
+//! directly. Untyped carriers use opaque IR geometry while resolvable topology
+//! remains available.
+
+use self::index::scan_carriers;
+use self::spline::patch_nurbs_curve;
+
+use cadmpeg_core::decode::{DecodeContext, View};
+use cadmpeg_ir::geometry::{CurveGeometry, SolvedCurveGeometry, SurfaceGeometry};
+use cadmpeg_ir::math::Vector3;
+
+use crate::layout::compact_analytic_header as analytic;
+
+const EPS_BREP_UNIT_LENGTH_E9: f64 = 1.0e-9;
+const EPS_BREP_ORTHONORMAL_E9: f64 = 1.0e-9;
+
+mod approximation;
+pub(crate) mod attrib;
+mod blend;
+mod blend_fit;
+mod blend_surface;
+mod carrier_nodes;
+mod chart_refine;
+pub(crate) mod entity;
+pub(crate) mod evaluation;
+mod fit;
+mod index;
+mod intersection;
+mod mesh;
+mod offset;
+pub(crate) mod read_ledger;
+mod sp_curve;
+pub(crate) mod spline;
+mod subset;
+mod sweep;
+pub(crate) mod topology;
+mod typed;
+
+/// Millimetres per Parasolid model-space length unit (metres), [spec §12](https://github.com/cadmpeg/cadmpeg/blob/main/docs/formats/sldprt.md#9-units).
+const LEN_TO_MM: f64 = 1000.0;
+
+fn record_starts(bytes: &[u8], offset: usize, tag: u8) -> impl Iterator<Item = usize> {
+    let at = offset
+        .checked_add(2)
+        .filter(|end| bytes.get(offset..*end) == Some(&[0, tag]));
+    let prefixed = at
+        .filter(|at| bytes.get(*at) == Some(&0xff))
+        .and_then(|at| at.checked_add(1));
+    [prefixed, at].into_iter().flatten()
+}
+
+fn native_refs<const N: usize>(bytes: &[u8], at: &mut usize) -> Option<[u32; N]> {
+    let mut refs = [0; N];
+    for reference in &mut refs {
+        *reference = cadmpeg_parasolid::pointer::read_at(bytes, at)?;
+    }
+    Some(refs)
+}
+
+fn word_at(bytes: &[u8], at: usize) -> Option<u32> {
+    View::u16_be_at(bytes, at).map(u32::from)
+}
+
+pub(crate) mod feature_source;
+pub(crate) mod graph;
+
+/// The native persistent identity shared by B-rep face attributes and display
+/// tessellation references.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PersistentFaceIdentity {
+    /// Native history-feature object identifier.
+    pub(crate) feature_source_id: feature_source::FeatureSourceId,
+    /// Face identity local to the producing feature.
+    pub(crate) local_id: u32,
+    /// Optional signed path fields stored as their native u32 bit patterns.
+    pub(crate) trailing_fields: Vec<u32>,
+}
+
+fn norm3(v: &[f64]) -> f64 {
+    Vector3::from([v[0], v[1], v[2]]).norm()
+}
+
+// ---- compact analytic carriers ([spec §8.1](https://github.com/cadmpeg/cadmpeg/blob/main/docs/formats/sldprt.md#71-compact-analytic-records)) -----------------------------------
+
+/// Analytic surface/curve tags and the count of trailing f64 values each holds.
+///
+/// The partition record is `00 TT [ff]? attr:u16 ordinal:u32 refs:u16[5]
+/// marker:u8(0x2b|0x2d) values:f64[n]`; deltas replace each reference with a
+/// `[hi][lo][01]` triple ([spec §8.1](https://github.com/cadmpeg/cadmpeg/blob/main/docs/formats/sldprt.md#71-compact-analytic-records)). Offsets below are measured from the
+/// tag byte; the optional `0xff` shifts everything after it by one.
+mod tag {
+    pub(super) const LINE: u8 = 0x1e;
+    pub(super) const CIRCLE: u8 = 0x1f;
+    pub(super) const ELLIPSE: u8 = 0x20;
+    pub(super) const PLANE: u8 = 0x32;
+    pub(super) const CYLINDER: u8 = 0x33;
+    pub(super) const CONE: u8 = 0x34;
+    pub(super) const SPHERE: u8 = 0x35;
+    pub(super) const TORUS: u8 = 0x36;
+}
+
+const COMPACT_REF_COUNT: usize = 5;
+const DELTAS_REF_STRIDE: usize = 3;
+const DELTAS_MARKER_OFFSET: usize = analytic::REFS + COMPACT_REF_COUNT * DELTAS_REF_STRIDE;
+/// Orientation marker of a compact analytic record that runs against its
+/// curve parameter or natural surface normal in forward-linked topology.
+const MARKER_REVERSED: u8 = 0x2d;
+/// Orientation marker of a compact analytic record that runs against its
+/// curve parameter in topology that is not forward linked.
+const MARKER_AGAINST_UNLINKED_EDGES: u8 = 0x2b;
+
+/// f64 count for each analytic tag; `None` if the tag is not an analytic carrier.
+fn analytic_value_count(tt: u8) -> Option<usize> {
+    Some(match tt {
+        tag::LINE => 6,
+        tag::CIRCLE => 10,
+        tag::ELLIPSE => 11,
+        tag::PLANE => 9,
+        tag::CYLINDER => 10,
+        tag::CONE => 12,
+        tag::SPHERE => 10,
+        tag::TORUS => 11,
+        _ => return None,
+    })
+}
+
+fn unit_length(values: &[f64]) -> bool {
+    (norm3(values) - 1.0).abs() <= EPS_BREP_UNIT_LENGTH_E9
+}
+
+fn orthonormal(left: &[f64], right: &[f64]) -> bool {
+    unit_length(left)
+        && unit_length(right)
+        && (left[0] * right[0] + left[1] * right[1] + left[2] * right[2]).abs()
+            <= EPS_BREP_ORTHONORMAL_E9
+}
+
+fn valid_carrier_frame(tt: u8, values: &[f64]) -> bool {
+    match tt {
+        tag::LINE => unit_length(&values[3..6]),
+        tag::CIRCLE | tag::ELLIPSE | tag::PLANE => orthonormal(&values[3..6], &values[6..9]),
+        tag::CYLINDER => orthonormal(&values[3..6], &values[7..10]),
+        tag::CONE => orthonormal(&values[3..6], &values[9..12]),
+        tag::SPHERE => orthonormal(&values[4..7], &values[7..10]),
+        tag::TORUS => orthonormal(&values[3..6], &values[8..11]),
+        _ => false,
+    }
+}
+
+fn valid_carrier_scalars(tt: u8, values: &[f64]) -> bool {
+    match tt {
+        tag::LINE | tag::PLANE => true,
+        tag::CIRCLE => values[9] > 0.0,
+        tag::ELLIPSE => values[9] >= values[10] && values[10] > 0.0,
+        tag::CYLINDER => values[6] > 0.0,
+        tag::CONE => {
+            values[6] >= 0.0
+                && cadmpeg_parasolid::geometry::cone_half_angle(values[7], values[8]).is_ok()
+        }
+        tag::SPHERE => values[3] > 0.0,
+        tag::TORUS => values[6].abs() > f64::EPSILON && values[7] > 0.0,
+        _ => false,
+    }
+}
+
+/// A parsed analytic carrier selected by its geometry family.
+#[derive(Debug, Clone)]
+pub(crate) enum Carrier {
+    Curve(CurveCarrier),
+    Surface(SurfaceCarrier),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CurveCarrier {
+    attr: u32,
+    offset: usize,
+    pub(crate) end: usize,
+    pub(crate) geometry: CurveGeometry,
+    parameter_range: Option<cadmpeg_ir::units::FiniteVector<2>>,
+    /// Whether the compact analytic orientation marker is `MARKER_REVERSED`,
+    /// when the record carries a marker.
+    pub(crate) marker_reversed: Option<bool>,
+}
+
+impl CurveCarrier {
+    /// Whether the stored direction of an edge on this carrier runs against
+    /// the curve parameter. `forward_linked` tells whether the edge's FIN
+    /// lies in a forward-linked loop.
+    pub(crate) fn runs_against_edges(&self, forward_linked: bool) -> bool {
+        self.marker_reversed == Some(forward_linked)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SurfaceCarrier {
+    attr: u32,
+    offset: usize,
+    pub(crate) end: usize,
+    pub(crate) geometry: SurfaceGeometry,
+    orientation_reversed: bool,
+    marker_reversed: bool,
+}
+
+impl SurfaceCarrier {
+    /// Whether the face normal runs against the natural surface normal.
+    /// `forward_linked` tells whether the face's loops are forward linked.
+    pub(crate) fn orientation_reversed(&self, forward_linked: bool) -> bool {
+        self.orientation_reversed != (self.marker_reversed && forward_linked)
+    }
+}
+
+/// The attr and marker offset of each bare reading at `off`, whose `attr
+/// ordinal refs[5]` head stores the attr and each reference as a native pointer.
+fn bare_carrier_markers(body: &[u8], off: usize, tag: u8) -> Vec<(u32, usize)> {
+    record_starts(body, off, tag)
+        .filter_map(|hdr| {
+            let mut at = hdr;
+            let attr = cadmpeg_parasolid::pointer::read_at(body, &mut at)?;
+            (attr > 1).then_some(())?;
+            View::u32_be_at(body, at)?;
+            at = at.checked_add(4)?;
+            native_refs::<COMPACT_REF_COUNT>(body, &mut at)?;
+            matches!(body.get(at), Some(0x2b | 0x2d)).then_some((attr, at))
+        })
+        .collect()
+}
+
+/// The attr and marker offset of each deltas reading at `off`.
+///
+/// Deltas records encode each of the five references as `[hi][lo][01]`. The
+/// marker follows that fixed-width roster, so its position is not a search
+/// result. The terminators distinguish this framing from arbitrary marker-like
+/// bytes in the reference and ordinal fields.
+fn tripled_carrier_markers(body: &[u8], off: usize, tag: u8) -> Vec<(u32, usize)> {
+    record_starts(body, off, tag)
+        .filter_map(|hdr| {
+            let attr = word_at(body, hdr).filter(|attr| *attr > 1 && *attr <= 0x7fff)?;
+            Some((attr, tripled_carrier_marker(body, hdr)?))
+        })
+        .collect()
+}
+
+/// The marker offset of the deltas reading whose header starts at `hdr`.
+fn tripled_carrier_marker(body: &[u8], hdr: usize) -> Option<usize> {
+    let refs_at = hdr.checked_add(analytic::REFS)?;
+    (0..COMPACT_REF_COUNT)
+        .all(|index| {
+            refs_at
+                .checked_add(index * DELTAS_REF_STRIDE + DELTAS_REF_STRIDE - 1)
+                .and_then(|at| body.get(at))
+                == Some(&1)
+        })
+        .then_some(())?;
+    let marker = hdr.checked_add(DELTAS_MARKER_OFFSET)?;
+    matches!(body.get(marker), Some(0x2b | 0x2d)).then_some(marker)
+}
+
+fn parse_carrier_at_marker(
+    body: &[u8],
+    off: usize,
+    tt: u8,
+    attr: u32,
+    n: usize,
+    marker_at: usize,
+) -> Option<Carrier> {
+    let values_at = marker_at.checked_add(1)?;
+    let end = values_at.checked_add(n.checked_mul(8)?)?;
+    let mut view = View::over_retained(body);
+    view.seek(values_at)?;
+    let mut storage = [0_f64; 12];
+    let vals = storage.get_mut(..n)?;
+    for value in vals.iter_mut() {
+        *value = view.f64_be()?;
+    }
+    if vals.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    if !valid_carrier_frame(tt, vals) || !valid_carrier_scalars(tt, vals) {
+        return None;
+    }
+
+    let reversed = Some(match body.get(marker_at) {
+        Some(&MARKER_REVERSED) => true,
+        Some(&MARKER_AGAINST_UNLINKED_EDGES) => false,
+        _ => return None,
+    });
+    decode_carrier_values(tt, vals, attr, (off, end), reversed)
+}
+
+/// Try to parse a compact analytic carrier whose tag byte pair `00 TT` begins at
+/// `off`. The partition and deltas framings are both considered, and a carrier
+/// is returned only when exactly one framing passes all structural and geometry
+/// invariants.
+pub(crate) fn parse_carrier(body: &[u8], off: usize) -> Option<Carrier> {
+    if body.get(off) != Some(&0x00) {
+        return None;
+    }
+    let tt = *body.get(off.checked_add(1)?)?;
+    let n = analytic_value_count(tt)?;
+
+    let mut candidates = bare_carrier_markers(body, off, tt);
+    candidates.extend(tripled_carrier_markers(body, off, tt));
+    let mut carriers = candidates
+        .into_iter()
+        .filter_map(|(attr, marker)| parse_carrier_at_marker(body, off, tt, attr, n, marker));
+    let carrier = carriers.next()?;
+    carriers.next().is_none().then_some(carrier)
+}
+
+/// Every compact analytic carrier the body admits, as body-relative spans.
+///
+/// The sweep matches the carrier scan of `index`: each `00 TT` offset is
+/// parsed with the same structural and geometry invariants, and every success
+/// names its record extent. `Some(deltas)` selects the record framing of one
+/// stream role, as [`parse_carrier_for_role`] does. Spline tags are not
+/// analytic carriers and never match.
+pub(crate) fn analytic_spans(body: &[u8], role: Option<bool>) -> Vec<read_ledger::RawSpan> {
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= body.len() {
+        if body[i] == 0x00 {
+            let carrier = match role {
+                Some(deltas) => parse_carrier_for_role(body, i, deltas),
+                None => parse_carrier(body, i),
+            };
+            if let Some(carrier) = carrier {
+                let (attr, end) = match &carrier {
+                    Carrier::Curve(carrier) => (carrier.attr, carrier.end),
+                    Carrier::Surface(carrier) => (carrier.attr, carrier.end),
+                };
+                if let (Some(tag), Some(length)) = (
+                    body.get(i + 1).copied(),
+                    end.checked_sub(i).filter(|length| *length > 0),
+                ) {
+                    spans.push(read_ledger::RawSpan {
+                        offset: i,
+                        length,
+                        tag,
+                        record: attr,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+    spans
+}
+
+pub(super) fn parse_carrier_for_role(body: &[u8], off: usize, deltas: bool) -> Option<Carrier> {
+    let carrier = parse_carrier(body, off)?;
+    let tag = *body.get(off.checked_add(1)?)?;
+    let n = analytic_value_count(tag)?;
+    let end = match &carrier {
+        Carrier::Curve(curve) => curve.end,
+        Carrier::Surface(surface) => surface.end,
+    };
+    let marker = end.checked_sub(n.checked_mul(8)?.checked_add(1)?)?;
+    let expected = if deltas {
+        tripled_carrier_markers(body, off, tag)
+    } else {
+        bare_carrier_markers(body, off, tag)
+    };
+    expected
+        .iter()
+        .any(|(_, at)| *at == marker)
+        .then_some(carrier)
+}
+
+/// Map a tag's decoded f64 run to IR geometry through the shared analytic
+/// decoder, which applies the ×1000 length rule to coordinates and radii.
+fn decode_carrier_values(
+    tt: u8,
+    v: &[f64],
+    attr: u32,
+    (offset, end): (usize, usize),
+    reversed: Option<bool>,
+) -> Option<Carrier> {
+    match cadmpeg_parasolid::geometry::analytic(u16::from(tt), v).ok()? {
+        cadmpeg_parasolid::geometry::Analytic::Curve(geometry) => {
+            Some(Carrier::Curve(CurveCarrier {
+                attr,
+                offset,
+                end,
+                geometry,
+                parameter_range: None,
+                marker_reversed: reversed,
+            }))
+        }
+        cadmpeg_parasolid::geometry::Analytic::Surface {
+            geometry,
+            negative_major,
+        } => Some(Carrier::Surface(SurfaceCarrier {
+            attr,
+            offset,
+            end,
+            geometry,
+            orientation_reversed: negative_major,
+            marker_reversed: reversed == Some(true),
+        })),
+    }
+}
+
+/// Return the typed curve carried by one stream-local attribute.
+pub(crate) fn curve_by_attr(
+    ctx: &DecodeContext<'_>,
+    body: &[u8],
+    attr: u32,
+) -> Result<Option<CurveGeometry>, cadmpeg_core::CodecError> {
+    let carriers = scan_carriers(ctx, body)?;
+    Ok(carriers
+        .curve(attr)
+        .map(|indexed| indexed.carrier().geometry.clone()))
+}
+
+/// Replace the scalar run of one compact analytic carrier.
+pub(crate) fn patch_compact_values(
+    ctx: &DecodeContext<'_>,
+    body: &mut [u8],
+    attr: u32,
+    values: &[f64],
+) -> Result<bool, cadmpeg_core::CodecError> {
+    let carriers = scan_carriers(ctx, body)?;
+    let Some(indexed) = carriers.curve(attr) else {
+        return Ok(false);
+    };
+    let carrier = indexed.carrier();
+    let Some(size) = values.len().checked_mul(8) else {
+        return Ok(false);
+    };
+    let Some(start) = carrier.end.checked_sub(size) else {
+        return Ok(false);
+    };
+    let Some(bytes) = body.get_mut(start..carrier.end) else {
+        return Ok(false);
+    };
+    for (slot, value) in bytes.chunks_exact_mut(8).zip(values) {
+        slot.copy_from_slice(&value.to_be_bytes());
+    }
+    Ok(true)
+}
+
+/// Patch one stream-local NURBS curve without changing its storage shape.
+pub(crate) fn patch_nurbs_by_attr(
+    ctx: &DecodeContext<'_>,
+    body: &mut [u8],
+    attr: u32,
+    new: &cadmpeg_ir::geometry::nurbs::NurbsCurve,
+) -> Result<bool, cadmpeg_core::CodecError> {
+    let carriers = scan_carriers(ctx, body)?;
+    let Some(indexed) = carriers.curve(attr) else {
+        return Ok(false);
+    };
+    let carrier = indexed.carrier();
+    let Some(SolvedCurveGeometry::Nurbs(old)) = carrier.geometry.solved() else {
+        return Ok(false);
+    };
+    Ok(patch_nurbs_curve(body, carrier.offset, old, new, 0.001)?.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index::scan_carriers;
+    use super::{parse_carrier, parse_carrier_for_role, tag, Carrier};
+    use cadmpeg_ir::geometry::SolvedCurveGeometry;
+    use cadmpeg_ir::geometry::SolvedSurfaceGeometry;
+    use cadmpeg_ir::math::Point3;
+    use cadmpeg_ir::math::Vector3;
+    use cadmpeg_parasolid::pointer::write;
+
+    fn compact_carrier(tag: u8, attr: u16, values: &[f64]) -> Vec<u8> {
+        let mut bytes = vec![0, tag];
+        bytes.extend_from_slice(&attr.to_be_bytes());
+        bytes.extend_from_slice(&[0; 14]);
+        bytes.push(0x2b);
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn tripled_compact_carrier(
+        tag: u8,
+        attr: u16,
+        refs: [u16; 5],
+        values: &[f64],
+        has_ff: bool,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0, tag];
+        if has_ff {
+            bytes.push(0xff);
+        }
+        bytes.extend_from_slice(&attr.to_be_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        for reference in refs {
+            bytes.extend_from_slice(&reference.to_be_bytes());
+            bytes.push(1);
+        }
+        bytes.push(0x2b);
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn largest_short_carrier_identity_keeps_the_node_id_aligned() {
+        let bytes = compact_carrier(tag::LINE, 0x7fff, &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let Carrier::Curve(carrier) = parse_carrier(&bytes, 0).unwrap() else {
+            panic!("expected LINE");
+        };
+        assert_eq!(carrier.attr, 0x7fff);
+        assert_eq!(carrier.end, bytes.len());
+    }
+
+    #[test]
+    fn analytic_surface_frames_follow_the_source_axis_order() {
+        let reference = Vector3::new(0.0, 1.0, 0.0);
+        let axis = Vector3::new(0.0, 0.0, 1.0);
+        for (kind, values, expected_v) in [
+            (
+                tag::PLANE,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                Vector3::new(-1.0, 0.0, 0.0),
+            ),
+            (
+                tag::CYLINDER,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001, 0.0, 1.0, 0.0],
+                axis,
+            ),
+            (
+                tag::SPHERE,
+                vec![0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                axis,
+            ),
+            (
+                tag::TORUS,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, -0.002, 0.001, 0.0, 1.0, 0.0],
+                axis,
+            ),
+        ] {
+            let bytes = compact_carrier(kind, 7, &values);
+            let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).unwrap() else {
+                panic!("expected surface carrier");
+            };
+            let frame = match carrier.geometry.solved() {
+                Some(SolvedSurfaceGeometry::Plane(plane)) => {
+                    let (normal, u_axis) = (plane.frame().axis(), plane.frame().reference());
+                    Some((*u_axis.as_raw(), normal.as_raw().cross(*u_axis.as_raw())))
+                }
+                Some(SolvedSurfaceGeometry::Cylinder(cylinder)) => Some((
+                    *cylinder.frame().reference().as_raw(),
+                    *cylinder.frame().axis().as_raw(),
+                )),
+                Some(SolvedSurfaceGeometry::Sphere(sphere)) => Some((
+                    *sphere.frame().reference().as_raw(),
+                    *sphere.frame().axis().as_raw(),
+                )),
+                Some(SolvedSurfaceGeometry::Torus(torus)) => Some((
+                    *torus.frame().reference().as_raw(),
+                    *torus.frame().axis().as_raw(),
+                )),
+                _ => None,
+            };
+            assert_eq!(frame, Some((reference, expected_v)));
+        }
+    }
+
+    #[test]
+    fn two_word_cells_move_the_compact_carrier_marker() {
+        let mut bytes = vec![0, tag::PLANE];
+        // attr, the two words of a zero ordinal, then five references.
+        for code in [36_225, 0, 0, 40_000, 1, 1, 33_000, 1] {
+            write(&mut bytes, code).expect("code in the two-word range");
+        }
+        bytes.push(0x2b);
+        for value in [0.0_f64, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        let Some(Carrier::Surface(carrier)) = parse_carrier_for_role(&bytes, 0, false) else {
+            panic!("expected surface carrier");
+        };
+        assert_eq!(carrier.attr, 36_225);
+        assert_eq!(carrier.end, bytes.len());
+    }
+
+    #[test]
+    fn scan_does_not_skip_overlapping_carrier_starts() {
+        let arena = cadmpeg_core::decode::DecodeArena::new();
+        let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+            &[],
+            &arena,
+            &cadmpeg_core::decode::DecodePolicy::service(),
+        )
+        .unwrap();
+        let mut bytes = compact_carrier(tag::LINE, 7, &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        bytes.truncate(60);
+        bytes.extend(compact_carrier(
+            tag::LINE,
+            8,
+            &[1.0, 2.0, 3.0, 0.0, 0.0, 1.0],
+        ));
+
+        let carriers = scan_carriers(&ctx, &bytes).expect("carrier scan");
+
+        assert!(carriers.curve(7).is_some());
+        assert!(carriers.curve(8).is_some());
+    }
+
+    #[test]
+    fn parses_tripled_compact_carrier_at_structural_marker() {
+        for has_ff in [false, true] {
+            let bytes = tripled_compact_carrier(
+                tag::LINE,
+                7,
+                [1, 0x2b00, 2, 3, 4],
+                &[1_000_000_000.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                has_ff,
+            );
+
+            let Carrier::Curve(carrier) =
+                parse_carrier(&bytes, 0).expect("tripled compact carrier")
+            else {
+                panic!("expected curve carrier");
+            };
+            assert_eq!(carrier.attr, 7);
+            assert_eq!(carrier.end, bytes.len());
+            let Some(SolvedCurveGeometry::Line(line_curve)) = carrier.geometry.solved() else {
+                panic!("expected line");
+            };
+            let origin = line_curve.origin().get();
+            let direction = *line_curve.direction().as_raw();
+            assert_eq!(origin, Point3::new(1_000_000_000_000.0, 0.0, 0.0));
+            assert_eq!(direction, Vector3::new(1.0, 0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn parses_verified_cone_layout() {
+        let root_half = std::f64::consts::FRAC_1_SQRT_2;
+        let bytes = compact_carrier(
+            tag::CONE,
+            7,
+            &[
+                0.0, 0.0, 0.0067, 0.0, 0.0, -1.0, 0.0015, root_half, root_half, -1.0, 0.0, 0.0,
+            ],
+        );
+        let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).expect("required invariant")
+        else {
+            panic!("expected surface carrier");
+        };
+        let Some(SolvedSurfaceGeometry::Cone(cone_surface)) = carrier.geometry.solved() else {
+            panic!("expected cone");
+        };
+        let origin = cone_surface.origin().get();
+        let axis = *cone_surface.frame().axis().as_raw();
+        let ref_direction = *cone_surface.frame().reference().as_raw();
+        let radius = cone_surface.radius().get();
+        let ratio = cone_surface.ratio().get();
+        let half_angle = cone_surface.half_angle().get();
+        assert_eq!(origin, Point3::new(0.0, 0.0, 6.7));
+        assert_eq!(axis, Vector3::new(0.0, 0.0, -1.0));
+        assert_eq!(ref_direction, Vector3::new(-1.0, 0.0, 0.0));
+        assert!((radius - 1.5).abs() < 1.0e-12);
+        assert_eq!(ratio, 1.0);
+        assert!((half_angle - std::f64::consts::FRAC_PI_4).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn parses_verified_torus_layout() {
+        let bytes = compact_carrier(
+            tag::TORUS,
+            8,
+            &[
+                0.0, 0.0, 0.0002, 0.0, 0.0, -1.0, 0.0022, 0.0002, -1.0, 0.0, 0.0,
+            ],
+        );
+        let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).expect("required invariant")
+        else {
+            panic!("expected surface carrier");
+        };
+        let Some(SolvedSurfaceGeometry::Torus(torus_surface)) = carrier.geometry.solved() else {
+            panic!("expected torus");
+        };
+        let center = torus_surface.center().get();
+        let axis = *torus_surface.frame().axis().as_raw();
+        let ref_direction = *torus_surface.frame().reference().as_raw();
+        let major_radius = torus_surface.major_radius().get();
+        let minor_radius = torus_surface.minor_radius().get();
+        assert_eq!(center, Point3::new(0.0, 0.0, 0.2));
+        assert_eq!(axis, Vector3::new(0.0, 0.0, -1.0));
+        assert_eq!(ref_direction, Vector3::new(-1.0, 0.0, 0.0));
+        assert!((major_radius - 2.2).abs() < 1.0e-12);
+        assert!((minor_radius - 0.2).abs() < 1.0e-12);
+        assert!(!carrier.orientation_reversed);
+    }
+
+    #[test]
+    fn rejects_nonorthogonal_analytic_frame() {
+        let bytes = compact_carrier(
+            tag::CIRCLE,
+            8,
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.002],
+        );
+
+        assert!(parse_carrier(&bytes, 0).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_analytic_radii() {
+        let ellipse = compact_carrier(
+            tag::ELLIPSE,
+            8,
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.001, 0.002],
+        );
+        let torus = compact_carrier(
+            tag::TORUS,
+            9,
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001, 0.0, 1.0, 0.0, 0.0],
+        );
+
+        assert!(parse_carrier(&ellipse, 0).is_none());
+        assert!(parse_carrier(&torus, 0).is_none());
+    }
+
+    #[test]
+    fn parses_spindle_torus_with_minor_radius_over_major() {
+        let bytes = compact_carrier(
+            tag::TORUS,
+            8,
+            &[
+                0.0, 0.0, 0.0002, 0.0, 0.0, -1.0, 0.0022, 0.0044, -1.0, 0.0, 0.0,
+            ],
+        );
+        let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).expect("spindle torus") else {
+            panic!("expected surface carrier");
+        };
+        let Some(SolvedSurfaceGeometry::Torus(torus_surface)) = carrier.geometry.solved() else {
+            panic!("expected torus");
+        };
+        let major_radius = torus_surface.major_radius().get();
+        let minor_radius = torus_surface.minor_radius().get();
+        assert!((major_radius - 2.2).abs() < 1.0e-12);
+        assert!((minor_radius - 4.4).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn normalizes_negative_torus_major_radius_and_marks_orientation_reversal() {
+        let bytes = compact_carrier(
+            tag::TORUS,
+            8,
+            &[
+                0.0, 0.0, 0.0002, 0.0, 0.0, -1.0, -0.0022, 0.0044, -1.0, 0.0, 0.0,
+            ],
+        );
+        let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).expect("signed-major torus")
+        else {
+            panic!("expected surface carrier");
+        };
+        let Some(SolvedSurfaceGeometry::Torus(torus_surface)) = carrier.geometry.solved() else {
+            panic!("expected torus");
+        };
+        let major_radius = torus_surface.major_radius().get();
+        let minor_radius = torus_surface.minor_radius().get();
+        assert!((major_radius - 2.2).abs() < 1.0e-12);
+        assert!((minor_radius - 4.4).abs() < 1.0e-12);
+        assert!(carrier.orientation_reversed);
+    }
+
+    /// The compact marker sits after the attribute and the 14 reference bytes.
+    const COMPACT_MARKER_AT: usize = 18;
+
+    #[test]
+    fn a_reversed_surface_marker_reverses_the_face_sense() {
+        let mut bytes = compact_carrier(
+            tag::PLANE,
+            8,
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+        );
+        bytes[COMPACT_MARKER_AT] = 0x2d;
+        let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).expect("reversed plane") else {
+            panic!("expected surface carrier");
+        };
+        assert!(carrier.orientation_reversed(true));
+        assert!(!carrier.orientation_reversed(false));
+    }
+
+    #[test]
+    fn a_curve_marker_reads_against_the_edge_by_the_loop_links() {
+        for (marker, forward_linked, against) in [
+            (0x2d, true, true),
+            (0x2d, false, false),
+            (0x2b, true, false),
+            (0x2b, false, true),
+        ] {
+            let mut bytes = compact_carrier(tag::LINE, 6, &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+            bytes[COMPACT_MARKER_AT] = marker;
+            let Carrier::Curve(carrier) = parse_carrier(&bytes, 0).expect("line") else {
+                panic!("expected curve carrier");
+            };
+            assert_eq!(carrier.runs_against_edges(forward_linked), against);
+        }
+    }
+
+    #[test]
+    fn a_reversed_marker_and_a_negative_torus_major_radius_cancel() {
+        let mut bytes = compact_carrier(
+            tag::TORUS,
+            8,
+            &[
+                0.0, 0.0, 0.0002, 0.0, 0.0, -1.0, -0.0022, 0.0044, -1.0, 0.0, 0.0,
+            ],
+        );
+        bytes[COMPACT_MARKER_AT] = 0x2d;
+        let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).expect("reversed torus") else {
+            panic!("expected surface carrier");
+        };
+        assert!(!carrier.orientation_reversed(true));
+    }
+
+    #[test]
+    fn rejects_nonunit_analytic_frames() {
+        let cases = [
+            (tag::LINE, vec![0.0, 0.0, 0.0, 0.0, 0.0, 2.0]),
+            (
+                tag::CIRCLE,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.002],
+            ),
+            (
+                tag::ELLIPSE,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.002, 0.001],
+            ),
+            (
+                tag::PLANE,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0],
+            ),
+            (
+                tag::CYLINDER,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.002, 2.0, 0.0, 0.0],
+            ),
+            (
+                tag::CONE,
+                vec![
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.001,
+                    std::f64::consts::FRAC_1_SQRT_2,
+                    std::f64::consts::FRAC_1_SQRT_2,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            (
+                tag::SPHERE,
+                vec![0.0, 0.0, 0.0, 0.002, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0],
+            ),
+            (
+                tag::TORUS,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.002, 0.001, 1.0, 0.0, 0.0],
+            ),
+        ];
+
+        for (tag, values) in cases {
+            let bytes = compact_carrier(tag, 9, &values);
+            assert!(
+                parse_carrier(&bytes, 0).is_none(),
+                "accepted tag {tag:#04x}"
+            );
+        }
+    }
+
+    /// A stored cone sine outside the unit interval is not a CONE record.
+    #[test]
+    fn a_cone_sine_outside_the_unit_interval_is_not_a_cone_record() {
+        let bytes = compact_carrier(
+            tag::CONE,
+            8,
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001, 2.0, 1.0, 1.0, 0.0, 0.0],
+        );
+
+        assert!(parse_carrier(&bytes, 0).is_none());
+    }
+
+    #[test]
+    fn a_cone_half_angle_comes_from_its_sine_and_cosine() {
+        let bytes = compact_carrier(
+            tag::CONE,
+            8,
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001, 0.6, 0.8, 1.0, 0.0, 0.0],
+        );
+        let Carrier::Surface(carrier) = parse_carrier(&bytes, 0).expect("required invariant")
+        else {
+            panic!("expected surface carrier");
+        };
+        let Some(SolvedSurfaceGeometry::Cone(cone_surface)) = carrier.geometry.solved() else {
+            panic!("expected cone");
+        };
+
+        assert!((cone_surface.half_angle().get() - 0.6_f64.atan2(0.8)).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn a_cone_sine_just_above_one_is_refused() {
+        let sine = 1.0 + 4.0e-10;
+        let bytes = compact_carrier(
+            tag::CONE,
+            8,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001, sine, 1.0e-8, 1.0, 0.0, 0.0,
+            ],
+        );
+        assert!(parse_carrier(&bytes, 0).is_none());
+    }
+
+    #[test]
+    fn a_negative_cone_sine_is_refused_without_changing_its_chart() {
+        let root_half = std::f64::consts::FRAC_1_SQRT_2;
+        let bytes = compact_carrier(
+            tag::CONE,
+            8,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001, -root_half, root_half, 1.0, 0.0, 0.0,
+            ],
+        );
+        assert!(parse_carrier(&bytes, 0).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_cone_angle_pair() {
+        let bytes = compact_carrier(
+            tag::CONE,
+            8,
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001, 0.5, 0.5, 1.0, 0.0, 0.0],
+        );
+
+        assert!(parse_carrier(&bytes, 0).is_none());
+    }
+    #[test]
+    fn analytic_carrier_role_refuses_the_other_frame_without_changing_values() {
+        let values = [0.017, -0.029, 0.043, 0.0, 1.0, 0.0];
+        let partition = compact_carrier(tag::LINE, 79, &values);
+        assert!(super::parse_carrier_for_role(&partition, 0, false).is_some());
+        assert!(super::parse_carrier_for_role(&partition, 0, true).is_none());
+        for escape in [false, true] {
+            let delta = tripled_compact_carrier(tag::LINE, 79, [1, 17, 73, 1, 1], &values, escape);
+            let Some(Carrier::Curve(old)) = parse_carrier(&delta, 0) else {
+                panic!("authored delta")
+            };
+            let Some(Carrier::Curve(accepted)) = super::parse_carrier_for_role(&delta, 0, true)
+            else {
+                panic!("declared delta role")
+            };
+            assert_eq!(old.attr, accepted.attr);
+            assert_eq!(old.offset, accepted.offset);
+            assert_eq!(old.end, accepted.end);
+            assert_eq!(
+                serde_json::to_value(old.geometry).unwrap(),
+                serde_json::to_value(accepted.geometry).unwrap()
+            );
+            assert!(super::parse_carrier_for_role(&delta, 0, false).is_none());
+            let mut malformed = delta.clone();
+            malformed[2 + usize::from(escape) + 8] = 0x66;
+            assert!(super::parse_carrier_for_role(&malformed, 0, true).is_none());
+        }
+        let invalid = compact_carrier(tag::LINE, 79, &[0.017, -0.029, 0.043, 2.0, 0.0, 0.0]);
+        assert!(parse_carrier(&invalid, 0).is_none());
+        for role in [false, true] {
+            assert!(super::parse_carrier_for_role(&invalid, 0, role).is_none());
+        }
+    }
+}

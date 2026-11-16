@@ -9190,6 +9190,7 @@ fn live_image_imported_mesh_keeps_selected_and_hovered_face_and_body_feedback() 
             file: "feedback-plane.stl".into(),
             meshes: vec![MeshData {
                 corner_normals: std::sync::Arc::from([]),
+                appearance: None,
                 name: "Reference".into(),
                 positions: vec![-2., -2., 0., 2., -2., 0., 2., 2., 0., -2., 2., 0.].into(),
                 triangles: vec![0, 1, 2, 0, 2, 3].into(),

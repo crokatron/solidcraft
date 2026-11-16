@@ -54,7 +54,7 @@ pub(crate) struct Meshing {
 impl Meshing {
     /// `plans`: the bodies are drawn from their display plans; `shared`: large meshes are drawn
     /// from shared vertices (a GPU viewport), made here too.
-    fn start(world: Arc<ModelState>, plans: bool, shared: bool) -> Meshing {
+    fn start(world: Arc<ModelState>, plans: bool, shared: bool, textures: crate::mesh_textures::MeshTextures) -> Meshing {
         let n = world.bodies.len();
         let ready = Arc::new(Mutex::new(Vec::with_capacity(n)));
         let (done, stop) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
@@ -78,10 +78,14 @@ impl Meshing {
                         if let Some(b) = world.bodies.get(i) {
                             // What the viewport draws and picks: a placed part's shared mesh, not a
                             // moved copy of it (its placements are drawn as instances of it).
-                            let (mesh, _) = b.mesh_in_place();
+                            let (mesh, place) = b.mesh_in_place();
+                            // Image preparation and the shared-vertex buffers are independent.
+                            if let Some(appearance) = &b.mesh_appearance {
+                                textures.warm(&mesh, appearance);
+                            }
                             // A large mesh's shared vertices too, so its first frame does not weld them.
                             if shared {
-                                crate::viewport::warm_shared_tris(&mesh);
+                                crate::viewport::warm_body_shared_tris(b, &mesh, &place);
                             }
                             if plans {
                                 let _ = b.gpu_plan_at(solidcraft_engine::doc::display_quality::current());
@@ -134,7 +138,8 @@ impl Drop for Meshing {
 pub(crate) fn start(app: &mut SolveApp, remember: Option<String>) {
     app.open_meshing_next = false;
     let plans = app.viewport.gpu.is_some_and(|g| g.tess);
-    let mut meshing = Meshing::start(crate::open_meshing::session_world(&app.session), plans, app.viewport.gpu.is_some());
+    let mut meshing =
+        Meshing::start(crate::open_meshing::session_world(&app.session), plans, app.viewport.gpu.is_some(), app.viewport.mesh_textures.clone());
     meshing.remember = remember;
     app.open_meshing = Some(meshing);
     app.fit_view();
@@ -209,7 +214,7 @@ pub(crate) fn tick(app: &mut SolveApp, ctx: &egui::Context) {
         // The design changed (an edit, an undo): mesh the new world; what is made is kept.
         let (framed, remember) = (m.framed, m.remember.clone());
         let plans = app.viewport.gpu.is_some_and(|g| g.tess);
-        let mut next = Meshing::start(world.clone(), plans, app.viewport.gpu.is_some());
+        let mut next = Meshing::start(world.clone(), plans, app.viewport.gpu.is_some(), app.viewport.mesh_textures.clone());
         (next.framed, next.remember) = (framed, remember);
         app.open_meshing = Some(next);
     }

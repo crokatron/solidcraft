@@ -1126,3 +1126,27 @@ fn an_ellipse_axis_end_is_no_corner_to_pick() {
         assert_eq!(crate::sketch_tools::corner_curves(sk, pi, arcs_ok), None, "the axis and the line are no corner (arcs_ok {arcs_ok})");
     }
 }
+
+#[test]
+fn spatial_fillet_picks_both_world_lines_previews_and_applies_typed_radius() {
+    let mut h = crate::scenario::Harness::new();
+    let sid = h.app.run("sketch.create", json!({"plane":"XY"})).unwrap()["sketch"].as_u64().unwrap();
+    h.app.run("sketch.options", json!({"sketch_3d":true})).unwrap();
+    h.app.run("sketch.line3d", json!({"points":[[-26,-10,-14],[2,4,14],[22,24,-16]]})).unwrap();
+    h.call("ui.view", json!({"view":"home"}));
+    h.call("ui.view", json!({"view":"fit"}));
+    h.settle();
+    h.step(&json!({"start":"sketch.fillet3d"})).unwrap();
+    for point in [[-12, -3, 0], [12, 14, -1]] {
+        h.step(&json!({"click":{"world":point}})).unwrap();
+    }
+    assert!(h.app.dialog.as_ref().unwrap().inputs.iter().all(|i| i.items.len() == 1));
+    retype(&mut h, "dialog:Radius", "6 mm");
+    h.step(&json!({"until":{"count":{"name":"sketch_preview_curves","value":3}}})).unwrap();
+    apply(&mut h);
+    let state = h.app.session.world_state().unwrap();
+    let sk = &state.sketch(sid).unwrap().sketch;
+    assert_eq!(sk.wires.len(), 3);
+    let arc = sk.wires.iter().find_map(|w| w.arc).unwrap();
+    assert!((arc.radius - 6.0).abs() < 1e-8);
+}

@@ -95,7 +95,7 @@ impl OpenSteps {
     pub fn next_import(&self) -> Option<Arc<str>> {
         let f = self.doc.features.get(self.next).filter(|_| !self.done())?;
         match &f.kind {
-            FeatureKind::Import { step, .. } if !f.suppressed => Some(step.clone()),
+            FeatureKind::Import { step, .. } if !f.suppressed && !step.trim().is_empty() => Some(step.clone()),
             _ => None,
         }
     }

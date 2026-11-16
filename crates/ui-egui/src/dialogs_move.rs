@@ -58,10 +58,156 @@ pub fn type_row(app: &SolveApp, d: &mut Dialog, ui: &mut egui::Ui) {
     if m != mode {
         switch_type(app, d, m);
     }
+    if matches!(m, FREE | TRANSLATE) && !bodies_empty(d) {
+        handle_rows(app, d, ui);
+    }
+}
+
+/// Handle placement is a tool setting, never a model edit.
+fn handles_only(d: &Dialog) -> bool {
+    d.extra.get("handles_only").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn handle_frame(app: &SolveApp, d: &Dialog) -> Option<Mat> {
+    let mut frame = d
+        .extra
+        .get("handle_frame")
+        .and_then(|v| serde_json::from_value::<Mat>(v.clone()).ok())
+        .unwrap_or_else(|| crate::move_handles::at(pivot(app, d).unwrap_or(Vec3::ZERO)));
+    if let Some(point) = sel_point(app, d, items(d, 1).first()) {
+        frame[3] = [point.x, point.y, point.z, 1.0];
+    }
+    solidcraft_engine::origins::frame_delta(&frame, &frame).ok()?;
+    Some(frame)
+}
+
+/// Local numeric offsets become a rigid motion around the positioned handle frame.
+fn handle_delta(app: &SolveApp, d: &Dialog) -> Result<Mat, String> {
+    let Kind::Move { mode, x, y, z, rx, ry, rz, .. } = &d.kind else { return Err("not a move".into()) };
+    let frame = handle_frame(app, d).ok_or("invalid handle frame")?;
+    let back = mat_inverse(&frame).ok_or("invalid handle frame")?;
+    let t = Vec3::new(len(app, x)?, len(app, y)?, len(app, z)?);
+    let a = if *mode == FREE { [ang(app, rx)?, ang(app, ry)?, ang(app, rz)?] } else { [0.; 3] };
+    let rotation = gizmo::mul(&gizmo::mul(&gizmo::rotation(Vec3::Z, a[2]), &gizmo::rotation(Vec3::Y, a[1])), &gizmo::rotation(Vec3::X, a[0]));
+    let (axis, angle) = gizmo::axis_angle(&rotation);
+    Ok(mat_mul(&mat_mul(&frame, &rigid(t, Vec3::ZERO, axis, angle)), &back))
+}
+
+fn shown_handle_frame(app: &SolveApp, d: &Dialog) -> Option<Mat> {
+    let delta = if handles_only(d) || d.extra.contains_key("handle_frame") {
+        handle_delta(app, d).ok()?
+    } else {
+        made(app, d).unwrap_or_else(|| crate::move_handles::at(Vec3::ZERO))
+    };
+    Some(mat_mul(&delta, &handle_frame(app, d)?))
+}
+
+/// Commit the current preview into the pending chain, then reset the incremental fields.
+/// In handles-only mode no part of the handle movement enters the geometry chain.
+fn freeze_step(app: &SolveApp, d: &mut Dialog) {
+    if let Some(made) = made(app, d) {
+        let total = chain(d).map_or(made, |c| mat_mul(&made, &c));
+        d.extra.insert("chain".into(), json!(total));
+    }
+    let Kind::Move { mode, .. } = d.kind else { return };
+    d.kind = kind(mode, &app.session.doc);
+    for key in ["axis", "angle", "drag0"] {
+        d.extra.remove(key);
+    }
+}
+
+fn set_handles_only(app: &SolveApp, d: &mut Dialog, only: bool) {
+    let frame = shown_handle_frame(app, d).or_else(|| handle_frame(app, d));
+    freeze_step(app, d);
+    if let Some(frame) = frame {
+        d.extra.insert("handle_frame".into(), json!(frame));
+    }
+    if let Some(input) = d.inputs.get_mut(1) {
+        input.items.clear();
+    }
+    d.extra.insert("handles_only".into(), json!(only));
+}
+
+fn set_handle_frame(app: &SolveApp, d: &mut Dialog, frame: Mat) {
+    freeze_step(app, d);
+    d.extra.insert("handle_frame".into(), json!(frame));
+    if let Some(input) = d.inputs.get_mut(1) {
+        input.items.clear();
+    }
+}
+
+fn align_handle_frame(app: &SolveApp, d: &mut Dialog, target: Mat) -> Result<(), String> {
+    let source = shown_handle_frame(app, d).ok_or("invalid handle frame")?;
+    let delta = solidcraft_engine::origins::frame_delta(&source, &target).map_err(|e| e.to_string())?;
+    freeze_step(app, d);
+    let total = chain(d).map_or(delta, |c| mat_mul(&delta, &c));
+    d.extra.insert("chain".into(), json!(total));
+    d.extra.insert("handle_frame".into(), json!(target));
+    d.extra.insert("handles_only".into(), json!(false));
+    if let Some(input) = d.inputs.get_mut(1) {
+        input.items.clear();
+    }
+    Ok(())
+}
+
+/// Apply pose edits to the handle frame only; geometry remains in its pending chain.
+pub(crate) fn pose_dock(app: &SolveApp, d: &mut Dialog, ctx: &egui::Context) -> Option<egui::Rect> {
+    if !matches!(d.kind, Kind::Move { mode: FREE | TRANSLATE, .. }) || !handles_only(d) {
+        return None;
+    }
+    let mut frame = shown_handle_frame(app, d)?;
+    let (changed, rect) = crate::move_handles::pose_dock(app, ctx, "body", &mut frame);
+    if changed {
+        set_handle_frame(app, d, frame);
+    }
+    rect
+}
+
+fn handle_rows(app: &SolveApp, d: &mut Dialog, ui: &mut egui::Ui) {
+    let mut only = handles_only(d);
+    let response = ui.checkbox(&mut only, solidcraft_ui_text::tr("move.handles_only"));
+    crate::scenario::publish_handle("move:handles_only", response.rect.center());
+    if response.changed() {
+        set_handles_only(app, d, only);
+    }
+    if let Some(mut frame) = shown_handle_frame(app, d) {
+        let owner = format!("body:{:?}", targets(app, d));
+        if crate::move_handle_snap::rows(app, ui, &owner, &mut frame) {
+            if only {
+                set_handle_frame(app, d, frame);
+            } else if let Err(error) = align_handle_frame(app, d, frame) {
+                d.error = Some(error);
+            }
+        }
+    }
+    if only {
+        crate::ui_kit::text(ui, solidcraft_ui_text::tr("move.handles_only_hint"), crate::ui_kit::Text::Hint("move_handles_only"));
+        if let Some(mut frame) = shown_handle_frame(app, d) {
+            let mut reference = d.extra.get("handle_reference").and_then(Value::as_str).unwrap_or("world").to_owned();
+            if crate::move_handles::rows(app, ui, &mut frame, &mut reference) {
+                set_handle_frame(app, d, frame);
+            }
+            d.extra.insert("handle_reference".into(), json!(reference));
+        }
+    } else {
+        let mut target = d.extra.get("target_frame").and_then(Value::as_str).unwrap_or("world").to_owned();
+        if crate::move_handles::target_row(app, ui, &mut target) {
+            let result = app.session.coordinate_frame(&target).map_err(|e| e.to_string()).and_then(|frame| align_handle_frame(app, d, frame));
+            if let Err(error) = result {
+                d.error = Some(error);
+            }
+        }
+        d.extra.insert("target_frame".into(), json!(target));
+    }
 }
 
 /// Change the Move Type to `m`, keeping the move made so far.
 fn switch_type(app: &SolveApp, d: &mut Dialog, m: usize) {
+    let frame = if d.extra.contains_key("handle_frame") && matches!(d.kind, Kind::Move { mode: FREE | TRANSLATE, .. }) {
+        shown_handle_frame(app, d)
+    } else {
+        None
+    };
     // A type whose picks are missing or whose values don't evaluate adds nothing.
     if let Ok(Step::Made(p)) = step(app, d)
         && let Ok(made) = transform(app, &p)
@@ -71,11 +217,17 @@ fn switch_type(app: &SolveApp, d: &mut Dialog, m: usize) {
     }
     let bodies = d.inputs.first().map(|i| i.items.clone()).unwrap_or_default();
     d.kind = kind(m, &app.session.doc);
+    if !matches!(m, FREE | TRANSLATE) {
+        d.extra.insert("handles_only".into(), json!(false));
+    }
     d.inputs = inputs(m);
     if let Some(i) = d.inputs.first_mut() {
         i.items = bodies;
     }
     d.extra.remove("pivot");
+    if let Some(frame) = frame {
+        d.extra.insert("handle_frame".into(), json!(frame));
+    }
     d.active = if bodies_empty(d) { 0 } else { 1.min(d.inputs.len() - 1) };
 }
 
@@ -262,14 +414,16 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Kind) -> bool {
     let mut enter = false;
     match *mode {
         FREE | TRANSLATE => {
-            enter |= expr_row(ui, "X Distance", x);
-            enter |= expr_row(ui, "Y Distance", y);
-            enter |= expr_row(ui, "Z Distance", z);
-            if *mode == FREE {
-                enter |= expr_row(ui, "X Angle", rx);
-                enter |= expr_row(ui, "Y Angle", ry);
-                enter |= expr_row(ui, "Z Angle", rz);
-            }
+            crate::ui_kit::section(ui, "move-manual-values", solidcraft_ui_text::tr("move.manual_values"), false, |ui| {
+                enter |= expr_row(ui, "X Distance", x);
+                enter |= expr_row(ui, "Y Distance", y);
+                enter |= expr_row(ui, "Z Distance", z);
+                if *mode == FREE {
+                    enter |= expr_row(ui, "X Angle", rx);
+                    enter |= expr_row(ui, "Y Angle", ry);
+                    enter |= expr_row(ui, "Z Angle", rz);
+                }
+            });
         }
         ROTATE => enter |= expr_row(ui, "Angle", angle),
         POINT_TO_POSITION => {
@@ -311,8 +465,8 @@ fn items(d: &Dialog, i: usize) -> &[Sel] {
 /// The centre of the picked bodies where they are before this move (after the earlier types').
 fn bodies_center(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
     let st = match d.editing {
-        Some((id, _)) => app.session.model.state_before(id),
-        None => app.session.model.state(),
+        Some((id, _)) => std::sync::Arc::new(solidcraft_engine::doc::world_state(&app.session.doc, &app.session.model.state_before(id)).ok()?),
+        None => crate::open_meshing::session_world(&app.session),
     };
     let mut bb: Option<(Vec3, Vec3)> = None;
     for n in bodies_of(app, d) {
@@ -373,14 +527,27 @@ pub fn params(app: &SolveApp, d: &Dialog) -> Result<Value, String> {
         (Step::Needs(e), None) => return Err(e),
         (Step::Made(p), Some(c)) => {
             let made = transform(app, &p)?;
-            with_transform(p, &mat_mul(&made, &c))
+            if d.extra.contains_key("handle_frame") { with_precise_transform(p, &mat_mul(&made, &c)) } else { with_transform(p, &mat_mul(&made, &c)) }
         }
-        (Step::Needs(_), Some(c)) => with_transform(targets_json(app, d), &c),
+        (Step::Needs(_), Some(c)) => {
+            if d.extra.contains_key("handle_frame") {
+                with_precise_transform(targets_json(app, d), &c)
+            } else {
+                with_transform(targets_json(app, d), &c)
+            }
+        }
     };
     if d.extra.get("copy").and_then(Value::as_bool).unwrap_or(false) {
         p["copy"] = json!(true);
     }
     Ok(p)
+}
+
+/// Accepting handle placement alone must not create a zero-motion history feature.
+pub(crate) fn handle_noop(app: &SolveApp, d: &Dialog) -> bool {
+    (handles_only(d) || d.extra.contains_key("handle_frame"))
+        && !copies(d)
+        && params(app, d).ok().and_then(|p| transform(app, &p).ok()).is_some_and(|m| is_identity(&m))
 }
 
 /// The current type's move, or what it still needs picked.
@@ -424,12 +591,32 @@ fn with_transform(mut p: Value, m: &Mat) -> Value {
     p
 }
 
+/// Frame matching retains full precision; display rounding must not change the placement.
+fn with_precise_transform(mut p: Value, m: &Mat) -> Value {
+    let rows = [0, 1, 2].map(|r| [m[0][r], m[1][r], m[2][r]]);
+    let (axis, angle) = gizmo::axis_angle(&rows);
+    p["translate"] = json!([m[3][0], m[3][1], m[3][2]]);
+    if let Some(object) = p.as_object_mut() {
+        object.remove("axis");
+        object.remove("angle");
+    }
+    if angle.abs() > 1e-14 {
+        p["axis"] = json!([axis.x, axis.y, axis.z]);
+        p["angle"] = json!(format!("{angle} rad"));
+    }
+    p
+}
+
 /// The current type's own move, from where the earlier types leave the bodies.
 fn step(app: &SolveApp, d: &Dialog) -> Result<Step, String> {
     let Kind::Move { mode, x, y, z, rx, ry, rz, angle } = &d.kind else { return Err("not a move".into()) };
     let (bodies, components) = targets(app, d);
     if bodies.is_empty() && components.is_empty() {
         return Err("select bodies first".into());
+    }
+    if matches!(*mode, FREE | TRANSLATE) && (handles_only(d) || d.extra.contains_key("handle_frame")) {
+        let delta = handle_delta(app, d)?;
+        return Ok(Step::Made(if handles_only(d) { targets_json(app, d) } else { with_precise_transform(targets_json(app, d), &delta) }));
     }
     let need_point = |i: usize, what: &str| sel_point(app, d, items(d, i).first()).ok_or(format!("select {what} first"));
     let num = |t: Vec3| json!([mm(t.x), mm(t.y), mm(t.z)]);
@@ -527,8 +714,17 @@ pub fn triad(app: &SolveApp, d: &Dialog) -> Option<gizmo::Triad> {
     if !matches!(*mode, FREE | TRANSLATE) || bodies_empty(d) {
         return None;
     }
+    if handles_only(d) || d.extra.contains_key("handle_frame") {
+        let frame = shown_handle_frame(app, d)?;
+        return Some(gizmo::Triad {
+            center: crate::move_handles::origin(&frame),
+            axes: crate::move_handles::axes(&frame),
+            translate: true,
+            rotate: *mode == FREE,
+        });
+    }
     let t = Vec3::new(len(app, x).unwrap_or(0.0), len(app, y).unwrap_or(0.0), len(app, z).unwrap_or(0.0));
-    Some(gizmo::Triad { center: pivot(app, d)? + t, translate: true, rotate: *mode == FREE })
+    Some(gizmo::Triad { center: pivot(app, d)? + t, axes: [Vec3::X, Vec3::Y, Vec3::Z], translate: true, rotate: *mode == FREE })
 }
 
 /// Rotate's ring lies on the selected axis, level with the picked bodies' centre.
@@ -586,15 +782,22 @@ pub fn show_handle_value(d: &mut Dialog, handle: crate::gizmo::Handle) {
 
 pub fn drag(app: &SolveApp, d: &mut Dialog, g: Drag) {
     show_handle_value(d, g.handle);
+    if g.started && d.extra.contains_key("handle_frame") {
+        if let Some(frame) = shown_handle_frame(app, d) {
+            set_handle_frame(app, d, frame);
+        }
+    }
     let Kind::Move { x, y, z, rx, ry, rz, .. } = &d.kind else { return };
     if g.started || !d.extra.contains_key("drag0") {
         let v = [len(app, x), len(app, y), len(app, z), ang(app, rx), ang(app, ry), ang(app, rz)].map(|r| r.unwrap_or(0.0));
         d.extra.insert("drag0".into(), json!(v));
     }
     let v0: [f64; 6] = d.extra.get("drag0").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let handle_axes = if d.extra.contains_key("handle_frame") { handle_frame(app, d) } else { None };
     let Kind::Move { x, y, z, rx, ry, rz, .. } = &mut d.kind else { return };
     match g.change {
         Change::Translate(t) => {
+            let t = handle_axes.as_ref().map_or(t, |frame| crate::move_handles::local(frame, t));
             *x = crate::length_input::model(&app.session.doc, v0[0] + t.x);
             *y = crate::length_input::model(&app.session.doc, v0[1] + t.y);
             *z = crate::length_input::model(&app.session.doc, v0[2] + t.z);

@@ -1,3 +1,5 @@
+> **Unofficial crokatron development branch.** See [fork information](FORK.md), the [changelog](FORK_CHANGELOG.md) and [feature requests](FEATURE_REQUESTS.md). These changes are experimental. Download badges below refer to upstream releases, not this modified version. No modified binary release is provided here; distribution permission has not been granted.
+
 <p align="center">
   <img src="assets/icons/app/linux/exports/hicolor/256x256/apps/io.tangencylabs.solidcraft.png" width="96" height="96" alt="SolidCraft" />
 </p>

@@ -12,6 +12,60 @@ fn near(actual: Vec3, expected: Vec3) {
     assert!(actual.dist(expected) < 1e-7, "{actual:?} != {expected:?}");
 }
 
+/// A pen-drawn plane line and a spatial line share a corner; their circular fillet is
+/// tangent at both ends in a plane tilted 45 degrees to XY. Trims and arc undo together.
+#[test]
+fn mixed_3d_fillet_trims_both_lines_with_a_true_tangent_arc_and_undo() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    run(&mut s, "sketch.options", json!({"sketch_3d":true}));
+    run(&mut s, "sketch.line", json!({"points":[[-20,0],[0,0]],"ids":["flat"],"infer":false}));
+    let planar = s.doc.sketch(s.active_sketch.unwrap()).unwrap().curves[0].id.clone();
+    let wire = run(&mut s, "sketch.line3d", json!({"points":[[0,0,0],[0,16,16]]}))["curves"][0].clone();
+    let before = s.doc.to_json();
+    let result = run(&mut s, "sketch.fillet3d", json!({"curves":[planar,wire],"radius":"4 mm"}));
+    let sk = s.doc.sketch(s.active_sketch.unwrap()).unwrap();
+    let arc = sk.wires[sk.wire_index(result["curves"][0].as_str().unwrap()).unwrap()].arc.unwrap();
+    near(arc.start, Vec3::new(-4., 0., 0.));
+    let right = Vec3::new(0., 1., 1.).normalized().unwrap();
+    near(arc.end, right * 4.);
+    near(arc.center, arc.start + right * 4.);
+    assert!((arc.radius - 4.).abs() < 1e-7);
+    assert!((arc.start - arc.center).dot(Vec3::X).abs() < 1e-7);
+    assert!((arc.end - arc.center).dot(right).abs() < 1e-7);
+    near(sk.wires[sk.wire_index(wire.as_str().unwrap()).unwrap()].fit[0], arc.end);
+    let solidcraft_sketch::CurveKind::Line { b, .. } = sk.curves[sk.curve_index(&planar).unwrap()].kind else { panic!("line") };
+    assert!((sk.point(b).unwrap().x + 4.).abs() < 1e-7);
+    let after = s.doc.to_json();
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.to_json(), before);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc.to_json(), after);
+}
+#[test]
+fn spatial_fillet_operands_are_order_independent_and_invalid_edits_are_atomic() {
+    for (a, b, works) in [
+        ([[0., 0., 10.], [0., 0., 0.]], [[0., 0., 0.], [8., 8., 0.]], true),
+        // Tangencies fall inside both segments although the original lines stop before their virtual corner.
+        ([[0., 0., 10.], [0., 0., 0.2]], [[0.2, 0.2, 0.], [8., 8., 0.]], true),
+        ([[0., 0., 10.], [0., 0., 0.]], [[1., 0., 0.], [1., 8., 0.]], false),
+        ([[0., 0., 10.], [0., 0., 0.]], [[1., 0., 0.], [1., 0., 10.]], false),
+        ([[0., 0., 1.], [0., 0., 0.]], [[0., 0., 0.], [8., 8., 0.]], false),
+    ] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane":"XY"}));
+        run(&mut s, "sketch.options", json!({"sketch_3d":true}));
+        let first = run(&mut s, "sketch.line3d", json!({"points":a}))["curves"][0].clone();
+        let second = run(&mut s, "sketch.line3d", json!({"points":b}))["curves"][0].clone();
+        let before = s.doc.to_json();
+        let result = s.execute("sketch.fillet3d", &json!({"curves":[second,first],"radius":2}));
+        assert_eq!(result.is_ok(), works, "{result:?}");
+        if !works {
+            assert_eq!(s.doc.to_json(), before);
+        }
+    }
+}
+
 fn second_frame() -> (Session, u64, u64, u64) {
     let mut s = Session::default();
     let c = run(&mut s, "component.create", json!({"name":"Wire owner"}));
@@ -472,4 +526,76 @@ fn wire_frame_copies_keep_component_and_legacy_coordinates() {
     run(&mut s, "component.activate", json!({"component":component,"occurrence":second,"path":[second]}));
     let restored = solidcraft_doc::format::read(&s.doc.to_json()).unwrap();
     assert_eq!(restored.sketch(sketch).unwrap().wires, s.doc.sketch(sketch).unwrap().wires);
+}
+#[test]
+fn spatial_constraints_use_standard_commands_persist_and_delete_with_undo() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    run(&mut s, "sketch.options", json!({"sketch_3d":true}));
+    let a = run(&mut s, "sketch.line3d", json!({"points":[[-10,0,4],[0,0,4]]}))["curves"][0].as_str().unwrap().to_owned();
+    let b = run(&mut s, "sketch.line3d", json!({"points":[[1,2,5],[5,6,7]]}))["curves"][0].as_str().unwrap().to_owned();
+    let first =
+        run(&mut s, "sketch.constraint.coincident", json!({"a":format!("{a}:1"),"b":format!("{b}:0")}))["constraint"].as_str().unwrap().to_owned();
+    let second = run(&mut s, "sketch.constraint.tangent", json!({"a":a,"b":b}))["constraint"].as_str().unwrap().to_owned();
+    assert_ne!(first, second);
+    let id = s.active_sketch.unwrap();
+    let sk = s.doc.sketch(id).unwrap();
+    assert_eq!(sk.wire_constraints.len(), 2);
+    near(sk.wires[0].fit[1], sk.wires[1].fit[0]);
+    let u = (sk.wires[0].fit[1] - sk.wires[0].fit[0]).normalized().unwrap();
+    let v = (sk.wires[1].fit[1] - sk.wires[1].fit[0]).normalized().unwrap();
+    assert!(u.cross(v).len() < 1e-6);
+    let before = s.doc.to_json();
+    run(&mut s, "sketch.delete", json!({"entities":[second]}));
+    assert_eq!(s.doc.sketch(id).unwrap().wire_constraints.len(), 1);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.to_json(), before);
+    let raw = serde_json::to_value(s.doc.sketch(id).unwrap()).unwrap();
+    let restored: solidcraft_sketch::Sketch = serde_json::from_value(raw).unwrap();
+    assert_eq!(&restored, s.doc.sketch(id).unwrap());
+    assert!(s.execute("sketch.constraint.tangent", &json!({"a":a,"b":format!("{b}:100")})).is_err());
+    assert_eq!(s.doc.to_json(), before);
+}
+
+#[test]
+fn spatial_dimensions_fix_edit_undo_and_freedom_use_stored_geometry() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    run(&mut s, "sketch.options", json!({"sketch_3d":true}));
+    let line = run(&mut s, "sketch.line3d", json!({"points":[[0,0,0],[3,4,12]]}))["curves"][0].as_str().unwrap().to_owned();
+    assert_eq!(run(&mut s, "sketch.freedom3d", json!({}))["dof"], 6);
+    run(&mut s, "sketch.constraint.fix", json!({"entity":format!("{line}.start"),"fixed":true}));
+    let length = run(&mut s, "sketch.dimension3d", json!({"kind":"distance","a":line,"value":13}))["constraints"][0].clone();
+    assert_eq!(run(&mut s, "sketch.inspect", json!({}))["spatial_dof"], 2);
+    let before = s.doc.to_json();
+    run(&mut s, "sketch.dimension3d.edit", json!({"id":length,"value":26}));
+    let sk = s.doc.sketch(s.active_sketch.unwrap()).unwrap();
+    assert!((sk.wires[0].fit[1].dist(sk.wires[0].fit[0]) - 26.).abs() < 1e-6);
+    let after = s.doc.to_json();
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.to_json(), before);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc.to_json(), after);
+    let reopened = solidcraft_doc::format::read(&after).unwrap();
+    assert_eq!(reopened.sketch(s.active_sketch.unwrap()).unwrap().wire_constraints, s.doc.sketch(s.active_sketch.unwrap()).unwrap().wire_constraints);
+    run(&mut s, "sketch.constraint.fix", json!({"entity":line,"fixed":true}));
+    assert_eq!(run(&mut s, "sketch.freedom3d", json!({}))["dof"], 0);
+    let before = s.doc.to_json();
+    assert!(s.execute("sketch.dimension3d.edit", &json!({"id":length,"value":20})).is_err());
+    assert_eq!(s.doc.to_json(), before);
+}
+
+#[test]
+fn spatial_dimension_drag_projects_cursor_goal_and_preserves_length() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    run(&mut s, "sketch.options", json!({"sketch_3d":true}));
+    let line = run(&mut s, "sketch.line3d", json!({"points":[[0,0,0],[3,4,12]]}))["curves"][0].as_str().unwrap().to_owned();
+    run(&mut s, "sketch.dimension3d", json!({"kind":"fix","a":format!("{line}.start")}));
+    run(&mut s, "sketch.dimension3d", json!({"kind":"distance","a":line,"value":13}));
+    run(&mut s, "sketch.move3d", json!({"wire":line,"index":1,"to":[6,8,20]}));
+    let sk = s.doc.sketch(s.active_sketch.unwrap()).unwrap();
+    assert!(sk.wires[0].fit[0].len() < 1e-7);
+    assert!((sk.wires[0].fit[1].len() - 13.).abs() < 1e-6);
+    assert!(sk.wires[0].fit[1].dist(Vec3::new(3., 4., 12.)) > 0.1);
 }

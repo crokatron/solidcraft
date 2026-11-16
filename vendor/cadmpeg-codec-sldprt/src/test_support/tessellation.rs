@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Synthetic display-list tessellation payloads for crate tests.
+#![allow(clippy::unwrap_used)]
+
+use super::container::make_block;
+use super::container::sldprt_with_body;
+
+/// Build a display-list descriptor header followed by its payload bytes.
+pub(crate) fn descriptor(item_size: u32, kind: u32, count: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(item_size.to_le_bytes());
+    out.extend(kind.to_le_bytes());
+    out.extend(2_u32.to_le_bytes());
+    out.extend(count.to_le_bytes());
+    out.extend(data);
+    out
+}
+
+pub(crate) fn display_list_payload() -> Vec<u8> {
+    display_list_payload_with_positions([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+}
+
+/// One compact triangle table with three positions, in metres.
+pub(crate) fn display_list_payload_with_positions(positions: [f32; 9]) -> Vec<u8> {
+    let mut b = b"uoTempBodyTessData_c".to_vec();
+    b.extend_from_slice(&[0u8; 8]);
+    b.extend_from_slice(b"uoTempFaceTessData_c");
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend(descriptor(4, 8, 1, &3u32.to_le_bytes()));
+    let positions = positions
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    b.extend(descriptor(12, 100, 3, &positions));
+    b.extend(descriptor(12, 100, 3, &[0u8; 36]));
+    b.extend(descriptor(4, 8, 4, &[0; 16]));
+    b.extend(descriptor(4, 8, 1, &4u32.to_le_bytes()));
+    b.extend(descriptor(1, 8, 4, &[0; 4]));
+    b
+}
+
+/// Table metadata after the sixth descriptor: `1` at `M+0x60` and `key` at `M+0x64`.
+pub(crate) fn face_key_metadata(key: u32) -> Vec<u8> {
+    let mut metadata = vec![0; 0x80];
+    metadata[0x60..0x64].copy_from_slice(&1_u32.to_le_bytes());
+    metadata[0x64..0x68].copy_from_slice(&key.to_le_bytes());
+    metadata
+}
+
+pub(crate) fn extended_display_list_payload() -> Vec<u8> {
+    let mut payload = display_list_payload();
+    let marker = b"uoTempFaceTessData_c";
+    let extension = [1_u32, 0, 0, 0x0020_1296, 0, 0, 0, 0]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let at = payload
+        .windows(marker.len())
+        .position(|bytes| bytes == marker)
+        .expect("face tessellation class")
+        + marker.len()
+        + 8;
+    payload.splice(at..at, extension);
+    payload
+}
+
+pub(crate) fn sldprt_with_body_and_display_list(body: &[u8]) -> Vec<u8> {
+    sldprt_with_body_and_display_payload(body, &display_list_payload())
+}
+
+pub(crate) fn sldprt_with_body_and_display_payload(body: &[u8], display: &[u8]) -> Vec<u8> {
+    let mut f = sldprt_with_body(body);
+    f.extend(make_block(0x41, "Contents/DisplayLists", display));
+    f
+}

@@ -241,17 +241,25 @@ pub struct MeshIndex {
 }
 
 impl MeshIndex {
-    /// The index of `mesh`.
+    fn padded(mut b: Aabb3) -> Aabb3 {
+        // Flat boxes (a triangle square to an axis) are grown a little, so a ray through
+        // them is never lost to rounding in the box test.
+        let scale = [b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z].iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        let e = scale * 1e-9;
+        b.min -= Vec3::new(e, e, e);
+        b.max += Vec3::new(e, e, e);
+        b
+    }
+
+    /// Both hierarchies, for a body with selectable faces and edges.
     pub fn new(mesh: &Mesh) -> MeshIndex {
-        let pad = |mut b: Aabb3| {
-            // Flat boxes (a triangle square to an axis) are grown a little, so a ray through
-            // them is never lost to rounding in the box test.
-            let scale = [b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z].iter().fold(1.0f64, |m, v| m.max(v.abs()));
-            let e = scale * 1e-9;
-            b.min -= Vec3::new(e, e, e);
-            b.max += Vec3::new(e, e, e);
-            b
-        };
+        let faces = Self::faces(mesh);
+        let edges = Self::edges(mesh);
+        MeshIndex { segments: edges.segments, segment_of: edges.segment_of, ..faces }
+    }
+
+    /// Face picking on an imported scan does not require indexing any outline edges.
+    pub fn faces(mesh: &Mesh) -> MeshIndex {
         let boxes: Vec<Aabb3> = mesh
             .triangles
             .iter()
@@ -260,9 +268,14 @@ impl MeshIndex {
                 for p in mesh.tri(t).into_iter().flatten() {
                     b.add(p);
                 }
-                if b.is_empty() { b } else { pad(b) }
+                if b.is_empty() { b } else { Self::padded(b) }
             })
             .collect();
+        MeshIndex { triangles: Bvh::new(&boxes), triangle_count: mesh.triangles.len(), ..Default::default() }
+    }
+
+    /// Standalone segment hierarchy, built if Measure asks to pick a scan outline.
+    pub fn edges(mesh: &Mesh) -> MeshIndex {
         let mut segment_of = Vec::new();
         let mut seg_boxes = Vec::new();
         for (ei, e) in mesh.edges.iter().enumerate() {
@@ -273,11 +286,11 @@ impl MeshIndex {
                 let mut bx = Aabb3::EMPTY;
                 bx.add(*a);
                 bx.add(*b);
-                seg_boxes.push(pad(bx));
+                seg_boxes.push(Self::padded(bx));
                 segment_of.push((ei as u32, si as u32));
             }
         }
-        MeshIndex { triangles: Bvh::new(&boxes), triangle_count: mesh.triangles.len(), segments: Bvh::new(&seg_boxes), segment_of }
+        MeshIndex { segments: Bvh::new(&seg_boxes), segment_of, ..Default::default() }
     }
 
     /// [`Mesh::raycast`] through the index: the same answer, including which triangle wins a tie.

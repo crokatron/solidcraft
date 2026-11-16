@@ -101,8 +101,19 @@ const AHEAD_AREAS: &[&str] = &[
 const NAMES_A_FILE: &[&str] = &["path", "paths", "file", "files", "dir", "folder", "url", "out"];
 
 /// Commands that change nothing in the design and write a file: they run on a copy.
-const ANSWERED_ON_A_COPY: &[&str] =
-    &["file.export", "file.export_3mf", "file.export_obj", "file.export_step", "file.export_stl", "file.export_urdf", "file.save_mesh"];
+const ANSWERED_ON_A_COPY: &[&str] = &[
+    "file.export",
+    "file.export_3mf",
+    "file.export_glb",
+    "file.export_json",
+    "file.export_nx_assembly",
+    "file.export_obj",
+    "file.export_parasolid",
+    "file.export_step",
+    "file.export_stl",
+    "file.export_urdf",
+    "file.save_mesh",
+];
 
 /// Commands that only read the design, which can take long on a large one (a measure of every
 /// body, an inspection that measures them, #4604; a clearance or interference check of every pair
@@ -576,6 +587,11 @@ impl SolveApp {
         if reply["ok"] == true && export {
             let language = solidcraft_ui_text::Locale::for_language(&self.preferences.language);
             self.session.echo(language.format("ui.command_done", &[("command", job.label.as_str())]));
+            if let Some((_, params)) = executed(&job.req.params)
+                && let Some(path) = params.get("path").and_then(Value::as_str)
+            {
+                self.set_file_status(language.format("notifications.exported", &[("path", path)]), path);
+            }
         }
         let _ = job.req.reply.send(reply);
     }

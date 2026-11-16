@@ -1,0 +1,718 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Datum-plane common headers and atomic construction references.
+
+use cadmpeg_ir::native::bytes::NativeBytes;
+
+use super::{
+    feature_input_blocks, format_feature_history_id, unique_offset_data_block_id,
+    visit_feature_history_operation_records, DatumPlaneBlockLane,
+};
+use crate::container::Container;
+use crate::om::compact::CompactIndexAtom;
+use crate::om::datum_plane_header::{
+    self, DatumPlaneBranch, DatumPlaneFrame, DoubleForm, SingleForm,
+};
+use crate::om::reference_index::PayloadIndexToken;
+use serde::{
+    ser::{SerializeSeq, SerializeStruct},
+    Deserialize, Serialize,
+};
+use std::collections::BTreeSet;
+
+/// A retained common header with an optional decoded construction branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::native) struct FeatureDatumPlaneHeader {
+    pub(in crate::native) id: String,
+    pub(in crate::native) operation_label: String,
+    control: u8,
+    construction: Construction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Construction {
+    HeaderOnly {
+        declared_count: u8,
+        branch_tag: u8,
+        source_offset: u64,
+    },
+
+    Unresolved(DatumPlaneFrame<()>),
+    Resolved(DatumPlaneFrame<String>),
+}
+
+impl FeatureDatumPlaneHeader {
+    pub(super) fn resolved_data_blocks(
+        &self,
+        lane: DatumPlaneBlockLane,
+    ) -> impl Iterator<Item = &String> {
+        let frame = match &self.construction {
+            Construction::Resolved(frame) => Some(frame),
+            Construction::Unresolved(_) | Construction::HeaderOnly { .. } => None,
+        };
+        frame.into_iter().flat_map(move |frame| {
+            let descriptor = frame.descriptor().map(|(_, block, _)| block);
+            let mut objects = frame.objects().map(|(_, block, _)| block);
+            match lane {
+                DatumPlaneBlockLane::Descriptor => [descriptor, None],
+                DatumPlaneBlockLane::Object => [objects.next(), objects.next()],
+            }
+            .into_iter()
+            .flatten()
+        })
+    }
+}
+
+/// Decode common datum-plane payload headers from feature-history records.
+pub(in crate::native) fn feature_datum_plane_headers(
+    ctx: &cadmpeg_core::decode::DecodeContext<'_>,
+    container: &Container,
+) -> Result<Vec<FeatureDatumPlaneHeader>, cadmpeg_core::CodecError> {
+    let indexed = container.indexed_om_sections();
+    let inputs = feature_input_blocks(container)?;
+    let mut headers = Vec::new();
+    let mut failure = None;
+    visit_feature_history_operation_records(
+        container,
+        |_section, section_key, entry_offset, operation_ordinal, record| {
+            if failure.is_some() {
+                return;
+            }
+            let projected = (|| -> Result<(), cadmpeg_core::CodecError> {
+                let Some(header) =
+                    datum_plane_header::datum_plane_payload_header(record.payload_view())
+                else {
+                    return Ok(());
+                };
+                let Some(source_offset) = entry_offset.checked_add(
+                    cadmpeg_core::decode::u64_from_index(record.payload_offset()),
+                ) else {
+                    return Ok(());
+                };
+                let parsed = datum_plane_header::datum_plane_descriptor_reference_branch(
+                    record.payload_view(),
+                )
+                .or_else(|| {
+                    datum_plane_header::datum_plane_double_reference_branch(record.payload_view())
+                });
+                let branch = match parsed {
+                    Some(frame) => {
+                        let Some(frame) = frame.relocate(entry_offset) else {
+                            return Ok(());
+                        };
+                        Some(frame)
+                    }
+                    None => None,
+                };
+                let operation_label = format_feature_history_id(
+                    "operation-label",
+                    section_key,
+                    operation_ordinal,
+                    None,
+                );
+                let mut input_prefixes = BTreeSet::new();
+                for input in inputs
+                    .iter()
+                    .filter(|input| input.operation_label == operation_label)
+                {
+                    let Some((prefix, _)) = input.data_block.rsplit_once(":block#") else {
+                        continue;
+                    };
+                    input_prefixes.insert(prefix);
+                }
+                let branch = branch.map(|branch| {
+                    let single_prefix = if input_prefixes.len() == 1 {
+                        input_prefixes.first().copied()
+                    } else {
+                        None
+                    };
+                    let resolved = single_prefix.and_then(|input_prefix| {
+                        branch.resolve(|index| {
+                            unique_offset_data_block_id(&indexed, index).filter(|data_block| {
+                                data_block
+                                    .rsplit_once(":block#")
+                                    .is_some_and(|(prefix, _)| prefix == input_prefix)
+                            })
+                        })
+                    });
+                    resolved
+                        .map_or_else(|| Construction::Unresolved(branch), Construction::Resolved)
+                });
+                let id = format_feature_history_id(
+                    "datum-plane-header",
+                    section_key,
+                    operation_ordinal,
+                    None,
+                );
+                ctx.charge_entities(1, "NX datum-plane header")?;
+
+                headers.push(FeatureDatumPlaneHeader {
+                    id,
+                    operation_label,
+                    control: header.control,
+                    construction: branch.unwrap_or(Construction::HeaderOnly {
+                        declared_count: header.declared_count,
+                        branch_tag: header.branch_tag,
+                        source_offset,
+                    }),
+                });
+                Ok(())
+            })();
+            if let Err(error) = projected {
+                failure = Some(error);
+            }
+        },
+    )?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(headers)
+}
+
+#[derive(Deserialize)]
+struct HeaderWire {
+    /// Globally unique header identity.
+    id: String,
+    /// Owning `DATUM_PLANE` operation label.
+    operation_label: String,
+    /// Payload control byte.
+    control: u8,
+    /// Declared construction count.
+    declared_count: u8,
+    /// Tag selecting the following construction branch.
+    branch_tag: u8,
+    /// Ordered compact descriptor indices carried by the selected branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    descriptor_indices: Vec<u32>,
+    /// Exact compact descriptor-index tokens in branch order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    raw_descriptor_indices: Vec<NativeBytes<Vec<u8>>>,
+    /// Ordered canonical object indices carried by the selected branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    object_indices: Vec<u32>,
+    /// Exact canonical object-index tokens in branch order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    raw_object_indices: Vec<NativeBytes<Vec<u8>>>,
+    /// Atomically resolved same-store descriptor blocks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    descriptor_data_blocks: Vec<String>,
+    /// Atomically resolved same-store canonical object blocks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    object_data_blocks: Vec<String>,
+    /// Absolute offsets of compact descriptor indices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    descriptor_source_offsets: Vec<u64>,
+    /// Absolute offsets of canonical object-index markers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    object_source_offsets: Vec<u64>,
+    /// Absolute offset of the payload control byte.
+    source_offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Column<'a> {
+    value: u32,
+    raw: &'a [u8],
+    block: Option<&'a str>,
+    source_offset: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnField {
+    Value,
+    Raw,
+    Block,
+    SourceOffset,
+}
+
+struct ColumnList<'a> {
+    columns: &'a [Option<Column<'a>>],
+    field: ColumnField,
+}
+
+impl Serialize for ColumnList<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let len = self
+            .columns
+            .iter()
+            .flatten()
+            .filter(|column| self.field != ColumnField::Block || column.block.is_some())
+            .count();
+        let mut items = serializer.serialize_seq(Some(len))?;
+        for column in self.columns.iter().flatten() {
+            match self.field {
+                ColumnField::Value => items.serialize_element(&column.value)?,
+                ColumnField::Raw => items.serialize_element(&NativeBytes::from(column.raw))?,
+                ColumnField::Block => {
+                    if let Some(block) = column.block {
+                        items.serialize_element(block)?;
+                    }
+                }
+                ColumnField::SourceOffset => items.serialize_element(&column.source_offset)?,
+            }
+        }
+        items.end()
+    }
+}
+
+impl Serialize for FeatureDatumPlaneHeader {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (declared_count, branch_tag, source_offset, descriptor, objects) =
+            match &self.construction {
+                Construction::HeaderOnly {
+                    declared_count,
+                    branch_tag,
+                    source_offset,
+                } => (
+                    *declared_count,
+                    *branch_tag,
+                    *source_offset,
+                    None,
+                    [None, None],
+                ),
+                Construction::Unresolved(branch) => {
+                    let (count, tag) = branch.header();
+                    let descriptor = branch.descriptor().map(|(token, (), offset)| Column {
+                        value: token.value(),
+                        raw: token.raw(),
+                        block: None,
+                        source_offset: offset,
+                    });
+                    let mut source = branch.objects();
+                    let objects = [source.next(), source.next()].map(|item| {
+                        item.map(|(token, (), offset)| Column {
+                            value: token.value(),
+                            raw: token.raw(),
+                            block: None,
+                            source_offset: offset,
+                        })
+                    });
+                    (count, tag, branch.origin(), descriptor, objects)
+                }
+                Construction::Resolved(branch) => {
+                    let (count, tag) = branch.header();
+                    let descriptor = branch.descriptor().map(|(token, block, offset)| Column {
+                        value: token.value(),
+                        raw: token.raw(),
+                        block: Some(block.as_str()),
+                        source_offset: offset,
+                    });
+                    let mut source = branch.objects();
+                    let objects = [source.next(), source.next()].map(|item| {
+                        item.map(|(token, block, offset)| Column {
+                            value: token.value(),
+                            raw: token.raw(),
+                            block: Some(block.as_str()),
+                            source_offset: offset,
+                        })
+                    });
+                    (count, tag, branch.origin(), descriptor, objects)
+                }
+            };
+        let descriptor_columns = [descriptor];
+        let has_objects = objects.iter().any(Option::is_some);
+        let mut fields = serializer.serialize_struct("HeaderWire", 14)?;
+        fields.serialize_field("id", &self.id)?;
+        fields.serialize_field("operation_label", &self.operation_label)?;
+        fields.serialize_field("control", &self.control)?;
+        fields.serialize_field("declared_count", &declared_count)?;
+        fields.serialize_field("branch_tag", &branch_tag)?;
+        if descriptor.is_some() {
+            fields.serialize_field(
+                "descriptor_indices",
+                &ColumnList {
+                    columns: &descriptor_columns,
+                    field: ColumnField::Value,
+                },
+            )?;
+            fields.serialize_field(
+                "raw_descriptor_indices",
+                &ColumnList {
+                    columns: &descriptor_columns,
+                    field: ColumnField::Raw,
+                },
+            )?;
+        }
+        if has_objects {
+            fields.serialize_field(
+                "object_indices",
+                &ColumnList {
+                    columns: &objects,
+                    field: ColumnField::Value,
+                },
+            )?;
+            fields.serialize_field(
+                "raw_object_indices",
+                &ColumnList {
+                    columns: &objects,
+                    field: ColumnField::Raw,
+                },
+            )?;
+        }
+        if descriptor.is_some_and(|column| column.block.is_some()) {
+            fields.serialize_field(
+                "descriptor_data_blocks",
+                &ColumnList {
+                    columns: &descriptor_columns,
+                    field: ColumnField::Block,
+                },
+            )?;
+        }
+        if objects
+            .iter()
+            .flatten()
+            .any(|column| column.block.is_some())
+        {
+            fields.serialize_field(
+                "object_data_blocks",
+                &ColumnList {
+                    columns: &objects,
+                    field: ColumnField::Block,
+                },
+            )?;
+        }
+        if descriptor.is_some() {
+            fields.serialize_field(
+                "descriptor_source_offsets",
+                &ColumnList {
+                    columns: &descriptor_columns,
+                    field: ColumnField::SourceOffset,
+                },
+            )?;
+        }
+        if has_objects {
+            fields.serialize_field(
+                "object_source_offsets",
+                &ColumnList {
+                    columns: &objects,
+                    field: ColumnField::SourceOffset,
+                },
+            )?;
+        }
+        fields.serialize_field("source_offset", &source_offset)?;
+        fields.end()
+    }
+}
+
+fn wire_tokens<T>(
+    indices: Vec<u32>,
+    raw: Vec<cadmpeg_ir::native::bytes::NativeBytes>,
+    offsets: &[u64],
+    field: &str,
+    read: impl Fn(u32, &[u8]) -> Result<T, &'static str>,
+) -> Result<Vec<T>, String> {
+    if indices.len() != raw.len() || indices.len() != offsets.len() {
+        return Err(format!("{field}: token columns differ in length"));
+    }
+    indices
+        .into_iter()
+        .zip(raw)
+        .enumerate()
+        .map(|(slot, (value, raw))| {
+            read(value, &raw).map_err(|error| format!("{field}[{slot}]: {error}"))
+        })
+        .collect()
+}
+
+impl<'de> Deserialize<'de> for FeatureDatumPlaneHeader {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HeaderWire::deserialize(deserializer)?;
+        let descriptors = wire_tokens(
+            wire.descriptor_indices,
+            wire.raw_descriptor_indices,
+            &wire.descriptor_source_offsets,
+            "descriptor_indices",
+            CompactIndexAtom::from_wire,
+        )
+        .map_err(serde::de::Error::custom)?;
+        let objects = wire_tokens(
+            wire.object_indices,
+            wire.raw_object_indices,
+            &wire.object_source_offsets,
+            "object_indices",
+            PayloadIndexToken::from_wire,
+        )
+        .map_err(serde::de::Error::custom)?;
+        let branch = match (descriptors.as_slice(), objects.as_slice()) {
+            ([], []) => None,
+            ([descriptor], [object]) => Some(DatumPlaneBranch::Single {
+                form: SingleForm::from_header(wire.declared_count, wire.branch_tag).ok_or_else(
+                    || serde::de::Error::custom("declared_count/branch_tag: invalid single branch"),
+                )?,
+                descriptor: (*descriptor, ()),
+                object: (*object, ()),
+            }),
+            ([], [first, second]) => Some(DatumPlaneBranch::Double {
+                form: DoubleForm::from_header(wire.declared_count, wire.branch_tag).ok_or_else(
+                    || serde::de::Error::custom("declared_count/branch_tag: invalid double branch"),
+                )?,
+                objects: [(*first, ()), (*second, ())],
+            }),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "datum-plane references do not match declared_count/branch_tag",
+                ))
+            }
+        };
+        if wire.declared_count < 2 {
+            return Err(serde::de::Error::custom(
+                "declared_count: datum-plane header requires at least two",
+            ));
+        }
+        wire.source_offset
+            .checked_add(10)
+            .ok_or_else(|| serde::de::Error::custom("source_offset: header end overflows"))?;
+        let branch = branch
+            .map(|branch| {
+                let frame = DatumPlaneFrame::new(wire.source_offset, branch).ok_or_else(|| {
+                    serde::de::Error::custom("source_offset: construction end overflows")
+                })?;
+                if frame
+                    .descriptor()
+                    .map(|(_, (), offset)| offset)
+                    .into_iter()
+                    .ne(wire.descriptor_source_offsets)
+                {
+                    return Err(serde::de::Error::custom(
+                        "descriptor_source_offsets: not derived from construction frame",
+                    ));
+                }
+                if frame
+                    .objects()
+                    .map(|(_, (), offset)| offset)
+                    .ne(wire.object_source_offsets)
+                {
+                    return Err(serde::de::Error::custom(
+                        "object_source_offsets: not derived from construction frame",
+                    ));
+                }
+                Ok(frame)
+            })
+            .transpose()?;
+        let branch = if wire.descriptor_data_blocks.is_empty() && wire.object_data_blocks.is_empty()
+        {
+            branch.map(Construction::Unresolved)
+        } else {
+            let Some(branch) = branch else {
+                return Err(serde::de::Error::custom(
+                    "data_blocks have no matching references",
+                ));
+            };
+            if wire.descriptor_data_blocks.len() != usize::from(branch.descriptor().is_some())
+                || wire.object_data_blocks.len() != branch.objects().count()
+            {
+                return Err(serde::de::Error::custom(
+                    "descriptor_data_blocks/object_data_blocks require complete branch resolution",
+                ));
+            }
+            let mut blocks = wire
+                .descriptor_data_blocks
+                .into_iter()
+                .chain(wire.object_data_blocks);
+            Some(Construction::Resolved(
+                branch.resolve(|_| blocks.next()).ok_or_else(|| {
+                    serde::de::Error::custom("data_blocks: incomplete branch resolution")
+                })?,
+            ))
+        };
+        Ok(Self {
+            id: wire.id,
+            operation_label: wire.operation_label,
+            control: wire.control,
+            construction: branch.unwrap_or(Construction::HeaderOnly {
+                declared_count: wire.declared_count,
+                branch_tag: wire.branch_tag,
+                source_offset: wire.source_offset,
+            }),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FeatureDatumPlaneHeader;
+
+    #[test]
+    fn composed_datum_plane_header_resolves_its_blocks() {
+        let container = {
+            crate::container::scan_bytes(
+                crate::test_support::test_prt::composed_feature_history_prt(),
+            )
+        }
+        .expect("composed datum plane container");
+        let headers = crate::test_support::with_decode_context(|ctx| {
+            super::feature_datum_plane_headers(ctx, &container)
+        })
+        .expect("admitted datum plane headers");
+        assert!(headers
+            .iter()
+            .any(|header| { matches!(header.construction, super::Construction::Resolved(_)) }));
+    }
+
+    fn datum_plane_container() -> crate::container::Container<'static> {
+        let payload = crate::test_support::test_om::composed_feature_history_payload(
+            &[(
+                &[0xff; 4],
+                "DATUM_PLANE",
+                vec![0, 0, 0, 1, 0, 1, 2, 0, 1, 2],
+            )],
+            &[],
+        );
+        {
+            crate::container::scan_bytes(crate::test_support::test_prt::prt_with_named_payloads(&[
+                ("/Root/UG_PART/UG_PART", payload),
+            ]))
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn datum_plane_header_route_preserves_header_only_record() {
+        let container = datum_plane_container();
+        let headers = crate::test_support::with_decode_context(|ctx| {
+            super::feature_datum_plane_headers(ctx, &container)
+        })
+        .unwrap();
+        assert_eq!(headers.len(), 1);
+        assert!(headers[0]
+            .id
+            .starts_with("nx:feature-history:datum-plane-header#"));
+    }
+
+    #[test]
+    fn datum_plane_columns_stream_once_with_native_retained_limit() {
+        let expected = serde_json::json!({
+            "id": "nx:feature-history:datum-plane-header#1",
+            "operation_label": "operation", "control": 1,
+            "declared_count": 2, "branch_tag": 27,
+            "descriptor_indices": [3], "raw_descriptor_indices": ["03"],
+            "object_indices": [4], "raw_object_indices": ["f004"],
+            "descriptor_data_blocks": ["descriptor"],
+            "object_data_blocks": ["object"],
+            "descriptor_source_offsets": [20], "object_source_offsets": [22],
+            "source_offset": 10
+        });
+        let record: FeatureDatumPlaneHeader = serde_json::from_value(expected.clone()).unwrap();
+        cadmpeg_test_support::native_serialization::assert_native_limit(&record, expected);
+    }
+
+    #[test]
+    fn header_only_and_resolved_branches_preserve_column_wire() {
+        for json in [
+            r#"{"id":"header","operation_label":"operation","control":1,"declared_count":2,"branch_tag":255,"source_offset":10}"#,
+            r#"{"id":"header","operation_label":"operation","control":1,"declared_count":2,"branch_tag":27,"source_offset":10}"#,
+            r#"{"id":"header","operation_label":"operation","control":1,"declared_count":2,"branch_tag":27,"descriptor_indices":[3],"raw_descriptor_indices":["03"],"object_indices":[4],"raw_object_indices":["f004"],"descriptor_data_blocks":["descriptor"],"object_data_blocks":["object"],"descriptor_source_offsets":[20],"object_source_offsets":[22],"source_offset":10}"#,
+            r#"{"id":"header","operation_label":"operation","control":1,"declared_count":3,"branch_tag":41,"object_indices":[3,4],"raw_object_indices":["f003","f004"],"object_data_blocks":["first","second"],"object_source_offsets":[20,27],"source_offset":10}"#,
+            r#"{"id":"header","operation_label":"operation","control":1,"declared_count":3,"branch_tag":40,"descriptor_indices":[3],"raw_descriptor_indices":["03"],"object_indices":[4],"raw_object_indices":["f004"],"descriptor_source_offsets":[20],"object_source_offsets":[25],"source_offset":10}"#,
+        ] {
+            let header: FeatureDatumPlaneHeader = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&header).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn wire_requires_complete_branch_tokens_and_atomic_resolution() {
+        let json = r#"{"id":"header","operation_label":"operation","control":1,"declared_count":2,"branch_tag":27,"descriptor_indices":[3],"raw_descriptor_indices":["03"],"object_indices":[4],"raw_object_indices":["f004"],"descriptor_data_blocks":["descriptor"],"object_data_blocks":["object"],"descriptor_source_offsets":[20],"object_source_offsets":[22],"source_offset":10}"#;
+        for column in [
+            "descriptor_indices",
+            "raw_descriptor_indices",
+            "object_indices",
+            "raw_object_indices",
+            "descriptor_data_blocks",
+            "object_data_blocks",
+            "descriptor_source_offsets",
+            "object_source_offsets",
+        ] {
+            let mut wire: serde_json::Value = serde_json::from_str(json).unwrap();
+            wire[column].as_array_mut().unwrap().clear();
+            assert!(
+                serde_json::from_value::<FeatureDatumPlaneHeader>(wire).is_err(),
+                "{column}"
+            );
+        }
+        for selector in [0x18, 0x29, 0x33, 0xff] {
+            let mut wire: serde_json::Value = serde_json::from_str(json).unwrap();
+            wire["branch_tag"] = selector.into();
+            let header: FeatureDatumPlaneHeader = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(header).unwrap(), wire);
+        }
+        let mut wire: serde_json::Value = serde_json::from_str(json).unwrap();
+        wire["branch_tag"] = 0.into();
+        assert!(serde_json::from_value::<FeatureDatumPlaneHeader>(wire).is_err());
+    }
+    #[test]
+    fn branch_tokens_preserve_distinct_descriptor_and_object_grammars() {
+        let json = r#"{"id":"header","operation_label":"operation","control":1,"declared_count":2,"branch_tag":27,"descriptor_indices":[4096],"raw_descriptor_indices":["9000"],"object_indices":[256],"raw_object_indices":["f10100"],"descriptor_data_blocks":["descriptor"],"object_data_blocks":["object"],"descriptor_source_offsets":[20],"object_source_offsets":[23],"source_offset":10}"#;
+        let header: FeatureDatumPlaneHeader = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&header).unwrap(), json);
+        assert_eq!(
+            header
+                .resolved_data_blocks(super::DatumPlaneBlockLane::Descriptor)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["descriptor"]
+        );
+        assert_eq!(
+            header
+                .resolved_data_blocks(super::DatumPlaneBlockLane::Object)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["object"]
+        );
+        for (column, raw) in [
+            ("raw_descriptor_indices", vec![255]),
+            ("raw_descriptor_indices", vec![144]),
+            ("raw_descriptor_indices", vec![144, 0, 0]),
+            ("raw_descriptor_indices", vec![1]),
+            ("raw_object_indices", vec![144, 1, 0]),
+            ("raw_object_indices", vec![241, 1]),
+            ("raw_object_indices", vec![241, 1, 0, 0]),
+            ("raw_object_indices", vec![240, 1]),
+        ] {
+            let mut wire: serde_json::Value = serde_json::from_str(json).unwrap();
+            wire[column][0] = serde_json::json!(cadmpeg_ir::native::bytes::NativeBytes::from(raw));
+            let error = serde_json::from_value::<FeatureDatumPlaneHeader>(wire).unwrap_err();
+            let field = if column == "raw_descriptor_indices" {
+                "descriptor_indices"
+            } else {
+                "object_indices"
+            };
+            assert!(error.to_string().contains(field));
+        }
+    }
+
+    #[test]
+    fn wire_derives_positions_and_rejects_independent_location_changes() {
+        for json in [
+            r#"{"id":"header","operation_label":"operation","control":255,"declared_count":2,"branch_tag":35,"descriptor_indices":[0],"raw_descriptor_indices":["00"],"object_indices":[256],"raw_object_indices":["f10100"],"descriptor_data_blocks":[""],"object_data_blocks":["object"],"descriptor_source_offsets":[110],"object_source_offsets":[112],"source_offset":100}"#,
+            r#"{"id":"header","operation_label":"operation","control":255,"declared_count":2,"branch_tag":41,"object_indices":[0,256],"raw_object_indices":["f000","f10100"],"object_source_offsets":[110,123],"source_offset":100}"#,
+        ] {
+            let header: FeatureDatumPlaneHeader = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&header).unwrap(), json);
+            let original: serde_json::Value = serde_json::from_str(json).unwrap();
+            for column in ["descriptor_source_offsets", "object_source_offsets"] {
+                if let Some(offsets) = original[column].as_array() {
+                    for slot in 0..offsets.len() {
+                        let mut wire = original.clone();
+                        wire[column][slot] = (offsets[slot].as_u64().unwrap() + 1).into();
+                        let error =
+                            serde_json::from_value::<FeatureDatumPlaneHeader>(wire).unwrap_err();
+                        assert!(error.to_string().contains(column));
+                    }
+                }
+            }
+            for origin in [101, u64::MAX - 10, u64::MAX] {
+                let mut wire = original.clone();
+                wire["source_offset"] = origin.into();
+                assert!(serde_json::from_value::<FeatureDatumPlaneHeader>(wire).is_err());
+            }
+        }
+        for count in [0, 1] {
+            let wire = serde_json::json!({
+                "id": "header", "operation_label": "operation", "control": 0,
+                "declared_count": count, "branch_tag": 255, "source_offset": 0
+            });
+            let error = serde_json::from_value::<FeatureDatumPlaneHeader>(wire).unwrap_err();
+            assert!(error.to_string().contains("declared_count"));
+        }
+    }
+}

@@ -1,0 +1,134 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Operation-header validation and record-boundary tests.
+
+use crate::om::operation_record::OperationPayload;
+use crate::om::UnlabeledOperationRecord;
+
+fn operation_body_write_frames(
+    record: OperationPayload<'_>,
+) -> Vec<crate::om::body_write::BodyWriteFrame<usize>> {
+    crate::om::operation_body_write_frames(record)
+}
+
+fn unlabeled_operation_body_write_frames(
+    record: UnlabeledOperationRecord<'_>,
+) -> Vec<crate::om::body_write::BodyWriteFrame<usize>> {
+    crate::om::unlabeled_operation_body_write_frames(record)
+}
+
+fn operation_labels(bytes: &[u8], base_offset: usize) -> Vec<crate::om::OperationLabel<'_>> {
+    {
+        crate::om::operation_labels(bytes, base_offset)
+    }
+}
+
+fn operation_records_with_labels_and_ordinals<'a>(
+    bytes: &'a [u8],
+    base_offset: usize,
+    labels: &[crate::om::OperationLabel<'a>],
+) -> Vec<(usize, crate::om::operation_record::OperationRecord<'a>)> {
+    {
+        crate::om::operation_records_with_labels_and_ordinals(bytes, base_offset, labels)
+    }
+}
+
+fn unlabeled_operation_records_with_ordinals<'a>(
+    bytes: &'a [u8],
+    base_offset: usize,
+    labels: &[crate::om::OperationLabel<'a>],
+) -> Vec<(usize, crate::om::UnlabeledOperationRecord<'a>)> {
+    {
+        crate::om::unlabeled_operation_records_with_ordinals(bytes, base_offset, labels)
+    }
+}
+
+#[test]
+fn unlabeled_operation_header_still_bounds_adjacent_records() {
+    const HEADER: &[u8] = b"\x80\xcd\x01\x04\x01\x2f\xa4\x7a\xe1\x47\xae\x14\x7b\xff\xff";
+    let mut bytes = Vec::new();
+    bytes.extend(b"\x80\xcd\x01\x04\x01\x2f\x5a\x36\xe2\xeb\x1c\x43\x2d\xff\xff");
+    bytes.extend(b"\xff\xff\xff\xff\x03\x07BLOCK\0owned");
+    bytes.extend(HEADER);
+    bytes.extend(b"\xff\xff\xff\xff\x01\x02\x0b\x21\x97\x75\x01\x02\x10\x22\xff");
+    bytes.extend(HEADER);
+    bytes.extend(b"\xff\xff\xff\xff\x03\x08SKETCH\0tail");
+
+    let labels = operation_labels(&bytes, 100);
+    let records = operation_records_with_labels_and_ordinals(&bytes, 100, &labels);
+    assert_eq!(labels.len(), 2);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].0, 0);
+    assert_eq!(records[0].1.label().value, "BLOCK");
+    assert_eq!(records[0].1.payload(), b"owned");
+    assert_eq!(records[1].0, 2);
+    assert_eq!(records[1].1.label().value, "SKETCH");
+    assert_eq!(records[1].1.payload(), b"tail");
+
+    let unlabeled = unlabeled_operation_records_with_ordinals(&bytes, 100, &labels);
+    let [(ordinal, record)] = unlabeled.as_slice() else {
+        panic!("one unlabeled operation record");
+    };
+    assert_eq!(*ordinal, 1);
+    assert_eq!(record.header().offset(), 100 + 32);
+    assert_eq!(record.header().end_offset(), 100 + 51);
+    assert_eq!(record.header().objects().values(), [None; 4]);
+    let writes = unlabeled_operation_body_write_frames(*record);
+    let [write] = writes.as_slice() else {
+        panic!("one independently bounded unlabeled body write");
+    };
+    assert_eq!(write.body_identity(), 0x0b);
+    assert_eq!(write.group_node().value(), 0x21);
+    assert_eq!(write.body_image().value(), 0x22);
+}
+
+#[test]
+fn every_body_identity_opens_a_body_write_frame() {
+    let payload = [
+        0x01, 0x02, 0x11, 0x80, 0xa9, 0x97, 0x75, 0x01, 0x02, 0x10, 0x86, 0x93, 0xff,
+    ];
+    let label = "EXTRUDE";
+    let record = OperationPayload::new(&payload, 100, label).unwrap();
+    let writes = operation_body_write_frames(record);
+    let [write] = writes.as_slice() else {
+        panic!("one body-write frame");
+    };
+    assert_eq!(write.body_identity(), 0x11);
+    assert_eq!(write.group_node().value(), 0xa9);
+    assert_eq!(write.endpoint_class_index().get(), 0x10);
+    assert_eq!(write.body_image().value(), 0x693);
+
+    for endpoint_class_index in [0x11, 0x12, 0x14, 0x15, 0xff] {
+        let mut generation = payload;
+        generation[9] = endpoint_class_index;
+        let writes = operation_body_write_frames(
+            OperationPayload::new(&generation, record.payload_offset(), record.name()).unwrap(),
+        );
+        let [write] = writes.as_slice() else {
+            panic!("generation body-write frame");
+        };
+        assert_eq!(write.endpoint_class_index().get(), endpoint_class_index);
+    }
+
+    let mut invalid_endpoint = payload;
+    invalid_endpoint[9] = 0;
+    assert!(operation_body_write_frames(
+        OperationPayload::new(&invalid_endpoint, record.payload_offset(), record.name()).unwrap()
+    )
+    .is_empty());
+}
+
+#[test]
+fn unlabeled_record_payload_requires_a_complete_bounded_header() {
+    use crate::om::header_references::{HeaderReferences, OperationHeader};
+
+    let header = OperationHeader::<usize>::new(100, HeaderReferences([None; 4])).unwrap();
+    assert!(UnlabeledOperationRecord::new(header, &[0; 18]).is_none());
+    let mut bytes = vec![0; 19];
+    bytes.extend_from_slice(b"payload");
+    let record = UnlabeledOperationRecord::new(header, &bytes).unwrap();
+    assert_eq!(record.bytes(), bytes);
+    assert_eq!(record.payload(), b"payload");
+    let last = OperationHeader::<usize>::new(usize::MAX - 19, HeaderReferences([None; 4])).unwrap();
+    assert!(UnlabeledOperationRecord::new(last, &[0; 19]).is_some());
+    assert!(UnlabeledOperationRecord::new(last, &[0; 20]).is_none());
+}

@@ -1,6 +1,6 @@
 //! Linked designs: a component whose bodies come from another design file (Insert Design).
 //!
-//! The linked design is opened and evaluated on its own, and its solid bodies, as placed in it,
+//! The linked design is opened and evaluated on its own, and its solid and mesh bodies, as placed in it,
 //! join a new component through an Import feature (exact B-rep, kept in this design so it opens
 //! without the part file). The link remembers the absolute file in a session and a path relative
 //! to the design's folder on disk; Update Links reads it again and replaces the Import feature's
@@ -51,7 +51,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&INSERT_DESIGN_CONTRACT)
         .output(output_schema_for::<InsertDesignResult>)
         .params(
-        "path: a .sc design → a new component linked to it, holding its solid bodies as placed in that design and a copy of its design properties; \
+        "path: a .sc design → a new component linked to it, holding its solid and mesh bodies as placed in that design and a copy of its design properties; \
          name? (default: the design's name); parent?: component id or name (default: the active one); \
          translate?: [x,y,z] in mm from the destination parent's origin (default [0,0,0], also with reuse); \
          reuse?: bool (default false): insert a free occurrence, reusing an existing link to the same file when available",
@@ -164,6 +164,7 @@ struct LinkRead {
     file: PathBuf,
     bytes: u64,
     step: u64,
+    meshes: u64,
     faces: u64,
     warnings: Vec<String>,
     properties: Vec<SourceProperties>,
@@ -181,19 +182,53 @@ fn digest<T: Hash + ?Sized>(value: &T) -> u64 {
     h.finish()
 }
 
+/// A streaming fingerprint avoids retaining scan payloads in the global link-read cache.
+fn mesh_digest(meshes: &[solidcraft_doc::MeshData]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    meshes.len().hash(&mut h);
+    for mesh in meshes {
+        mesh.name.hash(&mut h);
+        mesh.color.map(|color| color.map(f32::to_bits)).hash(&mut h);
+        mesh.positions.len().hash(&mut h);
+        for value in mesh.positions.iter() { value.to_bits().hash(&mut h); }
+        mesh.triangles.hash(&mut h);
+        mesh.corner_normals.len().hash(&mut h);
+        for value in mesh.corner_normals.iter() { value.to_bits().hash(&mut h); }
+        mesh.appearance.is_some().hash(&mut h);
+        if let Some(appearance) = &mesh.appearance {
+            appearance.corner_uvs.len().hash(&mut h);
+            for value in appearance.corner_uvs.iter().flatten().flatten() { value.to_bits().hash(&mut h); }
+            appearance.corner_colors.hash(&mut h);
+            appearance.triangle_materials.hash(&mut h);
+            appearance.materials.len().hash(&mut h);
+            for material in appearance.materials.iter() {
+                material.name.hash(&mut h);
+                material.base_color.map(f32::to_bits).hash(&mut h);
+                material.texture.is_some().hash(&mut h);
+                if let Some(texture) = &material.texture {
+                    texture.name.hash(&mut h);
+                    texture.mime_type.hash(&mut h);
+                    texture.bytes.hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
 /// Warnings and source properties of the last read of `file`, when it had these bytes and gave the STEP text
 /// `step` and the face names `faces`: the bodies it gives are the ones the link holds.
-fn unchanged_read(file: &Path, bytes: u64, step: u64, faces: u64) -> Option<(Vec<String>, Vec<SourceProperties>)> {
+fn unchanged_read(file: &Path, bytes: u64, step: u64, meshes: u64, faces: u64) -> Option<(Vec<String>, Vec<SourceProperties>)> {
     let file = absolute(file);
     let reads = READS.lock().ok()?;
     reads
         .iter()
-        .find(|r| r.file == file && r.bytes == bytes && r.step == step && r.faces == faces)
+        .find(|r| r.file == file && r.bytes == bytes && r.step == step && r.meshes == meshes && r.faces == faces)
         .map(|r| (r.warnings.clone(), r.properties.clone()))
 }
 
 fn remember_read(file: &Path, bytes: u64, feature: &solidcraft_io::StepFeature, faces: &[Vec<String>], properties: &[SourceProperties]) {
-    let FeatureKind::Import { step, .. } = &feature.kind else { return };
+    let FeatureKind::Import { step, meshes, .. } = &feature.kind else { return };
     let file = absolute(file);
     let Ok(mut reads) = READS.lock() else { return };
     reads.retain(|r| r.file != file);
@@ -204,6 +239,7 @@ fn remember_read(file: &Path, bytes: u64, feature: &solidcraft_io::StepFeature, 
         file,
         bytes,
         step: digest(step.as_bytes()),
+        meshes: mesh_digest(meshes),
         faces: digest(faces),
         warnings: feature.warnings.clone(),
         properties: properties.to_vec(),
@@ -221,7 +257,7 @@ fn read_link(file: &Path, own: Option<&str>) -> Result<Vec<u8>> {
     read_linked_file(file, own).map_err(|e| EngineError::Other(e.reason))
 }
 
-/// The solid bodies of the design at `file`, evaluated under `validation`, as an Import feature, with the digest of
+/// The solid and mesh bodies of the design at `file`, evaluated under `validation`, as an Import feature, with the digest of
 /// the bytes read, which the link keeps ([`DesignLink::file_sha256`], #9739).
 fn linked_bodies_read(file: &Path, own: Option<&str>, validation: solidcraft_kernel::Validation) -> Result<(Linked, String)> {
     let bytes = read_link(file, own)?;
@@ -255,7 +291,7 @@ pub(super) fn file_sha256(file: &Path, own: Option<&str>) -> Option<String> {
     Some(digest)
 }
 
-/// The solid bodies of `bytes`, the design at `file`, as an Import feature. The model the file
+/// The solid and mesh bodies of `bytes`, the design at `file`, as an Import feature. The model the file
 /// keeps is its evaluation when this build saved it for exactly that design, as when it is opened.
 fn design_bodies(file: &Path, bytes: &[u8], validation: solidcraft_kernel::Validation) -> Result<Linked> {
     #[cfg(test)]
@@ -275,7 +311,7 @@ fn design_bodies(file: &Path, bytes: &[u8], validation: solidcraft_kernel::Valid
     Ok((name, feature, faces, metadata, properties))
 }
 
-/// The solid bodies of `part`, the design saved as `shown`, as an Import feature.
+/// The solid and mesh bodies of `part`, the design saved as `shown`, as an Import feature.
 fn session_bodies(part: &Session, shown: &str) -> Result<Linked> {
     let name = part.doc.name.clone();
     if let Some(e) = part.model.results.iter().find_map(|r| r.error.clone()) {
@@ -283,19 +319,29 @@ fn session_bodies(part: &Session, shown: &str) -> Result<Linked> {
     }
     let world = part.world_state()?;
     let solids: Vec<String> = world.bodies.iter().filter(|b| !b.body.is_mesh()).map(|b| b.name.clone()).collect();
-    if solids.is_empty() {
-        return Err(EngineError::Other(format!("{shown}: the design has no solid bodies to link")));
+    if world.bodies.is_empty() {
+        return Err(EngineError::Other(format!("{shown}: the design has no bodies to link")));
     }
-    let step = solidcraft_io::export(&part.doc.painted_for_link(&world), &solids, solidcraft_io::Format::Step, &name)
-        .map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    let mut feature = solidcraft_io::step_import_feature(&step, shown).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    if world.bodies.len() > solids.len() {
-        feature.warnings.push(format!("{} mesh bodies of {shown} are not linked", world.bodies.len() - solids.len()));
-    }
+    let mut feature = if solids.is_empty() {
+        solidcraft_io::StepFeature {
+            name: name.clone(),
+            kind: FeatureKind::Import { file: shown.into(), step: "".into(), components: Vec::new(), skip: Vec::new(), meshes: Vec::new() },
+            body_names: Vec::new(),
+            warnings: Vec::new(),
+            import: std::sync::Arc::new(solidcraft_kernel::StepImport {
+                bodies: Vec::new(), tree: Vec::new(), warnings: Vec::new(), report: Default::default(),
+                schema: String::new(), system: String::new(), preprocessor: String::new(), description: String::new(),
+            }),
+        }
+    } else {
+        let step = solidcraft_io::export(&part.doc.painted_for_link(&world), &solids, solidcraft_io::Format::Step, &name)
+            .map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
+        solidcraft_io::step_import_feature(&step, shown).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?
+    };
     // The STEP text keeps no face names: carry the design's own, so references into the linked
     // bodies follow them as they do inside the design (#3330).
-    let faces = solidcraft_doc::naming::carried_face_names(&world, &feature.import.bodies);
-    let properties = feature
+    let mut faces = solidcraft_doc::naming::carried_face_names(&world, &feature.import.bodies);
+    let mut properties = feature
         .import
         .bodies
         .iter()
@@ -342,6 +388,30 @@ fn session_bodies(part: &Session, shown: &str) -> Result<Linked> {
             Ok(SourceProperties { material, definition, appearance, faces })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Keep native indexed scan data: STEP is only for B-rep bodies. The evaluated
+    // world frame includes source component and occurrence placements exactly once.
+    for source in world.bodies.iter().filter(|body| body.body.is_mesh()) {
+        let (positions, triangles) = source.body.triangle_mesh()
+            .ok_or_else(|| EngineError::Other(format!("{shown}: mesh {} has no triangles", source.name)))?;
+        let normals = source.body.triangle_corner_normals().unwrap_or_default();
+        let mesh = solidcraft_doc::MeshData {
+            name: source.name.clone(),
+            positions: positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
+            triangles: triangles.iter().flatten().copied().collect(),
+            corner_normals: normals.iter().flatten().flat_map(|p| [p.x, p.y, p.z]).collect(),
+            color: source.body.color(),
+            appearance: source.mesh_appearance.clone(),
+        };
+        feature.body_names.push(source.name.clone());
+        faces.push(Vec::new());
+        let key = source.definition_name();
+        let material = part.doc.body_material(key);
+        let definition = if solidcraft_doc::material_density(&material).is_none() { part.doc.user_material(&material).cloned() } else { None };
+        let appearance = part.doc.appearances.bodies.get(key).cloned()
+            .or_else(|| part.doc.appearances.components.get(&part.doc.model_body_component(source)).cloned());
+        properties.push(SourceProperties { material, definition, appearance, faces: Vec::new() });
+        if let FeatureKind::Import { meshes, .. } = &mut feature.kind { meshes.push(mesh); }
+    }
     Ok((name, feature, faces, part.doc.metadata.clone(), properties))
 }
 
@@ -653,7 +723,7 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
         };
         // A window running this off its thread names the design being read again (#5329).
         solidcraft_doc::progress::item(Some((&cname, index, count)));
-        let (old, file, bytes) = match read_linked(s, comp, &link) {
+        let (old, old_meshes, file, bytes) = match read_linked(s, comp, &link) {
             Ok(read) => read,
             Err(e) if go_on => {
                 failed.push(LinkFailure { component: comp, name: cname.clone(), error: e.clone() });
@@ -676,7 +746,7 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
             .feature(link.feature)
             .filter(|_| !link.inherited.is_empty() && link.inherited.iter().all(|p| p.faces.is_some()))
             .map(|f| digest(f.link_faces.as_slice()));
-        if let Some((known, properties)) = kept_faces.and_then(|faces| unchanged_read(&file, digest(bytes.as_slice()), digest(old.as_bytes()), faces))
+        if let Some((known, properties)) = kept_faces.and_then(|faces| unchanged_read(&file, digest(bytes.as_slice()), digest(old.as_bytes()), mesh_digest(&old_meshes), faces))
         {
             warnings.extend(known);
             // Another component or session may have evaluated this source first. Its
@@ -702,7 +772,7 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
             Err(e) => return Err(bad(cmd, format!("{cname}: {e}"))),
         };
         warnings.extend(sf.warnings.iter().cloned());
-        let same = matches!(&sf.kind, FeatureKind::Import { step, .. } if *step == old);
+        let same = matches!(&sf.kind, FeatureKind::Import { step, meshes, .. } if *step == old && *meshes == old_meshes);
         let kept = s.doc.feature(link.feature).map(|f| &f.link_faces);
         if same && kept == Some(&faces) {
             if inherit_properties(s, comp, &properties)? {
@@ -756,14 +826,14 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// `comp`'s linked design as it was last read (its bodies) and as its file is now, read before
 /// anything in the design changes.
-fn read_linked(s: &Session, comp: u64, link: &DesignLink) -> std::result::Result<(std::sync::Arc<str>, PathBuf, Vec<u8>), String> {
-    let Some(FeatureKind::Import { step: old, .. }) = s.doc.feature(link.feature).filter(|f| f.component == comp).map(|f| &f.kind) else {
+fn read_linked(s: &Session, comp: u64, link: &DesignLink) -> std::result::Result<(std::sync::Arc<str>, Vec<solidcraft_doc::MeshData>, PathBuf, Vec<u8>), String> {
+    let Some(FeatureKind::Import { step: old, meshes, .. }) = s.doc.feature(link.feature).filter(|f| f.component == comp).map(|f| &f.kind) else {
         return Err(format!("its linked bodies (feature {}) are gone; break the link or insert the design again", link.feature));
     };
     link_refused(s.path.as_deref(), &link.path).map_err(|e| e.to_string())?;
     let file = resolve(s.path.as_deref(), &link.path);
     let bytes = read_link(&file, s.path.as_deref()).map_err(|e| e.to_string())?;
-    Ok((old.clone(), file, bytes))
+    Ok((old.clone(), meshes.clone(), file, bytes))
 }
 
 /// The joints and joint origins on occurrences of `comp` that name its linked faces by their
@@ -809,7 +879,7 @@ fn relink(s: &mut Session, p: &Value) -> Result<Value> {
     // undo step and restores both the document and evaluated state on any later failure.
     let ((_, sf, faces, _, properties), read) = linked_bodies_read(&file, s.path.as_deref(), s.validation()).map_err(|e| bad(cmd, e.to_string()))?;
     let geometry_changed = match (s.doc.feature(link.feature).map(|f| &f.kind), &sf.kind) {
-        (Some(FeatureKind::Import { step: old, .. }), FeatureKind::Import { step, .. }) => old != step,
+        (Some(FeatureKind::Import { step: old, meshes: old_meshes, .. }), FeatureKind::Import { step, meshes, .. }) => old != step || old_meshes != meshes,
         _ => true,
     };
     let path = stored(s.path.as_deref(), &file);
@@ -896,7 +966,7 @@ fn relink_placement(s: &mut Session, comp: u64, link: &DesignLink, occurrence: u
     let linked = made["component"].as_u64().ok_or_else(|| bad(cmd, "the linked component was not created"))?;
     let feature = s.doc.links.get(&linked).map(|l| l.feature).ok_or_else(|| bad(cmd, "the design was not linked"))?;
     let geometry_changed = match (s.doc.feature(link.feature).map(|f| &f.kind), s.doc.feature(feature).map(|f| &f.kind)) {
-        (Some(FeatureKind::Import { step: was, .. }), Some(FeatureKind::Import { step, .. })) => was != step,
+        (Some(FeatureKind::Import { step: was, meshes: old_meshes, .. }), Some(FeatureKind::Import { step, meshes, .. })) => was != step || old_meshes != meshes,
         _ => true,
     };
     let mut warnings: Vec<String> = made["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect();
@@ -1007,6 +1077,95 @@ mod tests {
 
     fn run(s: &mut Session, id: &str, p: Value) -> Value {
         s.execute(id, &p).unwrap_or_else(|e| panic!("{id} {p}: {e}"))
+    }
+
+    fn linked_scan_fixture(path: &Path, shift: f64, color: u8, solid: bool) {
+        use solidcraft_geom::mesh_appearance::{MeshAppearance, MeshMaterial, MeshTexture};
+        let mut doc = Document::default();
+        doc.name = "Scan part".into();
+        let mesh = solidcraft_doc::MeshData {
+            name: "Scan".into(), positions: vec![shift, 0., 0., shift + 10., 0., 0., shift, 10., 0.].into(),
+            triangles: vec![0, 1, 2].into(), corner_normals: vec![0., 0., 1., 0., 0., 1., 0., 0., 1.].into(),
+            color: Some([0.2, 0.3, 0.4]),
+            appearance: Some(std::sync::Arc::new(MeshAppearance {
+                corner_uvs: vec![[[0.,0.],[1.,0.],[0.,1.]]].into(),
+                corner_colors: vec![[[color,20,30,255];3]].into(), triangle_materials: vec![0].into(),
+                materials: vec![MeshMaterial { name: "Paint".into(), base_color: [1.;4], texture: Some(MeshTexture {
+                    name: "pixel.png".into(), mime_type: "image/png".into(),
+                    bytes: vec![137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,11,73,68,65,84,120,156,99,248,15,4,0,9,251,3,253,251,94,107,43,0,0,0,0,73,69,78,68,174,66,96,130].into(),
+                }) }].into(),
+            })),
+        };
+        doc.add_feature(FeatureKind::MeshImport { file: "scan.obj".into(), meshes: vec![mesh] }, Some("Scan")).unwrap();
+        let mut part = Session::new(doc);
+        if solid { run(&mut part, "solid.box", json!({"length":2,"width":3,"height":4})); }
+        run(&mut part, "file.save", json!({"path":path,"cache":false}));
+    }
+
+    fn linked_scan_snapshot(s: &Session) -> (Vec<[f64;3]>, Vec<[u32;3]>, Option<std::sync::Arc<solidcraft_geom::mesh_appearance::MeshAppearance>>) {
+        let world = s.world_state().unwrap();
+        let scan = world.bodies.iter().find(|b| b.body.is_mesh()).unwrap();
+        let (points, triangles) = scan.body.triangle_mesh().unwrap();
+        assert_eq!(scan.body.triangle_corner_normals().unwrap().len(), 1);
+        (points.iter().map(|p| [p.x,p.y,p.z]).collect(),triangles.to_vec(),scan.mesh_appearance.clone())
+    }
+
+    #[test]
+    fn linked_scan_insert_update_relink_reopen_and_undo_keep_textures() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-linked-scans-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("scan.sc"); let other = dir.join("replacement.sc"); let assembly = dir.join("assembly.sc");
+        for mixed in [false,true] {
+            linked_scan_fixture(&part, 0., 50, mixed);
+            let mut s = Session::default();
+            let r = run(&mut s,"component.insert_design",json!({"path":part,"translate":[30,40,50]}));
+            let linked_name = r["name"].as_str().unwrap().to_owned();
+            let comp = r["component"].as_u64().unwrap(); let feature = r["feature"].as_u64().unwrap();
+            assert_eq!(s.world_state().unwrap().bodies.len(),if mixed {2} else {1});
+            let initial = linked_scan_snapshot(&s);
+            assert_eq!(initial.0[0],[30.,40.,50.]); assert!(initial.2.is_some());
+            run(&mut s,"file.save",json!({"path":assembly}));
+            let mut opened = Session::default();run(&mut opened,"doc.open",json!({"path":assembly}));
+            assert_eq!(linked_scan_snapshot(&opened),initial);
+            assert_eq!(run(&mut opened,"component.update_links",json!({}))["unchanged"],json!([linked_name]));
+            // Appearance-only edits must invalidate the linked payload, too.
+            linked_scan_fixture(&part,0.,90,mixed);
+            assert_eq!(run(&mut opened,"component.update_links",json!({}))["updated"],json!([linked_name]));
+            let edited = linked_scan_snapshot(&opened);assert_eq!(edited.0,initial.0);assert_ne!(edited.2,initial.2);
+            assert_eq!(opened.doc.links[&comp].feature,feature);
+            run(&mut opened,"edit.undo",json!({}));assert_eq!(linked_scan_snapshot(&opened),initial);
+            // The read cache must not mistake the undone old scan for the newest payload.
+            assert_eq!(run(&mut opened,"component.update_links",json!({}))["updated"],json!([linked_name]));
+            linked_scan_fixture(&other,5.,100,mixed);
+            let result=run(&mut opened,"component.relink",json!({"component":comp,"path":other}));assert_eq!(result["geometry_changed"],true);
+            assert_eq!(linked_scan_snapshot(&opened).0[0],[35.,40.,50.]);
+            let replaced=linked_scan_snapshot(&opened);
+            run(&mut opened,"component.break_link",json!({"component":comp}));assert!(opened.doc.links.is_empty());assert_eq!(linked_scan_snapshot(&opened),replaced);
+            run(&mut s,"edit.undo",json!({}));assert!(s.doc.links.is_empty());assert!(s.model.state().bodies.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn linked_scan_uses_source_world_placements_and_destination_parent_once() {
+        let dir=std::env::temp_dir().join(format!("solidcraft-linked-scan-placement-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap(); let path=dir.join("placed.sc");
+        linked_scan_fixture(&path,0.,50,false);
+        let mut source=Session::default();run(&mut source,"doc.open",json!({"path":path}));
+        let created=run(&mut source,"component.create",json!({"name":"Source scan","activate":false}));
+        let comp=created["component"].as_u64().unwrap();
+        source.doc_mut().features[0].component=comp;source.refresh();
+        run(&mut source,"occurrence.move",json!({"occurrence":created["occurrence"],"translate":[10,20,30],"axis":[0,0,1],"angle":"90 deg","move_grounded":true}));
+        let source_geometry=linked_scan_snapshot(&source);assert_eq!(source_geometry.0[0],[10.,20.,30.]);
+        run(&mut source,"file.save",json!({"path":path}));
+        let mut assembly=Session::default();
+        let parent=run(&mut assembly,"component.create",json!({"name":"Parent","activate":false}));
+        run(&mut assembly,"occurrence.move",json!({"occurrence":parent["occurrence"],"translate":[100,0,0],"move_grounded":true}));
+        run(&mut assembly,"component.insert_design",json!({"path":path,"parent":parent["component"],"translate":[0,50,0]}));
+        let actual=linked_scan_snapshot(&assembly);
+        for (a,b) in actual.0.iter().zip(&source_geometry.0){assert!((a[0]-b[0]-100.).abs()<1e-9);assert!((a[1]-b[1]-50.).abs()<1e-9);assert!((a[2]-b[2]).abs()<1e-9);}
+        assert_eq!(actual.1,source_geometry.1);assert_eq!(actual.2,source_geometry.2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn save_box(path: &Path, height: f64) {

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "cadmpeg-codec-nx"
+description = "Read Parasolid geometry and topology from NX .prt files."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+# Golden decode snapshots are a repository-side regression asset, not part of
+# the published API. They dominate the packaged crate (66MB of 70MB for the
+# FreeCAD codec) and a registry consumer cannot act on them. CI runs the golden
+# tests from the repository checkout.
+exclude = ["tests/golden/**"]
+readme = "README.md"
+documentation = "https://docs.rs/cadmpeg-codec-nx"
+keywords = ["cad", "siemens-nx", "parasolid", "prt", "geometry"]
+categories = ["encoding", "parser-implementations", "graphics"]
+
+[dependencies]
+cadmpeg-core.workspace = true
+cadmpeg-ir.workspace = true
+cadmpeg-container.workspace = true
+cadmpeg-parasolid.workspace = true
+flate2.workspace = true
+roxmltree.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+cadmpeg-ir = { workspace = true, features = ["examples"] }
+cadmpeg-parasolid = { workspace = true, features = ["test-support"] }
+
+# Test-only golden harness and round-trip helpers.
+cadmpeg-test-support = { workspace = true }
+
+[[bin]]
+name = "nx_profile"
+path = "src/bin/nx_profile.rs"
+
+# Local census helper. cargo-dist would otherwise ship it as a release app.
+[package.metadata.dist]
+dist = false
+
+[lints]
+workspace = true

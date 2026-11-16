@@ -1,0 +1,23 @@
+{
+  "en": {
+    "move.snap.auto": "Automatic",
+    "move.snap.axis_x": "Align X",
+    "move.snap.axis_y": "Align Y",
+    "move.snap.axis_z": "Align Z",
+    "move.snap.cancel": "Cancel pick",
+    "move.snap.center": "Circle / face center",
+    "move.snap.flip": "Reverse axis",
+    "move.snap.intersection": "Virtual intersection",
+    "move.snap.midpoint": "Edge midpoint",
+    "move.snap.mode": "Snap target",
+    "move.snap.origin": "Pick origin",
+    "move.snap.point": "On geometry",
+    "move.snap.prompt": "Pick a vertex, edge or face in the viewport.",
+    "move.snap.second_edge": "Pick the second straight edge. Skew edges cannot intersect.",
+    "move.snap.unavailable": "No compatible exact geometry here. Choose another target or snap type.",
+    "move.snap.first_edge": "Pick the first straight edge, then a second edge. Their extensions define the virtual corner.",
+    "move.snap.first_selected": "First edge selected",
+    "move.snap.center_prompt": "Pick a circular edge or a cylindrical or conical face.",
+    "move.snap.inference_hint": "Hover an edge or curved face, then click its marker. Hover two straight edges to reveal their virtual corner."
+  }
+}

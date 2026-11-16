@@ -1,0 +1,6 @@
+{
+  "en": {
+    "ui.3d_mouse_add_button": "Add button mapping",
+    "ui.3d_mouse_add_button_hint": "Add numbered buttons to configure them before pressing them. Press a device button to identify its row; it lights up here without running its command. Mappings are saved for this device only."
+  }
+}

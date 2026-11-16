@@ -1,0 +1,9 @@
+{
+  "en": {
+    "prefs.move_inference_markers": "Infer move snap targets on hover",
+    "prefs.move_inference_markers.help": "Show clickable centers, midpoints and virtual corners while hovering over geometry in Move. Turn off to use the previous explicit picker."
+  },
+  "en-GB": {
+    "prefs.move_inference_markers.help": "Show clickable centres, midpoints and virtual corners while hovering over geometry in Move. Turn off to use the previous explicit picker."
+  }
+}

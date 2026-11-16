@@ -589,3 +589,16 @@ mod tests {
         assert!(parse::<Points<[f64; 3]>>(&json!({"points": [[1, 2]]})).is_err());
     }
 }
+
+/// Review or apply a user shortcut file without opening a file picker.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShortcutImport {
+    pub text: Option<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default)]
+    pub replace: bool,
+}

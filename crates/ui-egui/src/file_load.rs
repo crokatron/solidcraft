@@ -501,7 +501,7 @@ pub fn begin_request(app: &mut SolveApp, mut request: Request) -> Result<(), Str
                 let (command, params) = request.command();
                 let r = app.run(command, params);
                 if r.is_ok() && !request.path.is_empty() {
-                    app.set_status(solidcraft_ui_text::format("ui.saved_to", &[("path", &request.path)]), false);
+                    app.set_file_status(solidcraft_ui_text::format("notifications.exported", &[("path", &request.path)]), &request.path);
                 }
                 r
             }
@@ -1506,7 +1506,7 @@ fn land_now(app: &mut SolveApp, mut running: Running) {
         match job {
             Ok(made) if request.kind == Kind::ExportDxf => {
                 if !request.path.is_empty() {
-                    app.set_status(solidcraft_ui_text::format("ui.saved_to", &[("path", &request.path)]), false);
+                    app.set_file_status(solidcraft_ui_text::format("notifications.exported", &[("path", &request.path)]), &request.path);
                 }
                 request.answer(Ok(made.result));
             }
@@ -1583,7 +1583,7 @@ fn land_now(app: &mut SolveApp, mut running: Running) {
                 if let Kind::Recover { .. } = request.kind {
                     recovered(app, request);
                 } else {
-                    app.set_status(
+                    app.set_file_status(
                         if made.result.get("read_only").and_then(Value::as_bool) == Some(true) {
                             solidcraft_ui_text::tr("document.opened_read_only").to_string()
                         } else if let Some(summary) = crate::timeline::import_status(app, &made.result) {
@@ -1615,7 +1615,7 @@ fn land_now(app: &mut SolveApp, mut running: Running) {
                             };
                             language.format(key, &[("name", &name)])
                         },
-                        false,
+                        &request.path,
                     );
                     if !request.insert() {
                         app.say_newer_file();
@@ -2249,6 +2249,7 @@ mod tests {
                 triangles: vec![0, 1, 2].into(),
                 color: Some([0.8, 0.2, 0.1]),
                 corner_normals: Default::default(),
+                appearance: None,
             }],
         };
         let picture = saved_picture(preview).unwrap();
@@ -2266,6 +2267,7 @@ mod tests {
                 triangles: (0..10_000).flat_map(|_| [0, 1, 2]).collect(),
                 color: None,
                 corner_normals: Default::default(),
+                appearance: None,
             }],
         };
         assert!(saved_picture(preview).is_none());

@@ -1409,8 +1409,12 @@ preference_settings! {
     /// Feature windows choose Join, New Body or Cut from what their material touches (`op_auto`,
     /// #6901). Off: they keep the operation they open with (Extrude its own Join or Cut), as before.
     auto_operation: bool = true, PAGE_TOOLS => check_id("prefs.auto_operation");
-    /// Reuse a command's safe values and options after it succeeds, until the app closes. Off by default: each dialog opens with its usual defaults.
-    remember_dialog_values: bool = false, PAGE_TOOLS => check_id_help("prefs.remember_dialog_values", "prefs.remember_dialog_values.help");
+    /// Reuse a command's safe values and options after it succeeds, including across restarts.
+    remember_dialog_values: bool = true, PAGE_TOOLS => check_id_help("prefs.remember_dialog_values", "prefs.remember_dialog_values.help");
+    /// Infer visible, clickable geometry targets while hovering in Move tools.
+    move_inference_markers: bool = true, PAGE_TOOLS => check_id_help("prefs.move_inference_markers", "prefs.move_inference_markers.help");
+    /// Last successful feature configurations. Geometry selections remain document-local.
+    command_dialog_values: BTreeMap<String, serde_json::Value> = BTreeMap::new(), PAGE_TOOLS;
     /// A new Solid Fillet opens at the radius the tool ships with, 2 mm, shown in the design's
     /// unit ("0.07874 in" in an inch design): a radius is bound by the faces beside its edges, and
     /// the number read in the design's unit ("2 in" = 50.8 mm) never fits the part (#12418). On: it
@@ -3150,10 +3154,26 @@ fn space_mouse_buttons(app: &mut SolveApp, ui: &mut egui::Ui) {
                 changed = true;
                 match choice {
                     Some(job) => jobs.insert(number, job),
-                    None => jobs.remove(&number),
+                    None => jobs.insert(number, crate::space_mouse::ButtonJob::Disabled),
                 };
             }
         }
+    });
+    ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
+        ui_kit::row(ui, "", |ui| {
+            let next = (1..=32).find(|number| !jobs.contains_key(number));
+            ui.add_enabled_ui(next.is_some(), |ui| {
+                let add = ui_kit::button(ui, solidcraft_ui_text::tr("ui.3d_mouse_add_button"), ui_kit::Button::Normal);
+                crate::scenario::publish_target("prefs:space_mouse_add_button", add.rect);
+                if add.clicked() {
+                    if let Some(number) = next {
+                        jobs.insert(number, crate::space_mouse::ButtonJob::Disabled);
+                        changed = true;
+                    }
+                }
+            });
+        });
+        hint_under_controls(ui, solidcraft_ui_text::tr("ui.3d_mouse_add_button_hint"), "space_mouse_button_setup");
     });
     if changed {
         app.preferences.space_mouse_buttons.insert(device.clone(), jobs);
@@ -3173,7 +3193,7 @@ fn space_mouse_buttons(app: &mut SolveApp, ui: &mut egui::Ui) {
 fn button_job_label(app: &SolveApp, job: Option<&crate::space_mouse::ButtonJob>) -> String {
     use crate::space_mouse::{ButtonJob, ButtonKey};
     match job {
-        None => solidcraft_ui_text::tr("ui.3d_mouse_button_nothing").to_string(),
+        None | Some(ButtonJob::Disabled) => solidcraft_ui_text::tr("ui.3d_mouse_button_nothing").to_string(),
         Some(ButtonJob::Settings) => solidcraft_ui_text::tr("ui.3d_mouse_button_settings").to_string(),
         Some(ButtonJob::View(view)) => {
             let mut name = view.clone();
@@ -3197,7 +3217,7 @@ fn button_job_label(app: &SolveApp, job: Option<&crate::space_mouse::ButtonJob>)
 fn button_job_value(job: Option<&crate::space_mouse::ButtonJob>) -> String {
     use crate::space_mouse::ButtonJob;
     match job {
-        None => "none".into(),
+        None | Some(ButtonJob::Disabled) => "none".into(),
         Some(ButtonJob::Settings) => "settings".into(),
         Some(ButtonJob::View(view)) => format!("view:{view}"),
         Some(ButtonJob::Key(key)) => format!("key:{key:?}"),
@@ -3216,7 +3236,10 @@ fn button_job_picker(
     use crate::space_mouse::{ButtonJob, ButtonKey};
     let views = ["home", "fit", "top", "front", "right", "left", "back", "bottom"].map(|view| ButtonJob::View(view.into()));
     let keys = [ButtonKey::Esc, ButtonKey::Shift, ButtonKey::Ctrl, ButtonKey::Alt].map(ButtonJob::Key);
-    let commands = solidcraft_engine::command_specs().into_iter().map(|spec| ButtonJob::Command(spec.id.into()));
+    let commands = solidcraft_engine::command_specs()
+        .into_iter()
+        .filter(|spec| solidcraft_engine::panels::ContextualPanelAction::from_command_id(spec.id).is_none())
+        .map(|spec| ButtonJob::Command(spec.id.into()));
     let jobs: Vec<Option<ButtonJob>> =
         [None, Some(ButtonJob::Settings)].into_iter().chain(views.into_iter().chain(keys).chain(commands).map(Some)).collect();
     let entries: Vec<(String, String)> = jobs.iter().map(|job| (button_job_value(job.as_ref()), button_job_label(app, job.as_ref()))).collect();
@@ -4755,18 +4778,30 @@ mod tests {
     }
 
     #[test]
-    fn command_dialog_value_memory_defaults_off_persists_and_resets() {
-        assert!(!Prefs::default().remember_dialog_values);
+    fn move_inference_markers_default_on_persist_and_reset() {
         let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
-        assert!(!app.preferences.remember_dialog_values);
-        app.preferences.remember_dialog_values = true;
-        assert_eq!(serde_json::to_value(&app.preferences).unwrap()["remember_dialog_values"], true);
+        assert!(app.preferences.move_inference_markers);
+        set(&mut app, &json!({"move_inference_markers":false})).unwrap();
+        let mut restored = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        restored.load_prefs(&app.prefs());
+        assert!(!restored.preferences.move_inference_markers);
+        reset_preferences(&mut app.preferences, PAGE_TOOLS);
+        assert!(app.preferences.move_inference_markers);
+    }
+
+    #[test]
+    fn command_dialog_value_memory_defaults_on_persists_and_resets() {
+        assert!(Prefs::default().remember_dialog_values);
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        assert!(app.preferences.remember_dialog_values);
+        app.preferences.remember_dialog_values = false;
+        assert_eq!(serde_json::to_value(&app.preferences).unwrap()["remember_dialog_values"], false);
 
         let mut restored = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
         restored.load_prefs(&app.prefs());
-        assert!(restored.preferences.remember_dialog_values);
+        assert!(!restored.preferences.remember_dialog_values);
         reset_preferences(&mut app.preferences, PAGE_TOOLS);
-        assert!(!app.preferences.remember_dialog_values);
+        assert!(app.preferences.remember_dialog_values);
     }
 
     #[test]
@@ -6307,6 +6342,20 @@ mod tests {
         assert_eq!(jobs["hid 046d:c62b"], [(1, ButtonJob::Key(ButtonKey::Esc)), (3, ButtonJob::Settings)].into());
         assert_eq!(jobs["hid 256f:c63a"], [(4, ButtonJob::View("top".into()))].into());
         assert!(!jobs.contains_key("spacenavd"));
+    }
+
+    #[test]
+    fn configured_space_mouse_rows_survive_reload_even_when_unassigned() {
+        use super::{Prefs, button_job_value};
+        use crate::space_mouse::ButtonJob;
+        let mut prefs = Prefs::default();
+        let device = "hid 256f:c652";
+        let mappings = [(1, ButtonJob::Disabled), (2, ButtonJob::Command("view.fit".into()))].into();
+        prefs.space_mouse_buttons.insert(device.into(), mappings);
+        let saved = serde_json::to_value(&prefs).expect("save preferences");
+        let restored: Prefs = serde_json::from_value(saved).expect("restore preferences");
+        assert_eq!(restored.space_mouse_buttons, prefs.space_mouse_buttons);
+        assert_eq!(button_job_value(Some(&ButtonJob::Disabled)), button_job_value(None));
     }
 
     /// A calibration as saved: the same text loads and is usable on 32 and 64 bits, and one saved

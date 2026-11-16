@@ -473,10 +473,12 @@ pub fn read_ply_mesh(bytes: &[u8], name: &str) -> Result<(Vec<MeshObject>, Vec<S
     let mut positions: Vec<Vec3> = Vec::new();
     let mut triangles: Vec<[u32; 3]> = Vec::new();
     let mut finite = true;
+    let mut colors = Vec::new();
     let r = walk(
         bytes,
         &mut |_| true,
-        &mut |([x, y, z], _)| {
+        &mut |([x, y, z], rgb)| {
+            colors.push(rgb);
             finite &= x.is_finite() && y.is_finite() && z.is_finite();
             positions.push(Vec3::new(x, y, z));
         },
@@ -492,7 +494,16 @@ pub fn read_ply_mesh(bytes: &[u8], name: &str) -> Result<(Vec<MeshObject>, Vec<S
     if r.bad_faces > 0 {
         warnings.push(format!("{} face(s) could not be read and were left out", r.bad_faces));
     }
-    Ok((vec![MeshObject { name: name.to_string(), positions, triangles, ..Default::default() }], warnings))
+    let appearance = if colors.iter().any(Option::is_some) {
+        let corner_colors: Vec<_> = triangles
+            .iter()
+            .map(|t| t.map(|i| colors.get(i as usize).copied().flatten().map(|[r, g, b]| [r, g, b, 255]).unwrap_or([255; 4])))
+            .collect();
+        Some(std::sync::Arc::new(solidcraft_geom::mesh_appearance::MeshAppearance { corner_colors: corner_colors.into(), ..Default::default() }))
+    } else {
+        None
+    };
+    Ok((vec![MeshObject { name: name.to_string(), positions, triangles, appearance, ..Default::default() }], warnings))
 }
 
 #[cfg(test)]

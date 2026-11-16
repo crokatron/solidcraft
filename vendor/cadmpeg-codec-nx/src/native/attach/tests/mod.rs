@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::native::attach::feature_projection::hole_body_projection;
+use crate::native::attach::feature_projection::simple_hole_operations;
+use cadmpeg_ir::document::CadIr;
+use cadmpeg_ir::ids::BodyId;
+use cadmpeg_ir::scalar::Length;
+use std::collections::BTreeMap;
+
+fn hole_diameters_for_operations(
+    ir: &CadIr,
+    operations: &[String],
+    outputs: &BTreeMap<String, Vec<BodyId>>,
+) -> BTreeMap<String, Length> {
+    {
+        hole_body_projection(ir, operations, outputs)
+            .map(|projection| projection.diameters)
+            .unwrap_or_default()
+    }
+}
+
+fn simple_hole_diameters(
+    ir: &CadIr,
+    templates: &[crate::native::features::holes::FeatureSimpleHoleTemplate],
+    groups: &[crate::native::features::holes::FeatureSimpleHoleConstructionGroup],
+    outputs: &BTreeMap<String, Vec<BodyId>>,
+) -> BTreeMap<String, Length> {
+    let operation_positions = templates
+        .iter()
+        .enumerate()
+        .map(|(position, template)| (template.operation_label.as_str(), position))
+        .collect::<BTreeMap<_, _>>();
+
+    let Some(operations) = simple_hole_operations(templates, groups, &operation_positions) else {
+        return BTreeMap::new();
+    };
+    hole_diameters_for_operations(ir, &operations, outputs)
+}
+
+mod blend;
+mod body_writes;
+mod brep;
+mod bridge_curve;
+mod cone;
+mod configuration;
+mod configuration_attachment;
+mod copy_face;
+mod cylinder;
+mod delete_face;
+mod enlarge;
+mod extract_datum_axis;
+mod extract_face;
+mod fill_hole;
+mod holes_offsets_and_attributes;
+mod indexing;
+mod linked_face;
+mod material_assets;
+mod mirror_face;
+mod move_face;
+mod move_object;
+mod operation_sources;
+mod operations_and_holes;
+mod part_attributes;
+mod shell;
+mod sketches;
+mod sphere;
+mod subdivision_body;
+mod sweep;
+mod symbolic_thread;
+mod thread;
+mod through_curve_mesh;
+mod topology_optimization;
+mod trim_body;

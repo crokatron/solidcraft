@@ -932,6 +932,7 @@ pub fn tool_for(id: &str) -> Option<Tool> {
     mode(id)?;
     let spec = solidcraft_engine::find_command(id)?;
     Some(Tool {
+        placement: Default::default(),
         cmd: spec.id,
         kind: Kind::Ext,
         pts: Vec::new(),

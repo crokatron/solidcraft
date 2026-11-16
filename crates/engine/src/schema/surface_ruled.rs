@@ -55,6 +55,33 @@ pub struct SurfaceRuledParams {
     pub common: FeatureCommon,
 }
 
+/// Extrude a chain of body edges or extend its supporting surface.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct EdgeExtrudeParams {
+    pub body: String,
+    pub edges: RuledEdges,
+    pub distance: LengthExpr,
+    #[serde(default)]
+    pub mode: Option<EdgeExtrudeMode>,
+    #[serde(default)]
+    pub direction: Option<RuledDirection>,
+    #[serde(default)]
+    pub face: Option<RuledFace>,
+    #[serde(default)]
+    pub flip: Option<bool>,
+    #[serde(flatten, deserialize_with = "feature_common")]
+    pub common: FeatureCommon,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeExtrudeMode {
+    Direction,
+    Normal,
+    Extend,
+}
+
 /// The handler's message for `body` when it isn't text.
 fn body<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     match Value::deserialize(d)? {

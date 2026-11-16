@@ -15,12 +15,35 @@ use crate::schema::sketch_3d::{Curves3dResult, Line3dParams, Move3dParams, Move3
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{Result, Session};
 
+#[path = "sketch_fillet3d.rs"]
+mod fillet;
+
 const LINE3D_CONTRACT: TypedContract<Line3dParams> = TypedContract::new();
 const SPLINE3D_CONTRACT: TypedContract<Spline3dParams> = TypedContract::new();
 const POINT3D_CONTRACT: TypedContract<Point3dParams> = TypedContract::new();
 const MOVE3D_CONTRACT: TypedContract<Move3dParams> = TypedContract::new();
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("sketch.dimension3d", "3D Dimension", crate::checked!("sketch.dimension3d", dimension3d))
+        .icon("dimension").enabled(in_sketch)
+        .contract(&TypedContract::<crate::schema::sketch_3d::Dimension3dParams>::new())
+        .output(output_schema_for::<crate::schema::sketch_3d::Dimension3dResult>)
+        .params("kind: distance|x|y|z|radius|angle|fix, a: editable 3D curve or fit-point ID, b?: second operand, value?: mm or degrees for angle; signed axis dimensions use B minus A in the stored curve frame, not the camera. A bare line measures its endpoints. Fix on a bare curve holds every defining point."),
+    CommandSpec::new("sketch.dimension3d.edit", "Edit 3D Dimension", crate::checked!("sketch.dimension3d.edit", edit_dimension3d))
+        .icon("dimension").enabled(in_sketch)
+        .contract(&TypedContract::<crate::schema::sketch_3d::EditDimension3dParams>::new())
+        .output(output_schema_for::<crate::schema::sketch_3d::Dimension3dResult>)
+        .params("id: saved 3D dimension ID, value: new mm or degrees for angle; conflicting edits leave the design unchanged"),
+    CommandSpec::new("sketch.freedom3d", "3D Sketch Freedom", crate::checked!("sketch.freedom3d", freedom3d))
+        .icon("dimension").noundo()
+        .contract(&TypedContract::<crate::schema::sketch_3d::Freedom3dParams>::new())
+        .output(output_schema_for::<crate::schema::sketch_3d::Freedom3dResult>)
+        .params("sketch?: target sketch; report instantaneous spatial DOF and each point's admissible movement directions, including rigid motion. No document changes."),
+    CommandSpec::new("sketch.fillet3d", "3D Sketch Fillet", crate::checked!("sketch.fillet3d",fillet::run))
+        .icon("sketch_fillet").enabled(in_sketch_3d)
+        .contract(&TypedContract::<crate::schema::sketch_3d::Fillet3dParams>::new())
+        .output(output_schema_for::<Curves3dResult>)
+        .params("curves: two editable straight line IDs in the active 3D sketch, radius: positive length in mm or expression; trim each line to meet an exact tangent circular arc"),
     CommandSpec::new("sketch.line3d", "3D Line", crate::checked!("sketch.line3d", line3d))
         .icon("line")
         .enabled(in_sketch_3d)
@@ -213,3 +236,82 @@ fn move3d(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 #[path = "sketch_3d_frame_tests.rs"]
 mod frame_tests;
+
+/// Route existing Coincident/Tangent buttons to actual spatial relations before any planar
+/// projection. One spatial operand paired with a planar entity is refused explicitly.
+pub(super) fn constrain_3d(s: &mut Session, p: &Value, kind: solidcraft_sketch::wire_constraints::Relation) -> Result<Option<Value>> {
+    let cmd =
+        if kind == solidcraft_sketch::wire_constraints::Relation::Coincident { "sketch.constraint.coincident" } else { "sketch.constraint.tangent" };
+    let id = sketch_store::target(s, p, cmd)?;
+    let prefix = format!("{id}:");
+    let name = |key| p.get(key).and_then(Value::as_str).map(|s| s.strip_prefix(&prefix).unwrap_or(s).to_string());
+    let a = name("a");
+    let b = name("b");
+    let sk = sketch_store::read(&s.doc, id)?;
+    if ![a.as_deref(), b.as_deref()].into_iter().flatten().any(|id| sk.wire_operand(id).is_some()) {
+        return Ok(None);
+    }
+    let (Some(a), Some(b)) = (a, b) else {
+        return Err(bad(cmd, "3D constraints need two editable spatial curve or endpoint ids"));
+    };
+    let (constraint, info) = edit(s, p, cmd, true, |sk, _| Ok(sk.add_wire_constraint(kind, &a, &b)?))?;
+    Ok(Some(json!({"constraint":constraint,"sketch":info})))
+}
+
+fn dimensional_kind(name: &str) -> Option<solidcraft_sketch::wire_constraints::Relation> {
+    use solidcraft_sketch::wire_constraints::Relation::*;
+    Some(match name {
+        "distance" => Distance,
+        "x" => DeltaX,
+        "y" => DeltaY,
+        "z" => DeltaZ,
+        "radius" => Radius,
+        "angle" => Angle,
+        "fix" => Fix,
+        _ => return None,
+    })
+}
+fn dimension3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "sketch.dimension3d";
+    let kind = p
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(dimensional_kind)
+        .ok_or_else(|| bad(cmd, "kind must be distance, x, y, z, radius, angle or fix"))?;
+    let target = sketch_store::target(s, p, cmd)?;
+    let prefix = format!("{target}:");
+    let a = p.get("a").and_then(Value::as_str).ok_or_else(|| bad(cmd, "a must name a spatial curve or fit point"))?;
+    let a = a.strip_prefix(&prefix).unwrap_or(a);
+    let b = p.get("b").map(|v| v.as_str().ok_or_else(|| bad(cmd, "b must name a spatial curve or fit point"))).transpose()?;
+    let b = b.map(|b| b.strip_prefix(&prefix).unwrap_or(b));
+    use solidcraft_sketch::wire_constraints::Relation;
+    let value = if kind == Relation::Fix {
+        0.
+    } else {
+        p.get("value").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad(cmd, "value must be a finite number"))?
+    };
+    let value = if kind == Relation::Angle { value.to_radians() } else { value };
+    let (constraints, info) = edit(s, p, cmd, true, |sk, _| {
+        Ok(if kind == Relation::Fix { sk.fix_wire_geometry(a)? } else { vec![sk.add_wire_dimension(kind, a, b, value)?] })
+    })?;
+    reply(cmd, crate::schema::sketch_3d::Dimension3dResult { constraints, sketch: info })
+}
+fn edit_dimension3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "sketch.dimension3d.edit";
+    let id = p.get("id").and_then(Value::as_str).ok_or_else(|| bad(cmd, "id must name a 3D dimension"))?;
+    let value = p.get("value").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad(cmd, "value must be finite"))?;
+    let (_, info) = edit(s, p, cmd, true, |sk, _| {
+        let c = sk.wire_constraints.iter().find(|c| c.id == id).ok_or_else(|| bad(cmd, "unknown 3D dimension"))?;
+        let value = if c.kind == solidcraft_sketch::wire_constraints::Relation::Angle { value.to_radians() } else { value };
+        Ok(sk.set_wire_dimension(id, value)?)
+    })?;
+    reply(cmd, crate::schema::sketch_3d::Dimension3dResult { constraints: vec![id.into()], sketch: info })
+}
+fn freedom3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "sketch.freedom3d";
+    let id = sketch_store::target(s, p, cmd)?;
+    let freedom = sketch_store::read(&s.doc, id)?.wire_freedom();
+    let result: crate::schema::sketch_3d::Freedom3dResult =
+        serde_json::from_value(serde_json::to_value(freedom).map_err(|e| bad(cmd, e.to_string()))?).map_err(|e| bad(cmd, e.to_string()))?;
+    reply(cmd, result)
+}

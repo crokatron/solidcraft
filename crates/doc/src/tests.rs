@@ -10,6 +10,278 @@ fn rel(a: f64, b: f64) -> f64 {
 }
 
 #[test]
+fn automatic_regions_are_deterministic_across_scan_seams_and_manifold_boundaries() {
+    use crate::MeshData;
+    let vertex = |x: f64, y: f64, z: f64| [x, y, z];
+    let a = vertex(0., 0., 0.);
+    let b = vertex(1., 0., 0.);
+    let c = vertex(1., 1., 0.);
+    let d = vertex(0., 1., 0.);
+    let mesh = |faces: Vec<[[f64; 3]; 3]>| {
+        let positions = faces.iter().flatten().flatten().copied().collect::<Vec<_>>();
+        MeshData {
+            appearance: None,
+            name: "Test".into(),
+            triangles: (0..positions.len() as u32 / 3).collect::<Vec<_>>().into(),
+            positions: positions.into(),
+            color: None,
+            corner_normals: Default::default(),
+        }
+    };
+    let data = mesh(vec![[a, b, c], [a, c, d], [b, a, vertex(0., 0., 1.)], [a, vertex(-1., 0., 0.), vertex(0., -1., 0.)], [a, a, a]]);
+    let (ids, groups) = data.segment_scan(25.).unwrap();
+    assert_eq!(ids, [0, 0, 1, 2, u32::MAX]);
+    assert_eq!(groups, [(0, 2), (2, 1), (3, 1)]);
+    assert_eq!(data.segment_scan(90.).unwrap().1, [(0, 3), (3, 1)]);
+    assert!(data.segment_scan(f64::NAN).is_err());
+    let contact = mesh(vec![[a, b, c], [b, a, d], [a, b, vertex(0., 0., 1.)]]);
+    assert_eq!(contact.segment_scan(180.).unwrap().1.len(), 3);
+    let mut kept = data.clone();
+    kept.retain_scan_facets(&[[0, 0], [2, 3]], true).unwrap();
+    assert_eq!(kept.triangles.len(), 9);
+    let before = kept.triangles.clone();
+    for invalid in [vec![[0, 2]], vec![[1, 0]], vec![[0, 1], [1, 2]], vec![[0, 3]]] {
+        assert!(kept.retain_scan_facets(&invalid, false).is_err());
+        assert_eq!(before, kept.triangles);
+    }
+}
+
+#[test]
+fn scan_region_anchors_to_seed_and_crosses_only_shared_edges() {
+    use crate::MeshData;
+    let mut points = Vec::<f64>::new();
+    let mut faces = Vec::<u32>::new();
+    let mut add = |tri: [[f64; 3]; 3]| {
+        for v in tri {
+            faces.push((points.len() / 3) as u32);
+            points.extend(v);
+        }
+    };
+    let (mut x, mut z) = (0., 0.);
+    for angle in [0.0f64, 15.0, 30.0] {
+        let (dz, dx) = angle.to_radians().sin_cos();
+        let a = [x, 0., z];
+        let b = [x + dx, 0., z + dz];
+        let c = [x + dx, 1., z + dz];
+        let d = [x, 1., z];
+        add([a, b, c]);
+        add([a, c, d]);
+        x += dx;
+        z += dz;
+    }
+    add([[0., 0., 0.], [-1., 0., 0.], [0., -1., 0.]]);
+    add([[2., 2., 2.]; 3]);
+    let normals = (0..faces.len() * 3).map(|i| i as f64).collect::<Vec<_>>();
+    let mut mesh = MeshData {
+        appearance: None,
+        name: "Scan".into(),
+        positions: points.into(),
+        triangles: faces.into(),
+        corner_normals: normals.clone().into(),
+        color: None,
+    };
+    assert_eq!(mesh.scan_region(0, 0.).unwrap(), vec![0, 1]);
+    assert_eq!(mesh.scan_region(0, 20.).unwrap(), vec![0, 1, 2, 3]);
+    assert_eq!(mesh.scan_region(0, 180.).unwrap(), vec![0, 1, 2, 3, 4, 5]);
+    for (picked, angle) in [(7, 90.), (99, 0.), (0, 181.), (0, -1.)] {
+        assert!(mesh.scan_region(picked, angle).is_err());
+    }
+    let mut outside = mesh.clone();
+    outside.edit_scan_region(0, 20., false).unwrap();
+    assert_eq!(outside.triangles.len(), 12);
+    assert_eq!(&*outside.corner_normals, &normals[36..]);
+    mesh.edit_scan_region(0, 20., true).unwrap();
+    assert_eq!(mesh.triangles.len(), 12);
+    assert_eq!(&*mesh.corner_normals, &normals[..36]);
+    let before = mesh.triangles.clone();
+    assert!(mesh.edit_scan_region(0, 180., false).is_err());
+    assert_eq!(mesh.triangles, before);
+}
+
+#[test]
+fn repair_caps_concave_openings_and_preserves_normals_and_winding() {
+    // Both ends of this L-shaped pipe are open. A fan could bridge the reentrant corner.
+    let contour = [[0., 0.], [3., 0.], [3., 1.], [1., 1.], [1., 3.], [0., 3.]];
+    let mut positions = Vec::new();
+    let mut triangles = Vec::new();
+    for z in [0., 2.] {
+        for [x, y] in contour {
+            positions.extend([x, y, z]);
+        }
+    }
+    for i in 0..6u32 {
+        let j = (i + 1) % 6;
+        triangles.extend([i, j, j + 6, i, j + 6, i + 6]);
+    }
+    let mut mesh = MeshData {
+        appearance: None,
+        name: "L".into(),
+        positions: positions.into(),
+        triangles: triangles.into(),
+        corner_normals: [0., 0., 1.].repeat(36).into(),
+        color: None,
+    };
+    let original = mesh.clone();
+    assert!(mesh.fill_scan_holes(5).is_err());
+    assert_eq!(mesh, original);
+    mesh.fill_scan_holes(6).unwrap();
+    assert_eq!(mesh.triangles.len() / 3, 20);
+    assert_eq!(mesh.triangles.len() * 3, mesh.corner_normals.len());
+    assert_eq!(&mesh.corner_normals[..original.corner_normals.len()], &*original.corner_normals);
+    let mut area = 0.;
+    for tri in mesh.triangles[36..].as_chunks::<3>().0 {
+        let [a, b, c] = tri.map(|i| {
+            let p = mesh.positions.as_chunks::<3>().0[i as usize];
+            Vec3::new(p[0], p[1], p[2])
+        });
+        area += (b - a).cross(c - a).len() * 0.5;
+    }
+    assert!((area - 10.).abs() < 1e-10);
+    let report = mesh.scan_topology().unwrap();
+    assert_eq!((report.boundary_edges, report.nonmanifold_edges, report.winding_conflicts), (0, 0, 0));
+    let closed = mesh.clone();
+    mesh.fill_scan_holes(6).unwrap();
+    assert_eq!(mesh, closed);
+}
+#[test]
+fn repair_orients_a_welded_scan_and_leaves_a_flat_outer_border_open() {
+    // A duplicated source vertex at each end of the diagonal belongs to the same STL seam.
+    let mut m = MeshData {
+        appearance: None,
+        name: "patch".into(),
+        positions: vec![0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 0., 0., 1., 1., 0., 0., 1., 0.].into(),
+        triangles: vec![0, 1, 2, 3, 5, 4].into(),
+        corner_normals: [0., 0., -1.].repeat(6).into(),
+        color: None,
+    };
+    assert_eq!(m.scan_topology().unwrap().winding_conflicts, 1);
+    m.orient_scan_normals().unwrap();
+    assert_eq!(&*m.triangles, &[0, 1, 2, 3, 4, 5]);
+    assert_eq!(&*m.corner_normals, &[0., 0., 1.].repeat(6));
+    assert_eq!(m.scan_topology().unwrap().winding_conflicts, 0);
+    let flat = m.clone();
+    assert!(m.fill_scan_holes(64).is_err());
+    assert_eq!(m, flat);
+    m.triangles = vec![0, 1, 2, 3, 4, 5, 2, 1, 0].into();
+    m.corner_normals = Default::default();
+    let invalid = m.clone();
+    assert!(m.orient_scan_normals().is_err());
+    assert_eq!(m, invalid);
+}
+
+#[test]
+fn scan_cleanup_preserves_boundary_winding_normals_and_undo_copy() {
+    let mut mesh = MeshData {
+        appearance: None,
+        name: "Scan".into(),
+        color: None,
+        positions: vec![0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0., 0., 0., -0., 7., 7., 7.].into(),
+        triangles: vec![0, 1, 2, 4, 2, 3, 2, 1, 4, 0, 4, 1].into(),
+        corner_normals: (0..36).map(f64::from).collect(),
+    };
+    let original = mesh.clone();
+    mesh.clean_scan().unwrap();
+    assert_eq!(&*mesh.triangles, &[0, 1, 2, 0, 2, 3]);
+    assert_eq!(mesh.positions.len(), 12);
+    assert_eq!(&*mesh.corner_normals, &original.corner_normals[..18]);
+    assert_eq!(original.triangles.len(), 12);
+    let clean = mesh.clone();
+    mesh.smooth_scan(3).unwrap();
+    assert_eq!(mesh, clean, "all four vertices are on the boundary");
+    mesh.triangles = vec![0, 1, 55].into();
+    let malformed = mesh.clone();
+    assert!(mesh.clean_scan().is_err());
+    assert_eq!(mesh, malformed);
+}
+
+#[test]
+fn scan_smoothing_pins_the_rim_and_decimation_reduces_a_grid() {
+    let mut points = Vec::new();
+    let mut triangles = Vec::new();
+    for y in 0..9u32 {
+        for x in 0..9u32 {
+            points.extend([f64::from(x), f64::from(y), if x == 4 && y == 4 { 2.0 } else { 0.0 }]);
+            let a = y * 9 + x;
+            if x < 8 && y < 8 {
+                triangles.extend([a, a + 1, a + 10, a, a + 10, a + 9]);
+            }
+        }
+    }
+    let mut mesh = MeshData {
+        appearance: None,
+        name: "Grid".into(),
+        color: None,
+        positions: points.into(),
+        triangles: triangles.into(),
+        corner_normals: Default::default(),
+    };
+    let original = mesh.clone();
+    mesh.smooth_scan(1).unwrap();
+    assert_eq!(&mesh.positions[..27], &original.positions[..27]);
+    assert_eq!(mesh.positions[40 * 3 + 2], 1.0);
+    mesh.decimate_scan(50).unwrap();
+    assert!(mesh.triangles.len() <= original.triangles.len() / 2);
+    assert!(mesh.triangles.iter().all(|&i| (i as usize) < mesh.positions.len() / 3));
+}
+
+#[test]
+fn scan_island_filter_keeps_main_shell_and_compacts_normals() {
+    let mut mesh = MeshData {
+        appearance: None,
+        name: "Two islands".into(),
+        color: None,
+        positions: vec![0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1., 5., 0., 0., 6., 0., 0., 5., 1., 0.].into(),
+        triangles: vec![4, 5, 6, 0, 1, 2, 0, 3, 1].into(),
+        corner_normals: (0..27).map(f64::from).collect(),
+    };
+    let original = mesh.clone();
+    mesh.remove_scan_islands(50).unwrap();
+    assert_eq!(mesh.triangles.len(), 6);
+    assert_eq!(mesh.positions.len(), 12);
+    assert_eq!(&*mesh.corner_normals, &original.corner_normals[9..]);
+    let cleaned = mesh.clone();
+    mesh.remove_scan_islands(50).unwrap();
+    assert_eq!(mesh, cleaned);
+}
+
+#[test]
+fn scan_island_filter_connects_stl_facets_with_distinct_corner_indices() {
+    let mut mesh = MeshData {
+        appearance: None,
+        name: "STL".into(),
+        color: None,
+        corner_normals: Default::default(),
+        positions: vec![0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 0., 0., 1., 0., 0., 0., 1., 8., 8., 8., 9., 8., 8., 8., 9., 8.].into(),
+        triangles: (0..9u32).collect(),
+    };
+    mesh.remove_scan_islands(2).unwrap();
+    assert_eq!(&*mesh.triangles, &[0, 1, 2, 3, 4, 5]);
+    assert_eq!(mesh.positions.len(), 18);
+}
+
+#[test]
+fn picked_island_crosses_seams_but_not_single_vertex_contacts() {
+    let mut mesh = MeshData {
+        appearance: None,
+        name: "Scan".into(),
+        color: None,
+        // The first two triangles share an entire edge with separate indices.
+        // The last triangle only touches the first at the origin.
+        positions: [0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 1., 0., 1., 0., 0., 1., 1., 0., 0., -1., 0., -1., 0., 0.].to_vec().into(),
+        triangles: vec![0, 1, 2, 3, 4, 5, 0, 6, 7].into(),
+        corner_normals: (0..27).map(f64::from).collect(),
+    };
+    let before = mesh.clone();
+    mesh.delete_scan_island(1).unwrap();
+    assert_eq!(&*mesh.triangles, &[0, 1, 2]);
+    assert_eq!(&*mesh.positions, &[0., 0., 0., 0., -1., 0., -1., 0., 0.]);
+    assert_eq!(&*mesh.corner_normals, &before.corner_normals[18..]);
+    let last = mesh.clone();
+    assert!(mesh.delete_scan_island(0).is_err());
+    assert_eq!(mesh, last);
+}
+
+#[test]
 fn component_lookup_refuses_duplicate_names_and_keeps_explicit_ids() {
     let mut doc = Document::new("A");
     let first = doc.add_component(Some("A"), 0).unwrap();
@@ -1996,4 +2268,100 @@ fn a_sketch_on_the_construction_plane_of_another_component_lies_on_it() {
     close(crate::apply_vector(&m, solved.plane.normal()), want.normal(), "normal");
     let end = solved.plane.origin + solved.plane.x * 10.0 + solved.plane.y * 5.0;
     close(crate::apply_point(&m, end), want.origin + want.x * 10.0 + want.y * 5.0, "line end");
+}
+
+fn textured_scan_fixture() -> MeshData {
+    use solidcraft_geom::mesh_appearance::{MeshAppearance, MeshMaterial, MeshTexture};
+    MeshData {
+        name: "Textured quad".into(),
+        positions: vec![0., 0., 0., 2., 0., 0., 2., 2., 0., 0., 0., 0., 2., 2., 0., 0., 2., 0.].into(),
+        triangles: vec![0, 1, 2, 3, 4, 5].into(),
+        corner_normals: Default::default(),
+        color: None,
+        appearance: Some(std::sync::Arc::new(MeshAppearance {
+            corner_uvs: vec![[[0., 0.], [1., 0.], [1., 1.]], [[2., 0.], [3., 1.], [2., 1.]]].into(),
+            corner_colors: vec![[[0, 0, 0, 255], [200, 0, 0, 255], [200, 200, 0, 255]], [[20, 0, 0, 255], [220, 200, 0, 255], [20, 200, 0, 255]]]
+                .into(),
+            triangle_materials: vec![0, 1].into(),
+            materials: vec![
+                MeshMaterial {
+                    name: "Photo".into(),
+                    base_color: [1.; 4],
+                    texture: Some(MeshTexture { name: "photo.jpg".into(), mime_type: "image/jpeg".into(), bytes: vec![255, 216, 255, 217].into() }),
+                },
+                MeshMaterial { name: "Other chart".into(), base_color: [1.; 4], texture: None },
+            ]
+            .into(),
+        })),
+    }
+}
+
+#[test]
+fn scan_editing_retains_photo_bytes_and_corner_seams_when_welding_and_filtering() {
+    use std::sync::Arc;
+    let original = textured_scan_fixture();
+    let source = original.appearance.as_ref().unwrap();
+    let mut welded = original.clone();
+    welded.clean_scan().unwrap();
+    assert_eq!(welded.positions.len(), 12);
+    assert_eq!(welded.appearance, original.appearance);
+    for isolate in [true, false] {
+        let mut edited = welded.clone();
+        edited.retain_scan_facets(&[[0, 0]], isolate).unwrap();
+        let appearance = edited.appearance.as_ref().unwrap();
+        let kept = usize::from(!isolate);
+        assert_eq!(appearance.corner_uvs.as_ref(), &[source.corner_uvs[kept]]);
+        assert_eq!(appearance.corner_colors.as_ref(), &[source.corner_colors[kept]]);
+        assert_eq!(appearance.triangle_materials.as_ref(), &[kept as u32]);
+        assert!(Arc::ptr_eq(&source.materials, &appearance.materials));
+        appearance.validate(1).unwrap();
+    }
+    assert_eq!(original.triangles.len(), 6, "undo source is immutable");
+    let mut smooth = original.clone();
+    smooth.smooth_scan(1).unwrap();
+    assert!(Arc::ptr_eq(smooth.appearance.as_ref().unwrap(), source));
+    let mut protected = original.clone();
+    let limited = protected.decimate_scan_report(50).unwrap();
+    assert!(limited.target_limited);
+    assert_eq!(protected.appearance, original.appearance);
+}
+
+#[test]
+fn scan_plane_trim_interpolates_uvs_and_colours_on_both_sides_of_texture_seam() {
+    let mut scan = textured_scan_fixture();
+    let source_materials = scan.appearance.as_ref().unwrap().materials.clone();
+    scan.trim_scan_plane([1., 0., 0., -1.]).unwrap();
+    let appearance = scan.appearance.as_ref().unwrap();
+    appearance.validate(scan.triangles.len() / 3).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&source_materials, &appearance.materials));
+    let points = scan.positions.as_chunks::<3>().0;
+    for (i, triangle) in scan.triangles.as_chunks::<3>().0.iter().enumerate() {
+        let chart = appearance.triangle_materials[i];
+        for (j, &vertex) in triangle.iter().enumerate() {
+            let [x, y, _] = points[vertex as usize];
+            assert_eq!(appearance.corner_uvs[i][j], [x as f32 / 2. + 2. * chart as f32, y as f32 / 2.]);
+            assert_eq!(appearance.corner_colors[i][j], [(100. * x) as u8 + 20 * chart as u8, (100. * y) as u8, 0, 255]);
+        }
+    }
+}
+
+#[test]
+fn scan_orientation_changes_winding_without_moving_texture_to_other_corners() {
+    let mut scan = textured_scan_fixture();
+    std::sync::Arc::make_mut(&mut scan.triangles).swap(4, 5);
+    let mut appearance = scan.appearance.as_ref().unwrap().as_ref().clone();
+    std::sync::Arc::make_mut(&mut appearance.corner_uvs)[1].swap(1, 2);
+    std::sync::Arc::make_mut(&mut appearance.corner_colors)[1].swap(1, 2);
+    scan.appearance = Some(std::sync::Arc::new(appearance));
+    let original = scan.clone();
+    scan.orient_scan_normals().unwrap();
+    let appearance = scan.appearance.as_ref().unwrap();
+    for (i, face) in scan.triangles.as_chunks::<3>().0.iter().enumerate() {
+        let before = original.triangles.as_chunks::<3>().0[i];
+        for (j, vertex) in face.iter().enumerate() {
+            let k = before.iter().position(|v| v == vertex).unwrap();
+            assert_eq!(appearance.corner_uvs[i][j], original.appearance.as_ref().unwrap().corner_uvs[i][k]);
+            assert_eq!(appearance.corner_colors[i][j], original.appearance.as_ref().unwrap().corner_colors[i][k]);
+        }
+    }
 }

@@ -32,6 +32,7 @@ pub mod hlr;
 pub mod inertia;
 pub mod linkage;
 mod mesh;
+pub mod mesh_appearance;
 pub mod mesh_distance;
 pub mod network;
 pub mod paper;

@@ -39,6 +39,8 @@ pub struct ModelBody {
     /// Definition geometry coordinates to this computed body's frame.
     pub source_transform: crate::Mat,
     pub body: Body,
+    /// Authored appearance aligned to the evaluated display triangle corners.
+    pub mesh_appearance: Option<Arc<solidcraft_geom::mesh_appearance::MeshAppearance>>,
     /// Feature that created it.
     pub feature: u64,
     // Timeline snapshots are cloned before meshes are requested. Share the cell itself so
@@ -145,6 +147,7 @@ impl ModelBody {
         ModelBody {
             name,
             source_name: None,
+            mesh_appearance: None,
             source_transform: crate::IDENTITY,
             body,
             feature,
@@ -1433,6 +1436,7 @@ struct MeshDigest {
     positions: Arc<[f64]>,
     triangles: Arc<[u32]>,
     corner_normals: Arc<[f64]>,
+    appearance: Option<Arc<solidcraft_geom::mesh_appearance::MeshAppearance>>,
     digest: u64,
 }
 
@@ -1441,6 +1445,11 @@ impl MeshDigest {
         Arc::ptr_eq(&self.positions, &mesh.positions)
             && Arc::ptr_eq(&self.triangles, &mesh.triangles)
             && Arc::ptr_eq(&self.corner_normals, &mesh.corner_normals)
+            && match (&self.appearance, &mesh.appearance) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 }
 
@@ -1448,12 +1457,12 @@ impl ImportDigests {
     fn of(doc: &Document, known: &ImportDigests) -> ImportDigests {
         let mut out = ImportDigests::default();
         for f in &doc.features {
+            if let FeatureKind::Import { step, .. } = &f.kind {
+                let digest = known.get(f.id, step).unwrap_or_else(|| step_text_digest(step));
+                out.steps.insert(f.id, (step.clone(), digest));
+            }
             match &f.kind {
-                FeatureKind::Import { step, .. } => {
-                    let digest = known.get(f.id, step).unwrap_or_else(|| step_text_digest(step));
-                    out.steps.insert(f.id, (step.clone(), digest));
-                }
-                FeatureKind::MeshImport { meshes, .. } => {
+                FeatureKind::MeshImport { meshes, .. } | FeatureKind::Import { meshes, .. } => {
                     let digests = meshes
                         .iter()
                         .enumerate()
@@ -1463,6 +1472,7 @@ impl ImportDigests {
                                 positions: mesh.positions.clone(),
                                 triangles: mesh.triangles.clone(),
                                 corner_normals: mesh.corner_normals.clone(),
+                                appearance: mesh.appearance.clone(),
                                 digest,
                             }
                         })
@@ -1495,6 +1505,24 @@ fn mesh_content_digest(mesh: &crate::MeshData) -> u64 {
     mesh.triangles.hash(&mut h);
     for n in mesh.corner_normals.iter() {
         n.to_bits().hash(&mut h);
+    }
+    if let Some(a) = &mesh.appearance {
+        for uv in a.corner_uvs.iter().flatten().flatten() {
+            uv.to_bits().hash(&mut h);
+        }
+        a.corner_colors.hash(&mut h);
+        a.triangle_materials.hash(&mut h);
+        for m in a.materials.iter() {
+            m.name.hash(&mut h);
+            for c in m.base_color {
+                c.to_bits().hash(&mut h);
+            }
+            if let Some(t) = &m.texture {
+                t.name.hash(&mut h);
+                t.mime_type.hash(&mut h);
+                t.bytes.hash(&mut h);
+            }
+        }
     }
     h.finish()
 }
@@ -1579,28 +1607,25 @@ fn hash_feature_json(f: &Feature, steps: &ImportDigests, h: &mut impl Hasher) {
 }
 
 fn feature_json(f: &Feature, steps: &ImportDigests) -> String {
-    if matches!(&f.kind, FeatureKind::MeshImport { .. }) {
+    if matches!(&f.kind, FeatureKind::MeshImport { .. } | FeatureKind::Import { .. }) {
         let mut g = f.clone();
         let mut digests = Vec::new();
-        if let FeatureKind::MeshImport { meshes, .. } = &mut g.kind {
+        if let FeatureKind::MeshImport { meshes, .. } | FeatureKind::Import { meshes, .. } = &mut g.kind {
             for (index, mesh) in meshes.iter_mut().enumerate() {
                 digests.push(steps.mesh(f.id, index, mesh).unwrap_or_else(|| mesh_content_digest(mesh)));
                 mesh.positions = Arc::from([]);
                 mesh.triangles = Arc::from([]);
                 mesh.corner_normals = Arc::from([]);
+                mesh.appearance = None;
             }
+        }
+        if let FeatureKind::Import { step, .. } = &mut g.kind {
+            let digest = steps.get(f.id, step).unwrap_or_else(|| step_text_digest(step));
+            *step = Arc::from(format!("{digest:016x}:{}", step.len()));
         }
         // Keep the complete definition (including mesh order, names and colors) without
         // writing the large numeric arrays out again. Equal content in fresh Arcs hashes alike.
         return serde_json::to_string(&(g, digests)).unwrap_or_default();
-    }
-    if let FeatureKind::Import { step, .. } = &f.kind {
-        let mut g = f.clone();
-        if let FeatureKind::Import { step: text, .. } = &mut g.kind {
-            let digest = steps.get(f.id, step).unwrap_or_else(|| step_text_digest(step));
-            *text = Arc::from(format!("{digest:016x}:{}", step.len()));
-        }
-        return serde_json::to_string(&g).unwrap_or_default();
     }
     if let FeatureKind::Sketch { .. } = &f.kind {
         let mut g = f.clone();
@@ -2745,6 +2770,7 @@ fn placement_digest(doc: &Document, f: &Feature, st: Option<&ModelState>) -> u64
             // fold in here, each relative to the reading component, as `reads.paths` does.
             return mirror_placements_digest(doc, f, plane, placements, bodies) ^ datum_paths_digest(doc, f, &datums);
         }
+        FeatureKind::SurfaceRuled { body, .. } => reads.placed_body(st, body),
         // A combine moves tools placed differently from its target into the target's frame (#3383).
         FeatureKind::Combine { target, tools, .. } => {
             frame = st.and_then(|st| st.body(target)).map(|b| body_world(doc, b));
@@ -10237,14 +10263,11 @@ fn eval_feature(
             *repair = Some(Arc::new(report));
             Ok(())
         }
-        FeatureKind::MeshImport { meshes, .. } => {
-            for (k, (name, b)) in mesh_bodies(meshes)?.into_iter().enumerate() {
-                let name = copy_body_name(st, f, k, &name);
-                st.bodies.push(ModelBody::new(name, b, f.id));
+        FeatureKind::MeshImport { meshes, .. } => append_mesh_bodies(st, f, meshes, 0, &[]),
+        FeatureKind::Import { step, skip, meshes, .. } => {
+            if step.is_empty() && !meshes.is_empty() {
+                return append_mesh_bodies(st, f, meshes, 0, skip);
             }
-            Ok(())
-        }
-        FeatureKind::Import { step, skip, .. } => {
             let imp = kernel::step_import_shared(step)?;
             let digest = crate::config::payload_digest(step);
             let names = import_body_names(st, &f.body_names, &imp, skip);
@@ -10254,6 +10277,7 @@ fn eval_feature(
                 let b = crate::lineage::linked_tool(b.body.clone().with_import_certificate(&digest, f.id)?, f.id, carried);
                 st.bodies.push(ModelBody::traced_new(name, b, f.id));
             }
+            append_mesh_bodies(st, f, meshes, imp.bodies.len(), skip)?;
             if !imp.warnings.is_empty() {
                 let n = imp.warnings.len();
                 let shown: Vec<&str> = imp.warnings.iter().take(3).map(String::as_str).collect();
@@ -10359,10 +10383,31 @@ fn moved_copy(source: &ModelBody, copy: Body, instance: usize) -> Traced {
     Traced::step(copy, &[&source.before_as(crate::lineage::Operand::Copy { body: source.name.clone(), instance })])
 }
 
+/// Append embedded scan bodies with the same appearance and naming rules as mesh import.
+fn append_mesh_bodies(st: &mut ModelState, f: &Feature, meshes: &[crate::MeshData], offset: usize, skip: &[u64]) -> Result<()> {
+    for (k, (name, b)) in mesh_bodies(meshes)?.into_iter().enumerate() {
+        let slot = offset + k;
+        if skip.contains(&(slot as u64)) {
+            continue;
+        }
+        let name = copy_body_name(st, f, slot, &name);
+        let mut body = ModelBody::new(name, b, f.id);
+        if let Some(source) = meshes.get(k).filter(|m| m.appearance.is_some()) {
+            let (positions, triangles) = body.body.triangle_mesh().ok_or_else(|| DocError::Invalid("imported mesh has no triangles".into()))?;
+            body.mesh_appearance = crate::mesh_appearance::evaluated_triangles(source, positions, triangles)?;
+        }
+        st.bodies.push(body);
+    }
+    Ok(())
+}
+
 /// Mesh bodies of a MeshImport feature.
 fn mesh_bodies(meshes: &[crate::MeshData]) -> Result<Vec<(String, Body)>> {
     let mut out = Vec::with_capacity(meshes.len());
     for m in meshes {
+        if let Some(a) = &m.appearance {
+            a.validate(m.triangles.len() / 3).map_err(DocError::Invalid)?;
+        }
         let positions: Vec<Vec3> = m.positions.as_chunks::<3>().0.iter().map(|c| Vec3::new(c[0], c[1], c[2])).collect();
         let triangles: Vec<[u32; 3]> = m.triangles.as_chunks::<3>().0.to_vec();
         if !m.corner_normals.is_empty() && m.corner_normals.len() != m.triangles.len().saturating_mul(3) {
@@ -10918,6 +10963,7 @@ fn in_frame(b: &ModelBody, m: &crate::Mat, placed: &ModelBody) -> ModelBody {
     moved.source_name = b.source_name.clone();
     moved.source_transform = crate::mat_mul(m, &b.source_transform);
     moved.imported = b.imported.clone();
+    moved.mesh_appearance = b.mesh_appearance.clone();
     // Moving a body keeps its faces (and their order): it keeps their names.
     moved.names = crate::naming::NameCell::same(b);
     moved
@@ -11035,6 +11081,7 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
             placed.component = comp;
             placed.transferred = b.transferred;
             placed.imported = b.imported.clone();
+            placed.mesh_appearance = b.mesh_appearance.clone();
             // Placement preserves topology: face ownership remains that of the
             // source model, including modifiers on component instances.
             placed.names = crate::naming::NameCell::same(b);
@@ -11280,13 +11327,18 @@ mod world_placement_cache_tests {
     #[test]
     fn an_imports_body_is_asked_for_its_own_slots_name() {
         let mut doc = Document::new("names");
-        let id =
-            doc.add_feature(FeatureKind::Import { file: "x.step".into(), step: "".into(), components: Vec::new(), skip: vec![0] }, None).unwrap();
+        let id = doc
+            .add_feature(
+                FeatureKind::Import { file: "x.step".into(), step: "".into(), components: Vec::new(), skip: vec![0], meshes: Vec::new() },
+                None,
+            )
+            .unwrap();
         doc.feature_mut(id).unwrap().body_names = vec!["A".into(), "B".into()];
         let mut state = ModelState::default();
         state.bodies.push(ModelBody::new("B (2)".into(), kernel::box_solid(Vec3::ZERO, Vec3::new(1., 1., 1.)).unwrap(), id));
         assert_eq!(asked_names(&doc, &state).next().unwrap().1, Some("B"));
-        doc.feature_mut(id).unwrap().kind = FeatureKind::Import { file: "x.step".into(), step: "".into(), components: Vec::new(), skip: Vec::new() };
+        doc.feature_mut(id).unwrap().kind =
+            FeatureKind::Import { file: "x.step".into(), step: "".into(), components: Vec::new(), skip: Vec::new(), meshes: Vec::new() };
         assert_eq!(asked_names(&doc, &state).next().unwrap().1, Some("A"));
     }
 

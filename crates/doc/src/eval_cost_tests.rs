@@ -234,7 +234,7 @@ fn placed_imports(parts: usize) -> Document {
         let comp = doc.add_component(Some(&format!("Part {i}")), 0).unwrap();
         let o = doc.occurrences.iter_mut().find(|o| o.component == comp).unwrap();
         o.transform = rigid(Vec3::new(0.0, 0.0, 5.0 * i as f64), Vec3::ZERO, Vec3::Z, 0.05 * i as f64);
-        let kind = FeatureKind::Import { file: format!("part{i}.step"), step, components: Vec::new(), skip: Vec::new() };
+        let kind = FeatureKind::Import { file: format!("part{i}.step"), step, components: Vec::new(), skip: Vec::new(), meshes: Vec::new() };
         let id = doc.add_feature(kind, Some(&format!("Part {i}"))).unwrap();
         doc.feature_mut(id).unwrap().component = comp;
     }
@@ -911,6 +911,7 @@ fn shared_imported_mesh_inputs_keep_payload_identity_and_invalidate_replacements
             FeatureKind::MeshImport {
                 file: "triangle.stl".into(),
                 meshes: vec![MeshData {
+                    appearance: None,
                     name: "Triangle".into(),
                     positions: Arc::from([0., 0., 0., 1., 0., 0., 0., 1., 0.]),
                     triangles: Arc::from([0, 1, 2]),
@@ -1047,6 +1048,7 @@ fn saved_states_read_back_their_sketch_keys() {
 #[test]
 fn comparing_a_copied_mesh_does_not_read_its_shared_arrays() {
     let mesh = MeshData {
+        appearance: None,
         name: "Scan".into(),
         positions: Arc::from([0., 0., 0., 1., 0., 0., 0., 1., f64::NAN]),
         triangles: Arc::from([0, 1, 2]),
@@ -1811,6 +1813,7 @@ fn imported_meshes() -> Document {
     let comp = doc.add_component(Some("Part"), 0).unwrap();
     let meshes = (0..2)
         .map(|i| MeshData {
+            appearance: None,
             name: format!("Mesh{i}"),
             positions: [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0].into(),
             triangles: [0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3].into(),
@@ -1878,6 +1881,28 @@ fn unchanged_mesh_payloads_are_not_read_again_for_rigid_motion() {
     assert_eq!(counted(|| model.evaluate(&reopened)).mesh_digested, 2, "new array identities must be checked");
     assert_eq!(model.last_recomputed, 0, "equal content has equal fingerprints");
     same_as_fresh(&reopened, &model);
+}
+
+#[test]
+fn linked_mesh_payloads_reuse_placement_and_invalidate_on_geometry_changes() {
+    let mut doc = imported_meshes();
+    let meshes = meshes_mut(&mut doc).clone();
+    doc.features[0].kind = FeatureKind::Import { file: "scan.sc".into(), step: "".into(), components: Vec::new(), skip: Vec::new(), meshes };
+    let original = doc.clone();
+    let mut model = Model::new();
+    assert_eq!(counted(|| model.evaluate(&doc)).mesh_digested, 2);
+    same_as_fresh(&doc, &model);
+    doc.occurrences[0].transform = rigid(Vec3::new(10., 2., 3.), Vec3::ZERO, Vec3::Z, 0.2);
+    assert_eq!(counted(|| model.evaluate(&doc)).mesh_digested, 0);
+    assert_eq!(model.last_recomputed, 0);
+    same_as_fresh(&doc, &model);
+    let FeatureKind::Import { meshes, .. } = &mut doc.features[0].kind else { panic!("linked mesh") };
+    Arc::make_mut(&mut meshes[0].positions)[0] = 0.5;
+    model.evaluate(&doc);
+    assert!(model.last_recomputed > 0);
+    same_as_fresh(&doc, &model);
+    model.evaluate(&original);
+    same_as_fresh(&original, &model);
 }
 
 #[test]
@@ -2080,4 +2105,53 @@ fn a_hole_whose_run_on_column_cannot_be_built_keeps_its_run_on() {
     let (top, near) = super::hole_run_on(&state, &Plane::XY, 3.0, 1.0);
     assert!((top - 0.25).abs() < 1e-6, "top {top}");
     assert!(near.is_empty());
+}
+
+#[test]
+fn scan_appearance_follows_display_winding_and_degenerate_filter() {
+    use solidcraft_geom::mesh_appearance::MeshAppearance;
+    let source = MeshData {
+        name: "Seam".into(),
+        positions: Arc::from([0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 0.]),
+        triangles: Arc::from([0, 3, 1, 0, 1, 2]),
+        corner_normals: Default::default(),
+        color: None,
+        appearance: Some(Arc::new(MeshAppearance {
+            corner_uvs: Arc::from([[[9., 9.]; 3], [[0., 0.], [1., 0.], [0., 1.]]]),
+            corner_colors: Arc::from([[[9; 4]; 3], [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]]]),
+            ..Default::default()
+        })),
+    };
+    let display = solidcraft_geom::Mesh { positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y], triangles: vec![[0, 2, 1]], ..Default::default() };
+    let mapped = crate::mesh_appearance::evaluated_appearance(&source, &display).unwrap().unwrap();
+    assert_eq!(&*mapped.corner_uvs, &[[[0., 0.], [0., 1.], [1., 0.]]]);
+    assert_eq!(mapped.corner_colors[0][1], [0, 0, 255, 255]);
+    assert_eq!(source.appearance.as_ref().unwrap().corner_uvs.len(), 2);
+    let before = crate::eval::mesh_content_digest(&source);
+    let mut changed = source.clone();
+    Arc::make_mut(changed.appearance.as_mut().unwrap()).corner_uvs = Arc::from([[[8., 8.]; 3], [[0., 0.], [1., 0.], [0., 1.]]]);
+    assert_ne!(before, crate::eval::mesh_content_digest(&changed));
+    let encoded = serde_json::to_string(&source).unwrap();
+    let decoded: MeshData = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(source, decoded);
+}
+
+#[test]
+fn unchanged_scan_appearance_reuses_arrays_without_forcing_display_geometry() {
+    use solidcraft_geom::mesh_appearance::MeshAppearance;
+    let appearance = Arc::new(MeshAppearance { corner_uvs: vec![[[0., 0.], [1., 0.], [0., 1.]]].into(), ..Default::default() });
+    let source = MeshData {
+        name: "Scan".into(),
+        positions: Arc::from([0., 0., 0., 1., 0., 0., 0., 1., 0.]),
+        triangles: Arc::from([0, 1, 2]),
+        corner_normals: Default::default(),
+        color: None,
+        appearance: Some(appearance.clone()),
+    };
+    let body = ModelBody::new("Scan".into(), kernel::mesh_body(&[Vec3::ZERO, Vec3::X, Vec3::Y], &[[0, 1, 2]]).unwrap(), 1);
+    assert!(body.cached_mesh().is_none());
+    let (positions, triangles) = body.body.triangle_mesh().unwrap();
+    let result = crate::mesh_appearance::evaluated_triangles(&source, positions, triangles).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&result, &appearance));
+    assert!(body.cached_mesh().is_none(), "mapping authored attributes must not sort display outlines or expand display corners");
 }

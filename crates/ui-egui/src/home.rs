@@ -972,6 +972,7 @@ fn recovery_body(app: &SolveApp) -> start_page::Reviews<'_, FileAction> {
 fn export_tiles(app: &SolveApp) -> start_page::Tiles<'_, FileAction> {
     let formats = [
         ("step", "STEP", Some("home.export_step_hint"), FileAction::Export("step")),
+        ("parasolid", "Parasolid", Some("home.export_parasolid_hint"), FileAction::Export("x_t")),
         ("mesh", "Mesh", Some("home.export_mesh_hint"), FileAction::Mesh),
         ("view_dxf", "DXF", None, FileAction::ViewDxf),
         ("obj", "OBJ", None, FileAction::Export("obj")),

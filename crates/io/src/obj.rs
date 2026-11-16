@@ -1,21 +1,25 @@
 //! Wavefront OBJ import: polygon meshes (`v`, `f` with any of `v`, `v/vt`, `v//vn`, `v/vt/vn`,
 //! negative indices counting back), one mesh body per object (`o`, else group `g`). Polygons
 //! are split into fans. Authored corner normals and smoothing groups are retained. Texture
-//! coordinates and materials are not consumed. The file is
+//! coordinates, material colours and embedded JPEG/PNG maps are retained. The file is
 //! untrusted: counts are capped and bad lines become warnings.
 
 use solidcore_record::Vec3;
+use solidcraft_geom::mesh_appearance::{MeshAppearance, MeshMaterial, MeshTexture};
 use solidcraft_geom::prelude::*;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 struct Corner {
     vertex: u32,
     normal: Option<u32>,
+    uv: Option<u32>,
 }
 
 struct Face {
     corners: [Corner; 3],
     smoothing: u32,
+    material: u32,
 }
 
 fn index(token: &str, len: usize) -> Option<u32> {
@@ -34,6 +38,15 @@ const MAX_TRIANGLES: usize = 20_000_000;
 
 /// Meshes of an OBJ file and what could not be read.
 pub fn read_obj(bytes: &[u8], default_name: &str) -> Result<(Vec<MeshObject>, Vec<String>)> {
+    read_obj_with_assets(bytes, default_name, &mut |name| Err(format!("asset `{name}` is unavailable")))
+}
+
+/// Import an OBJ and its relative MTL/image assets. Asset bytes are embedded in the result.
+pub fn read_obj_with_assets(
+    bytes: &[u8],
+    default_name: &str,
+    load: &mut dyn FnMut(&str) -> std::result::Result<Vec<u8>, String>,
+) -> Result<(Vec<MeshObject>, Vec<String>)> {
     let text = String::from_utf8_lossy(bytes);
     let mut verts: Vec<Vec3> = Vec::new();
     // Objects: name and polygons as vertex indices into `verts`.
@@ -44,12 +57,28 @@ pub fn read_obj(bytes: &[u8], default_name: &str) -> Result<(Vec<MeshObject>, Ve
     let mut named_by_o = false;
     let mut normals = Vec::<Vec3>::new();
     let mut smoothing = 0u32;
+    let mut uvs = Vec::<[f32; 2]>::new();
+    let mut colors = Vec::<Option<[u8; 4]>>::new();
+    let mut materials = vec![MeshMaterial { name: "Default".into(), base_color: [1.; 4], texture: None }];
+    let mut material_names = std::collections::HashMap::<String, u32>::new();
+    let mut active_material = 0;
+    let mut texture_bytes = 0usize;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(name) = line.strip_prefix("mtllib ") {
+            let path = asset_path(name.trim())?;
+            match load(&path) {
+                Ok(bytes) => read_materials(&bytes, &path, load, &mut materials, &mut material_names, &mut texture_bytes)?,
+                Err(e) => warnings.push(format!("OBJ material library `{path}` could not be read: {e}")),
+            }
+        }
+    }
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let mut it = line.split_whitespace();
         match it.next() {
             Some("v") => {
-                let c: Vec<f64> = it.take(3).filter_map(|x| x.parse::<f64>().ok()).collect();
+                let c: Vec<f64> = it.by_ref().take(3).filter_map(|x| x.parse::<f64>().ok()).collect();
                 match c[..] {
                     [x, y, z] if x.is_finite() && y.is_finite() && z.is_finite() => verts.push(Vec3::new(x, y, z)),
                     _ => {
@@ -58,9 +87,42 @@ pub fn read_obj(bytes: &[u8], default_name: &str) -> Result<(Vec<MeshObject>, Ve
                         bad_lines += 1;
                     }
                 }
+                let rgb: Vec<f32> = it.take(3).filter_map(|x| x.parse::<f32>().ok()).collect();
+                colors.push(match rgb.as_slice() {
+                    [r, g, b] if rgb.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) => {
+                        Some([(*r * 255.).round() as u8, (*g * 255.).round() as u8, (*b * 255.).round() as u8, 255])
+                    }
+                    _ => None,
+                });
                 if verts.len() > MAX_VERTICES {
                     return Err(IoError::Invalid(format!("OBJ with more than {MAX_VERTICES} vertices")));
                 }
+            }
+            Some("vt") => {
+                let u = it.next().and_then(|v| v.parse::<f32>().ok());
+                let v = it.next().and_then(|v| v.parse::<f32>().ok());
+                uvs.push(match (u, v) {
+                    (Some(u), Some(v)) if u.is_finite() && v.is_finite() => [u, v],
+                    _ => [f32::NAN; 2],
+                });
+                if uvs.len() > MAX_TRIANGLES * 3 {
+                    return Err(IoError::Invalid("too many OBJ texture coordinates".into()));
+                }
+            }
+            Some("usemtl") => {
+                let name = it.collect::<Vec<_>>().join(" ");
+                active_material = if let Some(id) = material_names.get(&name) {
+                    *id
+                } else {
+                    if material_names.len() >= 4096 {
+                        return Err(IoError::Invalid("too many OBJ materials".into()));
+                    }
+                    warnings.push(format!("OBJ material `{name}` is missing; using white"));
+                    let id = materials.len() as u32;
+                    materials.push(MeshMaterial { name: name.clone(), base_color: [1.; 4], texture: None });
+                    material_names.insert(name, id);
+                    id
+                };
             }
             Some("vn") => {
                 let c: Vec<f64> = it.take(3).filter_map(|x| x.parse::<f64>().ok()).collect();
@@ -101,9 +163,9 @@ pub fn read_obj(bytes: &[u8], default_name: &str) -> Result<(Vec<MeshObject>, Ve
                     .map(|tok| {
                         let mut fields = tok.split('/');
                         let vertex = index(fields.next()?, verts.len())?;
-                        fields.next(); // UVs do not replace the saved procedural material mapping.
+                        let uv = fields.next().filter(|v| !v.is_empty()).and_then(|v| index(v, uvs.len()));
                         let normal = fields.next().filter(|v| !v.is_empty()).and_then(|v| index(v, normals.len()));
-                        Some(Corner { vertex, normal })
+                        Some(Corner { vertex, normal, uv })
                     })
                     .collect();
                 match corners {
@@ -115,7 +177,7 @@ pub fn read_obj(bytes: &[u8], default_name: &str) -> Result<(Vec<MeshObject>, Ve
                         }
                         if let Some((_, tris)) = objects.last_mut() {
                             for k in 1..p.len() - 1 {
-                                tris.push(Face { corners: [p[0], p[k], p[k + 1]], smoothing });
+                                tris.push(Face { corners: [p[0], p[k], p[k + 1]], smoothing, material: active_material });
                             }
                         }
                     }
@@ -165,7 +227,37 @@ pub fn read_obj(bytes: &[u8], default_name: &str) -> Result<(Vec<MeshObject>, Ve
                 }
             }
         }
-        out.push(MeshObject { name, positions: mesh.positions, triangles: mesh.triangles, corner_normals, ..Default::default() });
+        let has_uv = tris.iter().any(|t| t.corners.iter().any(|c| c.uv.is_some()));
+        let has_colors = colors.iter().any(Option::is_some);
+        let appearance = if has_uv || has_colors || materials.len() > 1 {
+            let mut corner_uvs = Vec::new();
+            let mut corner_colors = Vec::new();
+            let mut triangle_materials = Vec::new();
+            for face in &tris {
+                let uv = face.corners.map(|c| c.uv.and_then(|i| uvs.get(i as usize)).copied());
+                if materials.get(face.material as usize).is_some_and(|m| m.texture.is_some())
+                    && uv.iter().any(|v| v.is_none_or(|v| !v.iter().all(|x| x.is_finite())))
+                {
+                    return Err(IoError::Invalid("textured OBJ face has missing or invalid texture coordinates".into()));
+                }
+                if has_uv {
+                    corner_uvs.push(uv.map(|v| v.filter(|v| v.iter().all(|x| x.is_finite())).unwrap_or([0.; 2])));
+                }
+                if has_colors {
+                    corner_colors.push(face.corners.map(|c| colors.get(c.vertex as usize).copied().flatten().unwrap_or([255; 4])));
+                }
+                triangle_materials.push(face.material);
+            }
+            Some(Arc::new(MeshAppearance {
+                corner_uvs: corner_uvs.into(),
+                corner_colors: corner_colors.into(),
+                triangle_materials: triangle_materials.into(),
+                materials: materials.clone().into(),
+            }))
+        } else {
+            None
+        };
+        out.push(MeshObject { name, positions: mesh.positions, triangles: mesh.triangles, corner_normals, appearance, ..Default::default() });
     }
     if out.is_empty() {
         return Err(IoError::Invalid("OBJ has no faces".into()));
@@ -173,9 +265,163 @@ pub fn read_obj(bytes: &[u8], default_name: &str) -> Result<(Vec<MeshObject>, Ve
     Ok((out, warnings))
 }
 
+/// Restrict external assets to the selected model folder and its descendants.
+fn asset_path(name: &str) -> Result<String> {
+    let path = name.replace('\\', "/");
+    if path.is_empty()
+        || path.len() > 4096
+        || path.starts_with('/')
+        || path.contains(':')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|p| p == ".." || p.starts_with('.'))
+    {
+        return Err(IoError::Invalid("OBJ assets must be relative files inside the model folder".into()));
+    }
+    Ok(path)
+}
+
+fn read_materials(
+    bytes: &[u8],
+    path: &str,
+    load: &mut dyn FnMut(&str) -> std::result::Result<Vec<u8>, String>,
+    materials: &mut Vec<MeshMaterial>,
+    names: &mut std::collections::HashMap<String, u32>,
+    total: &mut usize,
+) -> Result<()> {
+    if bytes.len() > 4 << 20 {
+        return Err(IoError::Invalid("OBJ material library exceeds 4 MiB".into()));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| IoError::Invalid("OBJ material library is not UTF-8".into()))?;
+    let mut active = None;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("newmtl") => {
+                let name = fields.collect::<Vec<_>>().join(" ");
+                if name.is_empty() || materials.len() >= 4096 {
+                    return Err(IoError::Invalid("invalid or excessive OBJ materials".into()));
+                }
+                let id = materials.len();
+                names.insert(name.clone(), id as u32);
+                materials.push(MeshMaterial { name, base_color: [1.; 4], texture: None });
+                active = Some(id);
+            }
+            Some("Kd") => {
+                if let Some(m) = active.and_then(|i| materials.get_mut(i)) {
+                    let c: Vec<f32> = fields.take(3).filter_map(|v| v.parse().ok()).collect();
+                    if let [r, g, b] = c.as_slice() {
+                        if c.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v)) {
+                            m.base_color = [*r, *g, *b, m.base_color[3]];
+                        }
+                    }
+                }
+            }
+            Some("d" | "Tr") => {
+                if let Some(m) = active.and_then(|i| materials.get_mut(i)) {
+                    if let Some(v) = fields.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && (0. ..=1.).contains(v)) {
+                        m.base_color[3] = if line.starts_with("Tr") { 1. - v } else { v };
+                    }
+                }
+            }
+            Some("map_Kd") => {
+                if let Some(m) = active.and_then(|i| materials.get_mut(i)) {
+                    let name = fields.collect::<Vec<_>>().join(" ");
+                    if name.starts_with('-') {
+                        return Err(IoError::Invalid("OBJ texture map options are not supported; export a plain map_Kd image".into()));
+                    }
+                    let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
+                    let relative = asset_path(&if parent.is_empty() { name.clone() } else { format!("{parent}/{name}") })?;
+                    let bytes = load(&relative).map_err(|e| IoError::Invalid(format!("OBJ texture `{relative}` could not be read: {e}")))?;
+                    *total = total.checked_add(bytes.len()).ok_or_else(|| IoError::Invalid("OBJ texture size overflow".into()))?;
+                    if bytes.len() > 128 << 20 || *total > 256 << 20 {
+                        return Err(IoError::Invalid("OBJ texture assets exceed memory limits".into()));
+                    }
+                    let format = image::guess_format(&bytes).map_err(|e| IoError::Invalid(format!("OBJ texture: {e}")))?;
+                    let mime_type = match format {
+                        image::ImageFormat::Jpeg => "image/jpeg",
+                        image::ImageFormat::Png => "image/png",
+                        _ => return Err(IoError::Invalid("OBJ textures must be JPEG or PNG".into())),
+                    };
+                    let (w, h) = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format)
+                        .into_dimensions()
+                        .map_err(|e| IoError::Invalid(format!("OBJ texture: {e}")))?;
+                    if w == 0 || h == 0 || w > 8192 || h > 8192 || u64::from(w) * u64::from(h) > 64_000_000 {
+                        return Err(IoError::Invalid("OBJ texture dimensions exceed 8192 or 64 million pixels".into()));
+                    }
+                    m.texture = Some(MeshTexture { name, mime_type: mime_type.into(), bytes: bytes.into() });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_uv_seams_materials_and_images_survive_import() {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let source=b"mtllib scan.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 -1 0\nvt 0 0\nvt 1 0\nvt 0 1\nvt 0.5 0.5\nusemtl photo\nf 1/1 2/2 3/3\nf 2/-1 1/2 4/3\n";
+        let mut load = |name: &str| match name {
+            "scan.mtl" => Ok(b"newmtl photo\nKd 0.5 1 1\nmap_Kd image.png\n".to_vec()),
+            "image.png" => Ok(encoded.get_ref().clone()),
+            _ => Err("missing".into()),
+        };
+        let (objects, warnings) = read_obj_with_assets(source, "scan", &mut load).unwrap();
+        assert!(warnings.is_empty());
+        let a = objects[0].appearance.as_ref().unwrap();
+        assert_eq!(objects[0].positions.len(), 4);
+        assert_eq!(a.corner_uvs[0], [[0., 0.], [1., 0.], [0., 1.]]);
+        assert_eq!(a.corner_uvs[1][0], [0.5, 0.5]);
+        assert_eq!(a.triangle_materials.as_ref(), [1, 1]);
+        assert_eq!(a.materials[1].base_color, [0.5, 1., 1., 1.]);
+        assert_eq!(a.materials[1].texture.as_ref().unwrap().bytes.as_ref(), encoded.get_ref());
+        assert!(
+            read_obj_with_assets(source, "scan", &mut |name| if name == "scan.mtl" {
+                Ok(b"newmtl photo\nmap_Kd ../private.png".to_vec())
+            } else {
+                panic!("unsafe path loaded")
+            })
+            .is_err()
+        );
+        let invalid = String::from_utf8_lossy(source).replace("1/1 2/2 3/3", "1 2 3");
+        assert!(read_obj_with_assets(invalid.as_bytes(), "scan", &mut load).is_err());
+        let feature = crate::mesh_import_feature_with_assets(source, "scan.obj", 1., &mut load).unwrap();
+        let mut doc = solidcraft_doc::Document::new("Textured export");
+        doc.add_feature(feature.kind, Some("Scan")).unwrap();
+        let mut model = solidcraft_doc::Model::new();
+        model.evaluate(&doc);
+        let state = model.state();
+        assert_eq!(state.bodies.len(), 1);
+        let expected = state.bodies[0].mesh_appearance.as_ref().unwrap();
+        let files = crate::export_obj(&state, &[], "export.mtl", crate::MeshQuality::default()).unwrap();
+        assert_eq!(files.assets.len(), 1);
+        assert_eq!(files.assets[0].1.as_ref(), encoded.get_ref());
+        let mut reload = |name: &str| {
+            if name == "export.mtl" {
+                Ok(files.mtl.as_bytes().to_vec())
+            } else {
+                files.assets.iter().find(|(n, _)| n == name).map(|(_, bytes)| bytes.to_vec()).ok_or_else(|| "missing exported texture".into())
+            }
+        };
+        let (again, warnings) = read_obj_with_assets(files.obj.as_bytes(), "export", &mut reload).unwrap();
+        assert!(warnings.is_empty());
+        let actual = again[0].appearance.as_ref().unwrap();
+        assert_eq!(actual.corner_uvs, expected.corner_uvs);
+        for (before, after) in expected.triangle_materials.iter().zip(actual.triangle_materials.iter()) {
+            let before = &expected.materials[*before as usize];
+            let after = &actual.materials[*after as usize];
+            assert_eq!(before.base_color, after.base_color);
+            assert_eq!(before.texture.as_ref().unwrap().bytes, after.texture.as_ref().unwrap().bytes);
+        }
+        assert!(crate::export(&state, &[], crate::Format::StlBinary, "scan").is_err());
+    }
 
     #[test]
     fn authored_corner_normals_and_smoothing_groups_survive_import() {

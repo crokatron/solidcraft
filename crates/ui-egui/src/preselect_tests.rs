@@ -2287,6 +2287,9 @@ fn match_surface_dialog_defaults_picks_and_edit_values() {
         target: BodyName::from("Target"),
         edges: vec![Position(point)],
         order: Continuity::G3,
+        source_edges: vec![],
+        cross_scale: 1.,
+        reverse_target: true,
     };
     let (kind, inputs, extra) = crate::dialogs_surface::for_feature(&app, &feature, &IDENTITY).unwrap();
     let cmds = if let Kind::Surface(k) = kind {
@@ -2346,6 +2349,9 @@ fn fair_and_match_picks_reopen_on_their_saved_bodies() {
         target: BodyName::from("Target"),
         edges: vec![edge],
         order: Continuity::G2,
+        source_edges: vec![],
+        cross_scale: 1.,
+        reverse_target: true,
     };
     let (_, inputs, _) = crate::dialogs_surface::for_feature(&app, &matched, &IDENTITY).unwrap();
     assert!(matches!(inputs[0].items.as_slice(), [Sel::Face { body, .. }] if body == "Target"), "{:?}", inputs[0].items);
@@ -3548,6 +3554,7 @@ fn convert_mesh_asks_for_the_body_and_converts_the_selected_one() {
                 triangles: mesh.triangles.iter().flatten().copied().collect(),
                 color: None,
                 corner_normals: Default::default(),
+                appearance: None,
             }],
         },
         Some("Imported mesh"),

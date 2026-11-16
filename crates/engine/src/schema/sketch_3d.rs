@@ -21,6 +21,16 @@ use super::sketch_ends::SketchTarget;
 use super::types::Point3;
 use crate::params;
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Fillet3dParams {
+    /// Two editable line IDs in this sketch; a spatial wire or a planar line.
+    pub curves: [String; 2],
+    /// A positive length in millimetres or a length expression.
+    pub radius: super::types::LengthExpr,
+    pub sketch: Option<SketchTarget>,
+}
+
 /// Draw 3D lines through world points, one line per segment, joined end to end. Needs 3D Sketch
 /// on for the sketch (`sketch.options` with `sketch_3d: true`). One undo step.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -287,3 +297,51 @@ pub struct Move3dResult {
 #[cfg(test)]
 #[path = "sketch_3d_tests.rs"]
 mod tests;
+
+/// Add a persistent driving dimension in the spatial curve coordinate frame.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Dimension3dParams {
+    /// distance, x, y, z, radius, angle, or fix. Axis values are signed B minus A.
+    pub kind: String,
+    /// Editable curve ID or explicit fit point such as w1.start, w1.end, or w1:2.
+    pub a: String,
+    pub b: Option<String>,
+    /// Millimetres, or degrees for an angle. Omitted only for fix.
+    pub value: Option<f64>,
+    pub sketch: Option<SketchTarget>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditDimension3dParams {
+    pub id: String,
+    /// Millimetres, or degrees for an angle.
+    pub value: f64,
+    pub sketch: Option<SketchTarget>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Freedom3dParams {
+    pub sketch: Option<SketchTarget>,
+}
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Dimension3dResult {
+    pub constraints: Vec<String>,
+    pub sketch: Value,
+}
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SpatialPointFreedomResult {
+    pub wire: String,
+    pub index: usize,
+    pub free_axes: [bool; 3],
+    pub directions: Vec<[f64; 3]>,
+}
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Freedom3dResult {
+    pub dof: Option<usize>,
+    pub variables: usize,
+    pub rank: usize,
+    pub points: Vec<SpatialPointFreedomResult>,
+    pub reason: Option<String>,
+    pub status: String,
+}

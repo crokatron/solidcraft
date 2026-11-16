@@ -1,0 +1,8 @@
+{
+  "en": {
+    "sketch_report.planar_dof": "Planar degrees of freedom",
+    "sketch_report.planar_status": "Planar status",
+    "sketch_report.spatial_constraints": "3D constraints",
+    "sketch_report.spatial_dof_unknown": "Degrees of freedom above describe planar geometry only; 3D degrees of freedom are not yet reported."
+  }
+}

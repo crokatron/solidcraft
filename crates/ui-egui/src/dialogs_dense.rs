@@ -43,6 +43,7 @@ pub(super) fn command(kind: &Kind) -> Option<&'static str> {
         Kind::Loft { .. } => Some("solid.loft"),
         Kind::Sweep { .. } => Some("solid.sweep"),
         Kind::Midplane => Some("construct.plane.midplane"),
+        Kind::MeshEdit { command, .. } => Some(command),
         Kind::MeshConvert { .. } => Some("mesh.convert"),
         Kind::Construct { command, .. } => Some(command),
         Kind::ConstructAuto { command, .. } => Some(command),
@@ -959,6 +960,114 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         Kind::PathPlane { t, .. } => {
             enter |= expr_row(ui, "Position (0 to 1)", t);
         }
+        Kind::MeshEdit { command, title, delta, amount, plane, side, .. } => match *command {
+            "mesh.fit_surface" | "mesh.fit_surface.refit" => {
+                enter |= crate::scan_surface_fit::rows(
+                    app,
+                    ui,
+                    &mut d.scan_surface_fit,
+                    &mut d.facet_lasso,
+                    &d.inputs,
+                    amount,
+                    &mut d.mesh_region_preview,
+                    &d.extra,
+                );
+            }
+            "mesh.copy_point_cloud" | "mesh.copy_facet_cloud" | "pointcloud.copy_snippet" | "mesh.auto_sections" => {
+                enter |= crate::scan_copy_ui::rows(app, ui, command, &mut d.scan_copy, &mut d.facet_lasso, &d.inputs);
+            }
+            "mesh.auto_regions" => {
+                enter |= expr_row(ui, "Region angle (degrees)", amount);
+            }
+            "mesh.delete_facets" | "mesh.isolate_facets" => {
+                crate::mesh_lasso::controls(ui, &mut d.facet_lasso, crate::mesh_lasso::body(&d.inputs).unwrap_or(""), app.session.revision, command);
+                let ready = d.facet_lasso.selection().is_some_and(|(_, _, revision, _)| revision == app.session.revision);
+                let response = ui.add_enabled(ready, egui::Button::new(solidcraft_ui_text::tr("ui.scan_fit.handoff")));
+                solidcraft_ui_registry::publish_handle("lasso:fit_surface", response.rect.center());
+                if response.clicked() {
+                    *command = "mesh.fit_surface";
+                    *title = "Fit Scan Surface";
+                    *amount = "20".into();
+                    if let Some(saved) = app.preferences.command_dialog_values.get("mesh.fit_surface") {
+                        d.scan_surface_fit.restore_memory(&saved["scan_fit"]);
+                    }
+                    d.scan_surface_fit.selection = 1;
+                    if let Some(input) = d.inputs.first_mut() {
+                        let items = std::mem::take(&mut input.items);
+                        *input = SelInput::new("Scan region", selection::FACES | selection::BODIES, false).places();
+                        input.items = items;
+                    }
+                    d.lasso_delete_key = false;
+                    d.repeat_after_apply = false;
+                    d.error = None;
+                }
+            }
+            "mesh.global_remesh" => {
+                enter |= hint_row(ui, "Target edge length", amount, "Auto");
+            }
+            "mesh.compare_scans" => {
+                enter |= expr_row(ui, "Distance tolerance", amount);
+            }
+            "mesh.align_plane_to_csys" => {
+                enter |= crate::scan_alignment_ui::plane_rows(app, ui, &mut d.extra, &mut d.inputs, plane, side, amount, delta);
+            }
+            "mesh.symmetry_plane" => {
+                enter |= crate::scan_alignment_ui::symmetry_rows(app, ui, &mut d.inputs, &mut d.extra, side, delta, &mut d.active);
+            }
+            "mesh.align_landmarks" => {
+                ui.label("Pick three matching pairs, alternating between the moving scan and the fixed scan. Spread the points across the surface.");
+            }
+            "mesh.align_datum" => {
+                ui.label("Pick the origin and positive X direction, then a point on the positive Y side of the XY plane.");
+            }
+            "mesh.align_coarse" => {
+                ui.label("Pick the scan to move, then the fixed scan to match.");
+            }
+            "mesh.align_scans" => {
+                enter |= count_row_to(ui, &app.session.doc, "Iterations (1-100)", amount, 100);
+            }
+            "mesh.trim_plane" | "mesh.section" => {
+                let previous = *plane;
+                choice_row(ui, "Cut plane", "mesh_cut_plane", plane, &["XY", "XZ", "YZ"]);
+                if *plane != previous {
+                    d.cut_pose = None;
+                }
+                if d.cut_pose.is_some() && ui.small_button("Reset plane orientation").clicked() {
+                    d.cut_pose = None;
+                }
+                enter |= expr_row(ui, "Plane offset", amount);
+                if *command == "mesh.trim_plane" {
+                    choice_row(ui, "Keep side", "mesh_cut_side", side, &["Positive", "Negative"]);
+                }
+            }
+            "mesh.delete_region" | "mesh.isolate_region" | "mesh.fit_region_plane" | "mesh.fit_region_cylinder" => {
+                if let Some(id) = d.extra.get("auto_region").and_then(Value::as_u64) {
+                    ui.label(format!("Detected region {} · {}°", id + 1, amount));
+                } else {
+                    enter |= expr_row(ui, "Region angle (degrees)", amount);
+                    crate::mesh_edit_overlay::region_controls(app, ui, &d.inputs, amount, &mut d.mesh_region_preview);
+                }
+            }
+            "mesh.move_vertex" => {
+                for (label, field) in ["Local X", "Local Y", "Local Z"].into_iter().zip(delta) {
+                    enter |= expr_row(ui, label, field);
+                }
+            }
+            "mesh.smooth" => {
+                enter |= count_row_to(ui, &app.session.doc, "Passes (1-20)", amount, 20);
+            }
+            "mesh.fill_holes" => {
+                let eval = |text: &str| app.session.doc.eval(text.trim(), solidcraft_engine::doc::expr::Kind::Unitless).ok();
+                enter |= ui_kit::count_row(ui, "Maximum hole edges (3-256)", amount, &ui_kit::Count { min: 3, max: 256, eval: &eval });
+            }
+            "mesh.remove_islands" => {
+                enter |= count_row_to(ui, &app.session.doc, "Minimum triangles", amount, i64::from(u32::MAX));
+            }
+            "mesh.decimate" => {
+                enter |= count_row_to(ui, &app.session.doc, "Keep % (1-80)", amount, 80);
+            }
+            _ => {}
+        },
         Kind::MeshConvert { tolerance } => {
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
         }
@@ -1147,7 +1256,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
                 }
             });
         }
-        Kind::Surface(k) => enter |= crate::dialogs_surface::rows(ui, k),
+        Kind::Surface(k) => enter |= crate::dialogs_surface::rows(ui, k, &mut d.inputs, &mut d.active),
         Kind::Sheet(k) => enter |= crate::dialogs_sheet::rows(app, ui, k, &mut d.inputs),
         Kind::Plastic(k) => enter |= crate::dialogs_plastic::rows(app, ui, k, &d.inputs),
         Kind::Frame(k) => enter |= crate::dialogs_frame::rows(app, ui, k, &d.inputs),

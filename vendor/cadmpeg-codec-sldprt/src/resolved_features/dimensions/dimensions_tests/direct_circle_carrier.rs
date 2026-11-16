@@ -1,0 +1,319 @@
+use super::super::{reconcile_direct_circle_dimension_carriers, MarkerCircleInputs};
+use crate::records::operand_tag::NativeOperandTag;
+use crate::records::{
+    FeatureInputLane, FeatureInputOperand, FeatureInputOperandKind, FeatureInputRelationFamily,
+    FeatureInputRelationInstance, SketchInputEntity, SketchInputKind,
+};
+use cadmpeg_ir::math::Point2;
+use cadmpeg_ir::sketches::{
+    Sketch, SketchEntity, SketchEntityId, SketchEntityUse, SketchGeometry,
+    SketchGeometryDefinition, SketchId, SketchPlacement,
+};
+use cadmpeg_ir::{
+    features::{Feature, FeatureDefinition, FeatureId, FeatureOperation},
+    scalar::Length,
+};
+
+fn lane(feature: &str, marker: &str, relation: &str) -> FeatureInputLane {
+    FeatureInputLane {
+        id: "lane".into(),
+        configuration: None,
+        native_payload: Vec::new().into(),
+        classes: Vec::new(),
+        names: Vec::new(),
+        scalars: Vec::new(),
+        relation_bindings: Vec::new(),
+        relation_instances: vec![FeatureInputRelationInstance {
+            id: relation.into(),
+            parent: "lane".into(),
+            ordinal: 0,
+            offset: 0,
+            family: FeatureInputRelationFamily::CircleDiameter,
+            class_ref: "circle-class".into(),
+            feature_ref: feature.into(),
+            scalars: crate::records::relation_scalars::RelationScalars::from_refs(
+                vec!["sldprt:test:scalar#unselected-1".into()],
+                None,
+                None,
+            )
+            .unwrap(),
+            operands: vec![FeatureInputOperand {
+                offset: 0,
+                reference_ref: "reference".into(),
+                kind: FeatureInputOperandKind::Native(NativeOperandTag::try_from(0x829a).unwrap()),
+                entity_index: 0,
+                entity_ref: Some(marker.into()),
+            }],
+        }],
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: vec![{
+            let marker_id: String = marker.into();
+            let marker_parent: String = "lane".into();
+            let mut constructed_marker = SketchInputEntity::new(
+                marker_id,
+                marker_parent,
+                0,
+                0,
+                SketchInputKind::LineOrCircle,
+            );
+            constructed_marker.feature_ref = Some(feature.into());
+            constructed_marker.state_value = cadmpeg_ir::scalar::FiniteReal::new(1.0);
+            constructed_marker.coordinates_m = cadmpeg_ir::units::FiniteVector::new([0.001, 0.002]);
+            constructed_marker.links = None;
+            constructed_marker
+        }],
+    }
+}
+
+fn feature(feature_ref: &str, sketch: &SketchId) -> Feature {
+    let mut feature = Feature {
+        product_definition: None,
+        id: FeatureId::mint("synthetic:test:id#neutral-feature").expect("identity grammar"),
+        ordinal: 0,
+        name: None,
+        suppressed: None,
+        dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+        source_properties: std::collections::BTreeMap::default(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+            FeatureDefinition::Operation(FeatureOperation::Sketch {
+                sketch: cadmpeg_ir::features::SketchFeatureBinding::Planar(Some(sketch.clone())),
+            }),
+        ),
+        native_ref: None,
+    };
+    feature.native_ref = Some(feature_ref.into());
+    feature
+}
+
+fn sketch(sketch: &SketchId, profiles: Vec<Vec<SketchEntityUse>>) -> Sketch {
+    Sketch {
+        id: sketch.clone(),
+        name: None,
+        configuration: None,
+        visible: None,
+        placement: SketchPlacement::Unresolved {},
+        profiles: cadmpeg_ir::sketches::SketchProfiles::try_from(profiles).unwrap(),
+        native_ref: Some("lane".into()),
+    }
+}
+
+fn native_entity(sketch: &SketchId, id: &str, native_ref: &str) -> SketchEntity {
+    SketchEntity::new(
+        SketchEntityId::mint(id).unwrap(),
+        sketch.clone(),
+        SketchGeometry::native(
+            cadmpeg_core::text::NonBlankString::new("native-circle")
+                .expect("nonempty source identity"),
+        ),
+    )
+    .with_native_ref(Some(native_ref.into()))
+}
+
+struct DirectCircleFixture {
+    sketch_id: SketchId,
+    typed_id: SketchEntityId,
+    feature: Feature,
+    lane: FeatureInputLane,
+    entities: Vec<SketchEntity>,
+    sketches: Vec<Sketch>,
+}
+
+fn direct_circle_fixture() -> DirectCircleFixture {
+    let feature_ref = "feature";
+    let marker_ref = "circle-marker";
+    let relation_ref = "circle-dimension";
+    let sketch_id = SketchId::mint("synthetic:test:id#sketch").unwrap();
+    let typed_id = SketchEntityId::mint("synthetic:test:id#typed-circle").unwrap();
+    let native_id = SketchEntityId::mint("synthetic:test:id#native-circle").unwrap();
+    let other_id = SketchEntityId::mint("synthetic:test:id#other-native").unwrap();
+    let lane = lane(feature_ref, marker_ref, relation_ref);
+    let feature = feature(feature_ref, &sketch_id);
+    let typed = SketchEntity::new(
+        typed_id.clone(),
+        sketch_id.clone(),
+        SketchGeometry::try_from(SketchGeometryDefinition::Circle {
+            center: Point2::new(1.0, 2.0),
+            radius: Length::new(2.0).unwrap(),
+        })
+        .unwrap(),
+    )
+    .with_native_ref(Some(marker_ref.into()))
+    .with_geometry_ref(Some(relation_ref.into()));
+    let native = native_entity(&sketch_id, native_id.as_str(), marker_ref);
+    let other = native_entity(&sketch_id, other_id.as_str(), "other-marker");
+    let entities = vec![typed, native, other];
+    let sketches = vec![sketch(
+        &sketch_id,
+        vec![
+            vec![
+                SketchEntityUse {
+                    entity: native_id,
+                    reversed: false,
+                },
+                SketchEntityUse {
+                    entity: typed_id.clone(),
+                    reversed: false,
+                },
+            ],
+            vec![SketchEntityUse {
+                entity: other_id,
+                reversed: false,
+            }],
+        ],
+    )];
+
+    DirectCircleFixture {
+        sketch_id,
+        typed_id,
+        feature,
+        lane,
+        entities,
+        sketches,
+    }
+}
+
+#[test]
+fn exact_direct_circle_dimension_replaces_only_its_native_carrier() {
+    let DirectCircleFixture {
+        sketch_id,
+        typed_id,
+        feature,
+        lane,
+        mut entities,
+        mut sketches,
+    } = direct_circle_fixture();
+
+    reconcile_direct_circle_dimension_carriers(
+        &mut entities,
+        sketches.first_mut(),
+        &sketch_id,
+        feature.native_ref.as_deref().expect("feature reference"),
+        &MarkerCircleInputs::new(&[], std::slice::from_ref(&lane)),
+    );
+
+    assert!(!entities.iter().any(|entity| entity.id().clone()
+        == SketchEntityId::mint("synthetic:test:id#native-circle").unwrap()));
+    assert!(entities
+        .iter()
+        .any(|entity| entity.id().clone() == typed_id));
+    assert!(entities.iter().any(|entity| entity.id().clone()
+        == SketchEntityId::mint("synthetic:test:id#other-native").unwrap()));
+    assert_eq!(sketches[0].profiles.len(), 2);
+    assert_eq!(sketches[0].profiles[0].len(), 1);
+    assert_eq!(
+        sketches[0].profiles[0][0].entity,
+        SketchEntityId::mint("synthetic:test:id#typed-circle").unwrap()
+    );
+}
+
+#[test]
+fn direct_circle_dimension_without_typed_replacement_keeps_native_carrier() {
+    let feature_ref = "feature";
+    let marker_ref = "circle-marker";
+    let sketch_id = SketchId::mint("synthetic:test:id#sketch").unwrap();
+    let lane = lane(feature_ref, marker_ref, "circle-dimension");
+    let feature = feature(feature_ref, &sketch_id);
+    let mut entities = vec![native_entity(
+        &sketch_id,
+        "synthetic:test:id#native-circle",
+        marker_ref,
+    )];
+    let mut sketches = [sketch(&sketch_id, Vec::new())];
+
+    reconcile_direct_circle_dimension_carriers(
+        &mut entities,
+        sketches.first_mut(),
+        &sketch_id,
+        feature.native_ref.as_deref().expect("feature reference"),
+        &MarkerCircleInputs::new(&[], std::slice::from_ref(&lane)),
+    );
+
+    assert_eq!(entities.len(), 1);
+    assert!(matches!(
+        *entities[0].geometry.definition(),
+        SketchGeometryDefinition::Native { .. }
+    ));
+}
+
+#[test]
+fn repeated_direct_circle_carriers_keep_the_native_carrier() {
+    let native_id = SketchEntityId::mint("synthetic:test:id#native-circle").unwrap();
+    let reconcile = |change: &dyn Fn(&mut DirectCircleFixture)| {
+        let mut fixture = direct_circle_fixture();
+        change(&mut fixture);
+        let feature = fixture
+            .feature
+            .native_ref
+            .clone()
+            .expect("feature reference");
+        reconcile_direct_circle_dimension_carriers(
+            &mut fixture.entities,
+            fixture.sketches.first_mut(),
+            &fixture.sketch_id,
+            &feature,
+            &MarkerCircleInputs::new(&[], std::slice::from_ref(&fixture.lane)),
+        );
+        fixture
+            .entities
+            .iter()
+            .any(|entity| entity.id() == &native_id)
+    };
+    let typed_copy = |fixture: &DirectCircleFixture, id: &str, sketch: &SketchId| {
+        let typed = fixture.entities[0].clone();
+        SketchEntity::new(
+            SketchEntityId::mint(id).unwrap(),
+            sketch.clone(),
+            typed.geometry.clone(),
+        )
+        .with_native_ref(typed.native_ref.clone())
+        .with_geometry_ref(typed.geometry_ref.clone())
+    };
+
+    assert!(!reconcile(&|_| {}));
+    assert!(reconcile(&|fixture| {
+        let marker = fixture.lane.sketch_entities[0].clone();
+        fixture.lane.sketch_entities.push(marker);
+    }));
+    assert!(reconcile(&|fixture| {
+        let sketch_id = fixture.sketch_id.clone();
+        let copy = typed_copy(fixture, "synthetic:test:id#typed-copy", &sketch_id);
+        fixture.entities.push(copy);
+    }));
+    assert!(!reconcile(&|fixture| {
+        let other = SketchId::mint("synthetic:test:id#other-sketch").unwrap();
+        let copy = typed_copy(fixture, "synthetic:test:id#other-typed", &other);
+        fixture.entities.push(copy);
+    }));
+}
+
+#[test]
+fn marker_circle_projection_adds_the_typed_circle_profile() {
+    let DirectCircleFixture {
+        typed_id,
+        feature,
+        lane,
+        mut entities,
+        mut sketches,
+        ..
+    } = direct_circle_fixture();
+    super::super::project_marker_dimensioned_circles(
+        &mut entities,
+        &mut sketches,
+        &[feature],
+        &[],
+        &[lane],
+    )
+    .unwrap();
+    assert_eq!(entities.len(), 2);
+    assert!(entities.iter().any(|entity| entity.id() == &typed_id));
+    assert_eq!(sketches[0].profiles.len(), 2);
+    assert_eq!(sketches[0].profiles[0].len(), 1);
+    assert_eq!(sketches[0].profiles[0][0].entity, typed_id);
+}

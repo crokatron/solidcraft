@@ -1,0 +1,10 @@
+{
+  "en": {
+    "cmd.mesh.auto_regions": "Auto Regions",
+    "help.mesh.auto_regions": "Partition a scan into connected regions by normal angle and color their surfaces. Use a numbered region as the seed for another mesh tool.",
+    "cmd.mesh.global_remesh": "Global Remesh",
+    "help.mesh.global_remesh": "Redistribute triangles across a scan with an automatic or specified target edge length.",
+    "mesh_ui.target_edge_length": "Target edge length",
+    "mesh_ui.use_region_seed": "Use region seed"
+  }
+}

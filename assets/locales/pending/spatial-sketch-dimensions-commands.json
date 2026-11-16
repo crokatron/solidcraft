@@ -1,0 +1,10 @@
+{
+  "en": {
+    "cmd.sketch.dimension3d": "3D Dimension",
+    "cmd.sketch.dimension3d.edit": "Edit 3D Dimension",
+    "cmd.sketch.freedom3d": "3D Sketch Freedom",
+    "help.sketch.dimension3d": "Add a driving length, signed axis distance, radius or angle to editable 3D sketch geometry. Fix a point or curve to anchor its position.",
+    "help.sketch.dimension3d.edit": "Change a saved 3D dimension and solve its connected geometry. Conflicting changes are rejected without changing the sketch.",
+    "help.sketch.freedom3d": "Show remaining instantaneous freedom and the movement directions of editable 3D fit points."
+  }
+}

@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::native::om::display_color::DisplayColorFrame;
+use crate::native::om::display_color::RmDisplayColorAssignment;
+use crate::native::om::display_color::RmDisplayColorAssignmentEncoding;
+use crate::om::compact::CompactIndexAtom;
+
+use crate::native::attach::ensure_rm_color_appearance;
+use crate::native::attach::resolve_rm_source_color_bindings;
+use crate::native::attach::RmSourceColorBinding;
+use std::collections::BTreeMap;
+
+#[test]
+fn rm_appearance_is_created_once_per_definition() {
+    ({
+        let definition = crate::native::om::PartColorDefinition {
+            id: "nx:test:color#201".into(),
+            color_table: "nx:test:table#0".into(),
+            color_index: crate::om::color::PaletteIndex::new(201).unwrap(),
+            name: "Iron Gray".into(),
+            components: [(0.25_f64, 11), (0.5, 12), (0.75, 13)].map(|(value, offset)| {
+                let mut raw = (value * 4.0).to_be_bytes();
+                raw[0] -= 0x10;
+                (
+                    crate::om::color::ColorComponent::read(&raw).unwrap(),
+                    offset,
+                )
+            }),
+            source_offset: 10,
+        };
+        let mut ir = cadmpeg_ir::document::CadIr::empty();
+        let mut annotations = cadmpeg_ir::AnnotationBuilder::new();
+        let mut appearances = BTreeMap::new();
+        let stream =
+            cadmpeg_ir::annotations::StreamHandle::new(cadmpeg_ir::stream_name!("nx:container"));
+        for _ in 0..2 {
+            ensure_rm_color_appearance(
+                &mut ir,
+                &mut annotations,
+                &mut appearances,
+                &definition,
+                &stream,
+            )
+            .unwrap();
+        }
+        assert_eq!(ir.model.appearances.len(), 1);
+    });
+}
+
+#[test]
+fn rm_source_color_bindings_require_one_palette_per_source_identity() {
+    let assignment = |id: &str, source_id: Option<&str>, color_definition: &str, offset| {
+        let color_index = crate::om::color::PaletteIndex::new(201).unwrap();
+        RmDisplayColorAssignment {
+            id: id.into(),
+            ordinal: 0,
+            frame: DisplayColorFrame::new(
+                RmDisplayColorAssignmentEncoding::Target(
+                    crate::om::column_row::TargetRow::<(), u64>::new(
+                        CompactIndexAtom::read(&[7]).unwrap().into(),
+                        [1, 2, 3].map(|value| CompactIndexAtom::read(&[value]).unwrap().into()),
+                        crate::om::discriminators::IndexRowMode::Form04,
+                        offset + u64::from(color_index.display_byte_len()),
+                    )
+                    .unwrap(),
+                ),
+                color_index,
+            )
+            .unwrap(),
+            target_object_id: source_id.map(str::to_owned),
+            color_definition: color_definition.into(),
+            source_entry: "/Root/FastLoad/RMFastLoad".into(),
+        }
+    };
+    let assignments = [
+        assignment("assignment-b", Some("source-a"), "color-a", 20),
+        assignment("assignment-a", Some("source-a"), "color-a", 10),
+        assignment("assignment-c", Some("source-b"), "color-a", 30),
+        assignment("assignment-d", Some("source-c"), "color-a", 40),
+        assignment("assignment-e", Some("source-c"), "color-b", 50),
+        assignment("assignment-f", None, "color-a", 60),
+    ];
+    assert_eq!(
+        resolve_rm_source_color_bindings(&assignments),
+        vec![
+            RmSourceColorBinding {
+                source_id: "source-a".into(),
+                color_definition: "color-a".into(),
+                source_offset: 10,
+            },
+            RmSourceColorBinding {
+                source_id: "source-b".into(),
+                color_definition: "color-a".into(),
+                source_offset: 30,
+            },
+        ]
+    );
+}

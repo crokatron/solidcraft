@@ -1,0 +1,669 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Material and face-color decode tests.
+#![allow(clippy::unwrap_used)]
+
+use std::io::Cursor;
+
+use cadmpeg_core::convert::{f32_from_f64, f64_from_index, truncate_f64_to_u8};
+use cadmpeg_ir::codec::{Codec, DecodeOptions};
+
+use crate::layout::visual_states_feature_appearance_prefix as feature_visual;
+use crate::test_support::appearance::material_payload;
+use crate::test_support::appearance::sldprt_with_body_and_material;
+use crate::test_support::container::add_solidworks_version;
+use crate::test_support::container::make_block;
+use crate::test_support::container::outer_header;
+use crate::test_support::container::sldprt_with_body;
+use crate::test_support::parasolid::bridge_owned;
+use crate::test_support::parasolid::entity51;
+use crate::test_support::parasolid::entity53_color;
+use crate::test_support::parasolid::face_color_definition;
+use crate::test_support::parasolid::owned_triangle;
+use crate::test_support::parasolid::plane_carrier;
+use crate::test_support::parasolid::triangle_body;
+use crate::test_support::parasolid::FACE_COLOR_DEFINITION_ID;
+use crate::test_support::tessellation::descriptor;
+use crate::SldprtCodec;
+
+#[test]
+fn appearance_from_nameless_block_keeps_source_owner() {
+    let payload = material_payload("Steel", [32, 64, 128]);
+    let mut source = outer_header();
+    source.extend(make_block(0x43, "", &payload));
+    let scan = crate::test_support::container::scan(&source);
+
+    let arena = cadmpeg_core::decode::DecodeArena::new();
+    let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+        &source,
+        &arena,
+        &cadmpeg_core::decode::DecodePolicy::service(),
+    )
+    .unwrap();
+    let definitions = super::definitions(&ctx, &scan).unwrap();
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].source_name.as_str(), "block@8");
+}
+
+fn display_table(x: f32) -> Vec<u8> {
+    let mut out = descriptor(4, 8, 1, &3_u32.to_le_bytes());
+    let positions = [x, 0.0_f32, 0.0, x + 1.0, 0.0, x, 0.0, 1.0, x]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    out.extend(descriptor(12, 100, 3, &positions));
+    out.extend(descriptor(12, 100, 3, &[0; 36]));
+    out.extend(descriptor(4, 8, 4, &[0; 16]));
+    out.extend(descriptor(4, 8, 1, &4_u32.to_le_bytes()));
+    out.extend(descriptor(1, 8, 4, &[0; 4]));
+    out
+}
+
+fn display_class(out: &mut Vec<u8>, name: &str) {
+    out.extend_from_slice(&[0xff, 0xff, 0x01, 0x00]);
+    out.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+}
+
+fn inline_display_appearance(name: &str, rgb: [u8; 3]) -> Vec<u8> {
+    let payload = material_payload(name, rgb);
+    let mut out = vec![0x33, 0x80];
+    out.extend_from_slice(&payload[b"moVisualProperties_c".len()..]);
+    out
+}
+
+fn feature_visual_record(source_id: u32, timestamp: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut record = vec![0; feature_visual::LEN];
+    for (offset, value) in [
+        (feature_visual::PRELUDE, 0),
+        (feature_visual::FEATURE_SOURCE_ID, source_id),
+        (feature_visual::FEATURE_TIMESTAMP, timestamp),
+        (
+            feature_visual::SELECTOR_ONE_A,
+            feature_visual::SELECTOR_ONE_A_VALUE,
+        ),
+        (
+            feature_visual::SELECTOR_ONE_B,
+            feature_visual::SELECTOR_ONE_B_VALUE,
+        ),
+        (
+            feature_visual::SELECTOR_TWO,
+            feature_visual::SELECTOR_TWO_VALUE,
+        ),
+    ] {
+        record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    record[feature_visual::INSTANCE_PREFIX
+        ..feature_visual::INSTANCE_PREFIX + feature_visual::INSTANCE_PREFIX_VALUE.len()]
+        .copy_from_slice(&feature_visual::INSTANCE_PREFIX_VALUE);
+    record[feature_visual::MARKER..feature_visual::MARKER + feature_visual::MARKER_VALUE.len()]
+        .copy_from_slice(&feature_visual::MARKER_VALUE);
+    let packed = u32::from(rgb[0]) | (u32::from(rgb[1]) << 8) | (u32::from(rgb[2]) << 16);
+    record[feature_visual::PACKED_COLOR..feature_visual::PACKED_COLOR + 4]
+        .copy_from_slice(&packed.to_le_bytes());
+    record
+}
+
+fn framed_surface_reference(class: &str, source_id: u32, local_id: u32) -> Vec<u8> {
+    let units = format!("{class},{source_id},{local_id},opaque")
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let mut out = vec![0xff, 0xfe, 0xff, units.len().try_into().unwrap()];
+    out.extend(units.into_iter().flat_map(u16::to_le_bytes));
+    out
+}
+
+fn display_fixture(
+    body: [u8; 3],
+    faces: &[Vec<(&str, u32, u32)>],
+    face_overrides: &[(usize, [u8; 3])],
+    features: &[(u32, u32, [u8; 3])],
+) -> Vec<u8> {
+    let mut display = Vec::new();
+    display_class(&mut display, "uoTempFaceTessData_c");
+    display.extend(1_u32.to_le_bytes());
+    display.extend(1_u32.to_le_bytes());
+    for (index, references) in faces.iter().enumerate() {
+        display.extend(display_table(
+            f32_from_f64(f64_from_index(index).unwrap()).unwrap() * 10.0,
+        ));
+        for (class, source, local) in references {
+            display.extend(framed_surface_reference(class, *source, *local));
+        }
+        if let Some((_, rgb)) = face_overrides.iter().find(|(face, _)| *face == index) {
+            display.extend(inline_display_appearance("Face override", *rgb));
+        }
+    }
+    display_class(&mut display, "uoBodyPropInfo_c");
+    display.extend(inline_display_appearance("Body default", body));
+
+    let mut source = sldprt_with_body(&triangle_body());
+    source.extend(make_block(0x41, "Contents/DisplayLists", &display));
+    if !features.is_empty() {
+        let mut visual_states = Vec::new();
+        display_class(&mut visual_states, "moCompFeature_c");
+        for (source_id, timestamp, rgb) in features {
+            visual_states.extend(feature_visual_record(*source_id, *timestamp, *rgb));
+        }
+        source.extend(make_block(
+            0x42,
+            "ThirdPtyStore/VisualStates",
+            &visual_states,
+        ));
+    }
+    source
+}
+
+fn display_colors(bytes: Vec<u8>) -> Vec<[u8; 3]> {
+    use cadmpeg_ir::appearance::AppearanceTarget;
+
+    let result = SldprtCodec
+        .decode(&mut Cursor::new(bytes), &DecodeOptions::default())
+        .unwrap();
+    let colors = result
+        .ir()
+        .model
+        .appearances
+        .iter()
+        .filter_map(|appearance| Some((appearance.id.clone(), appearance.base_color?)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut colors = result
+        .ir()
+        .model
+        .tessellations
+        .iter()
+        .filter_map(|tessellation| {
+            let binding = result
+                .ir()
+                .model
+                .appearance_bindings
+                .iter()
+                .find(|binding| {
+                    binding.target == AppearanceTarget::Tessellation(tessellation.id.to_string())
+                })?;
+            let color = colors[&binding.appearance];
+            let table_index = tessellation
+                .id
+                .as_str()
+                .rsplit(':')
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            Some((
+                table_index,
+                [color.r(), color.g(), color.b()]
+                    .map(|value| truncate_f64_to_u8(f64::from((value * 255.0).round())).unwrap()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    colors.sort_by_key(|(table_index, _)| *table_index);
+    colors.into_iter().map(|(_, color)| color).collect()
+}
+
+const EPS_COLOR_COMPONENT: f32 = 1.0e-6;
+
+#[test]
+fn packed_rgb_uses_low_to_high_red_green_blue_bytes() {
+    for (packed, expected) in [
+        (0x0000_00ff, [1.0, 0.0, 0.0]),
+        (0x0000_ff00, [0.0, 1.0, 0.0]),
+        (0x00ff_0000, [0.0, 0.0, 1.0]),
+    ] {
+        let color = super::packed_rgb(packed);
+        assert_eq!([color.r(), color.g(), color.b()], expected);
+    }
+}
+
+#[test]
+fn visual_states_feature_assignment_decodes_identity_and_color() {
+    let mut visual_states = Vec::new();
+    display_class(&mut visual_states, "moCompFeature_c");
+    visual_states.extend(feature_visual_record(36, 0x6a81_f0f4, [236, 255, 0]));
+    let mut source = outer_header();
+    source.extend(make_block(
+        0x42,
+        "ThirdPtyStore/VisualStates",
+        &visual_states,
+    ));
+
+    let assignments = super::feature_assignments(&crate::test_support::container::scan(&source));
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].feature_source_id.value(), 36);
+    assert_eq!(assignments[0].feature_timestamp, 0x6a81_f0f4);
+    assert_eq!(assignments[0].packed_color, 0x0000_ffec);
+}
+
+#[test]
+fn display_body_and_face_assignments_use_structural_precedence() {
+    let faces = vec![Vec::new(), Vec::new(), Vec::new()];
+    assert_eq!(
+        display_colors(display_fixture([46, 255, 7], &faces, &[], &[])),
+        [[46, 255, 7]; 3]
+    );
+    assert_eq!(
+        display_colors(display_fixture(
+            [202, 209, 238],
+            &faces,
+            &[(0, [247, 0, 23]), (1, [7, 15, 255])],
+            &[],
+        )),
+        [[247, 0, 23], [7, 15, 255], [202, 209, 238]]
+    );
+}
+
+#[test]
+fn unresolved_history_and_display_state_do_not_bind_feature_appearances() {
+    let classes = [
+        "moFromSktEntSurfIdRep_c",
+        "moFromSktEnt3IntSurfIdRep_c",
+        "moEndFace3IntSurfIdRep_c",
+    ];
+    let faces = (0..12)
+        .map(|index| {
+            let source = match index {
+                0..=5 => 36,
+                6..=9 => 44,
+                _ => 51,
+            };
+            vec![(
+                classes[index % classes.len()],
+                source,
+                u32::try_from(index).unwrap() + 1,
+            )]
+        })
+        .collect::<Vec<_>>();
+    let features = [
+        (36, 10, [236, 255, 0]),
+        (44, 20, [239, 0, 0]),
+        (51, 30, [7, 255, 43]),
+    ];
+    let expected = vec![[128; 3]; faces.len()];
+    assert_eq!(
+        display_colors(display_fixture([128; 3], &faces, &[], &features)),
+        expected
+    );
+}
+
+#[test]
+fn unresolved_feature_scope_keeps_source_bound_display_colour() {
+    let source = display_fixture(
+        [128; 3],
+        &[vec![("moFromSktEntSurfIdRep_c", 36, 1)]],
+        &[],
+        &[(36, 10, [236, 255, 0])],
+    );
+    let result = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let binding = result
+        .ir()
+        .model
+        .appearance_bindings
+        .iter()
+        .find(|binding| {
+            matches!(
+                binding.target,
+                cadmpeg_ir::appearance::AppearanceTarget::Tessellation(_)
+            )
+        })
+        .unwrap();
+    let appearance = result
+        .ir()
+        .model
+        .appearances
+        .iter()
+        .find(|appearance| appearance.id == binding.appearance)
+        .unwrap();
+    assert_eq!(
+        appearance.base_color,
+        Some(cadmpeg_ir::topology::Color::from_rgba8(128, 128, 128, 255))
+    );
+    assert_eq!(
+        binding.channels.get("packed_color_hex").map(String::as_str),
+        Some("00808080")
+    );
+    assert_eq!(binding.object_type.as_deref(), Some("DisplayFace"));
+    assert!(result
+        .ir()
+        .model
+        .faces
+        .iter()
+        .all(|face| face.color.is_none()));
+}
+
+#[test]
+fn face_local_wins_and_conflicting_or_missing_feature_sources_do_not_guess() {
+    let faces = vec![
+        vec![
+            ("moFromSktEntSurfIdRep_c", 36, 1),
+            ("moFromSktEntSurfIdRep_c", 36, 1),
+        ],
+        vec![
+            ("moFromSktEntSurfIdRep_c", 36, 2),
+            ("moFromSktEntSurfIdRep_c", 44, 2),
+        ],
+        vec![("moEndFace3IntSurfIdRep_c", 99, 1)],
+    ];
+    assert_eq!(
+        display_colors(display_fixture(
+            [128; 3],
+            &faces,
+            &[(0, [0, 0, 255])],
+            &[(36, 10, [255, 0, 0]), (44, 20, [0, 255, 0])],
+        )),
+        [[0, 0, 255], [128; 3], [128; 3]]
+    );
+}
+
+#[test]
+fn decode_retains_visual_property_without_fabricating_body_ownership() {
+    let f = sldprt_with_body_and_material(&triangle_body(), "Steel", [32, 64, 128]);
+    let mut cur = Cursor::new(f);
+
+    let result = SldprtCodec
+        .decode(&mut cur, &DecodeOptions::default())
+        .unwrap();
+
+    assert!(result.ir().model.bodies[0].color.is_none());
+    let color = result.ir().model.appearances[0].base_color.unwrap();
+    assert!((color.r() - 32.0 / 255.0).abs() < EPS_COLOR_COMPONENT);
+    assert!((color.g() - 64.0 / 255.0).abs() < EPS_COLOR_COMPONENT);
+    assert!((color.b() - 128.0 / 255.0).abs() < EPS_COLOR_COMPONENT);
+    assert_eq!(result.ir().model.appearances.len(), 1);
+    assert!(result.ir().model.appearance_bindings.is_empty());
+    assert_eq!(
+        result.ir().model.appearances[0].name.as_deref(),
+        Some("Steel")
+    );
+}
+
+#[test]
+fn decode_preserves_ambiguous_materials_without_fabricating_ownership() {
+    let mut source = sldprt_with_body(&triangle_body());
+    let mut materials = material_payload("Steel", [32, 64, 128]);
+    materials.extend(material_payload("Aluminum", [160, 170, 180]));
+    source.extend(make_block(0x40, "SWObjects", &materials));
+
+    let result = SldprtCodec
+        .decode(&mut Cursor::new(source), &DecodeOptions::default())
+        .unwrap();
+    let mut result = cadmpeg_test_support::EditableDecodeResult::from(result);
+    assert_eq!(result.ir().model.appearances.len(), 2);
+    assert!(result.ir().model.appearance_bindings.is_empty());
+    assert!(result
+        .ir()
+        .model
+        .bodies
+        .iter()
+        .all(|body| body.color.is_none() && body.name.is_none()));
+
+    let moved = result.ir_mut().model.points[0].position().get();
+    result.ir_mut().model.points[0].set_position(
+        cadmpeg_ir::features::FinitePoint3::new(cadmpeg_ir::math::Point3::new(
+            moved.x,
+            moved.y,
+            moved.z + 1.0,
+        ))
+        .expect("a finite position is a point"),
+    );
+    let mut encoded = Vec::new();
+    crate::test_support::plan_fixture_write_with_native_envelope(
+        result.ir(),
+        result.source_fidelity(),
+        &mut encoded,
+    )
+    .unwrap();
+    let regenerated = SldprtCodec
+        .decode(&mut Cursor::new(encoded), &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(regenerated.ir().model.appearances.len(), 2);
+    assert_eq!(
+        regenerated
+            .ir()
+            .model
+            .appearances
+            .iter()
+            .filter_map(|appearance| appearance.name.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["Steel", "Aluminum"]
+    );
+    assert!(regenerated.ir().model.appearance_bindings.is_empty());
+}
+
+#[test]
+fn decode_binds_entity53_color_to_face() {
+    use cadmpeg_ir::appearance::AppearanceTarget;
+    let mut body = Vec::new();
+    body.extend(face_color_definition());
+    body.extend(entity51(2, 500, 0x0017, &[700, 0, 0, 0, 0, 0]));
+    body.extend(entity51(
+        1,
+        700,
+        FACE_COLOR_DEFINITION_ID,
+        &[0, 0, 0, 0, 0, 900],
+    ));
+    body.extend(entity53_color(900, [0.25, 0.5, 0.75]));
+    body.extend(owned_triangle(0, 700, 0.0));
+    // The fixture declares a `swVersion` so the exact loss count below stays a
+    // statement about appearance binding. Without one the part classifies as
+    // `sldprt:unknown` and picks up `source.dialect-unverified`, which has
+    // nothing to do with what this test asserts.
+    let mut fixture = sldprt_with_body(&body);
+    add_solidworks_version(&mut fixture, 13100);
+    let mut cur = Cursor::new(fixture);
+    let result = SldprtCodec
+        .decode(&mut cur, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(
+        result.report().losses.len(),
+        1,
+        "{:#?}",
+        result.report().losses
+    );
+    assert_eq!(
+        result.report().losses[0].message,
+        "1 configuration state(s) are inferred from geometry partitions without native configuration definitions."
+    );
+    let binding = result
+        .ir()
+        .model
+        .appearance_bindings
+        .iter()
+        .find(|binding| matches!(binding.target, AppearanceTarget::Face(_)))
+        .expect("face binding");
+    let appearance = result
+        .ir()
+        .model
+        .appearances
+        .iter()
+        .find(|appearance| appearance.id == binding.appearance)
+        .unwrap();
+    let color = appearance.base_color.unwrap();
+    assert_eq!([color.r(), color.g(), color.b()], [0.25, 0.5, 0.75]);
+}
+
+#[test]
+fn decode_does_not_bind_color_to_an_unemitted_face() {
+    use cadmpeg_ir::appearance::AppearanceTarget;
+
+    let mut body = Vec::new();
+    body.extend(face_color_definition());
+    body.extend(entity51(
+        1,
+        700,
+        FACE_COLOR_DEFINITION_ID,
+        &[0, 0, 0, 0, 0, 900],
+    ));
+    body.extend(entity53_color(900, [0.25, 0.5, 0.75]));
+    body.extend(entity51(
+        1,
+        701,
+        FACE_COLOR_DEFINITION_ID,
+        &[0, 0, 0, 0, 0, 901],
+    ));
+    body.extend(entity53_color(901, [0.75, 0.5, 0.25]));
+    body.extend(owned_triangle(0, 700, 0.0));
+    body.extend(plane_carrier(
+        200,
+        [2.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ));
+    body.extend(bridge_owned(110, 120, 200, 701));
+
+    let result = SldprtCodec
+        .decode(
+            &mut Cursor::new(sldprt_with_body(&body)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(result.ir().model.appearances.len(), 2);
+    assert_eq!(
+        result
+            .ir()
+            .model
+            .appearance_bindings
+            .iter()
+            .filter(|binding| matches!(binding.target, AppearanceTarget::Face(_)))
+            .count(),
+        1
+    );
+    assert!(
+        cadmpeg_ir::validate_neutral(result.ir(), result.report().losses.clone())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_binds_adjacent_entity53_color_to_disc14_face() {
+    use cadmpeg_ir::appearance::AppearanceTarget;
+    let mut body = Vec::new();
+    body.extend(face_color_definition());
+    body.extend(entity51(2, 500, 0x0017, &[700, 0, 0, 0, 0, 0]));
+    body.extend(entity51(
+        1,
+        700,
+        FACE_COLOR_DEFINITION_ID,
+        &[0, 0, 0, 0, 0, 0],
+    ));
+    body.extend(entity53_color(901, [1.0, 0.125, 0.0]));
+    body.extend(owned_triangle(0, 700, 0.0));
+    let mut cur = Cursor::new(sldprt_with_body(&body));
+    let result = SldprtCodec
+        .decode(&mut cur, &DecodeOptions::default())
+        .unwrap();
+    let binding = result
+        .ir()
+        .model
+        .appearance_bindings
+        .iter()
+        .find(|binding| matches!(binding.target, AppearanceTarget::Face(_)))
+        .expect("face binding");
+    let color = result
+        .ir()
+        .model
+        .appearances
+        .iter()
+        .find(|appearance| appearance.id == binding.appearance)
+        .unwrap()
+        .base_color
+        .unwrap();
+    assert_eq!([color.r(), color.g(), color.b()], [1.0, 0.125, 0.0]);
+}
+
+#[test]
+fn visual_property_keeps_lossless_packed_hex_alongside_color() {
+    let payload = material_payload("Steel", [32, 64, 128]);
+    let mut source = outer_header();
+    source.extend(make_block(0x43, "", &payload));
+    let scan = crate::test_support::container::scan(&source);
+    let arena = cadmpeg_core::decode::DecodeArena::new();
+    let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+        &source,
+        &arena,
+        &cadmpeg_core::decode::DecodePolicy::service(),
+    )
+    .unwrap();
+    let definitions = super::definitions(&ctx, &scan).unwrap();
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].packed_hex, "00804020");
+    let color = definitions[0].color;
+    assert!((color.r() - 32.0 / 255.0).abs() < EPS_COLOR_COMPONENT);
+    assert!((color.g() - 64.0 / 255.0).abs() < EPS_COLOR_COMPONENT);
+    assert!((color.b() - 128.0 / 255.0).abs() < EPS_COLOR_COMPONENT);
+}
+
+#[test]
+fn conflicting_feature_appearances_are_retained_as_unresolved_evidence() {
+    use std::collections::BTreeSet;
+    let faces = vec![vec![("moFromSktEntSurfIdRep_c", 36, 1)]];
+    let mut display = Vec::new();
+    display_class(&mut display, "uoTempFaceTessData_c");
+    display.extend(1_u32.to_le_bytes());
+    display.extend(1_u32.to_le_bytes());
+    display.extend(display_table(0.0));
+    display.extend(framed_surface_reference("moFromSktEntSurfIdRep_c", 36, 1));
+    display_class(&mut display, "uoBodyPropInfo_c");
+    display.extend(inline_display_appearance("Body default", [128; 3]));
+    let mut visual_states = Vec::new();
+    display_class(&mut visual_states, "moCompFeature_c");
+    visual_states.extend(feature_visual_record(36, 10, [255, 0, 0]));
+    visual_states.extend(feature_visual_record(36, 10, [0, 255, 0]));
+    let mut source = outer_header();
+    source.extend(make_block(0x41, "Contents/DisplayLists", &display));
+    source.extend(make_block(
+        0x42,
+        "ThirdPtyStore/VisualStates",
+        &visual_states,
+    ));
+    let scan = crate::test_support::container::scan(&source);
+    let arena = cadmpeg_core::decode::DecodeArena::new();
+    let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+        &source,
+        &arena,
+        &cadmpeg_core::decode::DecodePolicy::service(),
+    )
+    .unwrap();
+    let section = scan
+        .sections()
+        .find(|section| section.name() == Some("Contents/DisplayLists"))
+        .unwrap();
+    let display_faces = crate::tessellation::section_display_faces(&ctx, section).unwrap();
+    let mut eligible = BTreeSet::new();
+    eligible.insert(crate::brep::feature_source::FeatureSourceId::try_from(36).unwrap());
+    let resolved =
+        super::resolve_display_appearances(&ctx, &scan, section, &display_faces, &eligible)
+            .unwrap();
+    assert_eq!(resolved.unresolved.len(), 1);
+    let unresolved = &resolved.unresolved[0];
+    assert_eq!(unresolved.owner_class, "moCompFeature_c");
+    assert_eq!(unresolved.identity, "36");
+    assert_eq!(unresolved.appearance_index, 0);
+    assert!(!unresolved.reason.is_empty());
+    assert!(unresolved.source_offset > 0);
+    assert!(unresolved.packed_hex.is_some());
+    let _ = faces;
+}
+
+#[test]
+fn appearance_utf16_name_decodes() {
+    let mut payload = material_payload("x", [32, 64, 128]);
+    let length = payload.len();
+    payload[length - 2..].copy_from_slice(&0x0800_u16.to_le_bytes());
+    let mut source = outer_header();
+    source.extend(make_block(0x43, "", &payload));
+    let scan = crate::test_support::container::scan(&source);
+    let arena = cadmpeg_core::decode::DecodeArena::new();
+    let (ctx, _) = cadmpeg_core::decode::DecodeContext::from_root_bytes(
+        &[],
+        &arena,
+        &cadmpeg_core::decode::DecodePolicy::service(),
+    )
+    .expect("empty root");
+    assert_eq!(
+        super::definitions(&ctx, &scan).expect("decode the appearance definitions")[0].name,
+        "ࠀ"
+    );
+}

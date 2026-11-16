@@ -56,6 +56,7 @@ pub const MODIFIERS: &[ToolModifiers] = &[
     // Pattern spacing/count live in the dialog - no viewport modifier chords.
     ToolModifiers { tool: "sketch.pattern.rectangular", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "sketch.pattern.circular", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "sketch.fillet3d", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "sketch.fillet", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "sketch.chamfer.equal_distance", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "sketch.chamfer.two_distance", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
@@ -143,6 +144,8 @@ pub enum Mod {
     /// `sketch.pattern.circular`: how many instances around the picked centre, and the total
     /// angle they span.
     PatternCirc { count: String, angle: String, alignment: PatternAlignment, reversed: bool },
+    /// Round the junction of two straight sketch lines in world space.
+    Fillet3d { radius: String },
     /// `sketch.fillet` and the three `sketch.chamfer.*` commands. `chamfer` chooses between a
     /// fillet and a chamfer and never changes while the window is open; `ctype` chooses which
     /// of the three chamfer commands runs (0 equal distance, 1 two distances, 2 distance and
@@ -163,7 +166,13 @@ impl Mod {
     pub fn previews(&self) -> bool {
         matches!(
             self,
-            Self::Mirror | Self::PatternRect { .. } | Self::PatternCirc { .. } | Self::Offset { .. } | Self::Corner { .. } | Self::Divide { .. }
+            Self::Mirror
+                | Self::PatternRect { .. }
+                | Self::PatternCirc { .. }
+                | Self::Offset { .. }
+                | Self::Corner { .. }
+                | Self::Fillet3d { .. }
+                | Self::Divide { .. }
         )
     }
 
@@ -176,6 +185,7 @@ impl Mod {
             Mod::Transform { .. } => "TRANSFORM",
             Mod::PatternRect { .. } => "RECTANGULAR PATTERN",
             Mod::PatternCirc { .. } => "CIRCULAR PATTERN",
+            Mod::Fillet3d { .. } => "3D SKETCH FILLET",
             Mod::Corner { chamfer: false, .. } => "FILLET",
             Mod::Corner { .. } => "CHAMFER",
             Mod::Equation { .. } => "EQUATION CURVE",
@@ -194,6 +204,7 @@ impl Mod {
             Mod::Mirror => None,
             Mod::PatternRect { spacing, .. } => Some(("Spacing", ValueKind::Length, spacing)),
             Mod::PatternCirc { angle, .. } => Some(("Angle", ValueKind::Angle, angle)),
+            Mod::Fillet3d { radius } => Some(("Radius", ValueKind::Length, radius)),
             Mod::Corner { chamfer: false, size, .. } => Some(("Radius", ValueKind::Length, size)),
             Mod::Corner { size, .. } => Some(("Distance", ValueKind::Length, size)),
             Mod::Equation { .. } | Mod::Divide { .. } => None,
@@ -228,6 +239,7 @@ fn inputs(k: &Mod) -> Vec<SelInput> {
         // A fillet rounds any number of corners to one radius, and a chamfer cuts any number
         // alike (`points`). Two lines name the corner between them where more lines meet at its
         // point (#1824), for both.
+        Mod::Fillet3d { .. } => vec![SelInput::new("First line", CURVES, false), SelInput::new("Second line", CURVES, false)],
         Mod::Corner { .. } => vec![SelInput::new("Corners", SKETCH_POINTS | CURVES, true)],
         Mod::Equation { .. } => Vec::new(),
         Mod::Divide { .. } => vec![SelInput::new("Curves", CURVES, true)],
@@ -281,6 +293,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         "sketch.pattern.circular" => {
             Mod::PatternCirc { count: "6".into(), angle: "360 deg".into(), alignment: PatternAlignment::Right, reversed: false }
         }
+        "sketch.fillet3d" => Mod::Fillet3d { radius: crate::dialogs::length_default(&app.session, "2") },
         "sketch.fillet" => corner(false, 0),
         "sketch.chamfer.equal_distance" => corner(true, 0),
         "sketch.chamfer.two_distance" => corner(true, 1),
@@ -368,6 +381,29 @@ pub(crate) fn picks_entity(d: &Dialog, session: &solidcraft_engine::Session, hit
     candidate(d, session, hit).is_none() && entities_candidate(d, session, hit).is_some()
 }
 
+pub(crate) fn fillet3d_line(session: &solidcraft_engine::Session, sketch: u64, id: &str) -> bool {
+    if Some(sketch) != session.active_sketch {
+        return false;
+    }
+    let state = crate::open_meshing::session_world(session);
+    let Some(ss) = state.sketch(sketch) else {
+        return false;
+    };
+    let sk = &ss.sketch;
+    sk.curve_index(id).is_some_and(|i| {
+        let c = &sk.curves[i];
+        matches!(c.kind, solidcraft_engine::sketch::CurveKind::Line { .. })
+            && c.link.is_none()
+            && !c.fixed
+            && !c.infinite
+            && !sk.is_ellipse_axis(i)
+            && sk.offset_distance(id).is_none()
+    }) || sk.wire_index(id).is_some_and(|i| {
+        let w = &sk.wires[i];
+        w.link.is_none() && w.fit.len() == 2 && w.arc.is_none() && w.exact.is_empty()
+    })
+}
+
 /// What the active input of a sketch modify window takes. Sketch modify inputs accept only the
 /// sketch being edited. Origin axes remain valid rectangular-pattern directions, while Hole
 /// continues using its separate POINTS mask.
@@ -375,6 +411,12 @@ pub fn candidate(d: &Dialog, session: &solidcraft_engine::Session, hit: &Hit) ->
     let active = session.active_sketch?;
     match hit {
         Hit::SketchCurve { sketch, .. } | Hit::SketchPoint { sketch, .. } | Hit::Profile { sketch, .. } if *sketch != active => None,
+        Hit::SketchCurve { sketch, id, .. } if matches!(d.kind, Kind::SketchModify(Mod::Fillet3d { .. })) => {
+            if !fillet3d_line(session, *sketch, id) {
+                return None;
+            }
+            d.active_input()?.accepts(hit, Some(active), |_, _| false)
+        }
         Hit::SketchCurve { id, .. } if matches!(d.kind, Kind::SketchModify(Mod::Corner { .. })) => {
             let state = crate::open_meshing::session_world(session);
             let sk = &state.sketch(active)?.sketch;
@@ -522,6 +564,7 @@ pub(crate) fn command(k: &Mod) -> &'static str {
         Mod::Transform { .. } => "sketch.transform",
         Mod::PatternRect { .. } => "sketch.pattern.rectangular",
         Mod::PatternCirc { .. } => "sketch.pattern.circular",
+        Mod::Fillet3d { .. } => "sketch.fillet3d",
         Mod::Corner { chamfer: false, .. } => "sketch.fillet",
         Mod::Corner { ctype: 1, .. } => "sketch.chamfer.two_distance",
         Mod::Corner { ctype: 2, .. } => "sketch.chamfer.distance_angle",
@@ -529,11 +572,6 @@ pub(crate) fn command(k: &Mod) -> &'static str {
         Mod::Equation { .. } => "sketch.equation_curve",
         Mod::Divide { .. } => "sketch.point.divide",
     }
-}
-
-/// Repeatable operations offer Apply for another selection, with the same typed values.
-pub(crate) fn repeatable(k: &Mod) -> bool {
-    matches!(k, Mod::Offset { .. } | Mod::Mirror | Mod::PatternRect { .. } | Mod::PatternCirc { .. } | Mod::Divide { .. })
 }
 
 /// A labelled value row. The value carries its own unit text ("2 mm", "45 deg").
@@ -588,6 +626,7 @@ fn pattern_hint(ui: &mut egui::Ui) {
 pub fn rows(ui: &mut egui::Ui, k: &mut Mod, doc: &Document) -> bool {
     let mut enter = false;
     match k {
+        Mod::Fillet3d { radius } => enter |= number(ui, "Radius", radius),
         Mod::Scale { factor } => enter |= number(ui, "Factor", factor),
         Mod::Offset { distance, distance2, instances, mode, chain, flip } => {
             icons(ui, "Direction", &OFFSET_MODES, &OFFSET_MODE_ICONS, mode);
@@ -1125,6 +1164,15 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                 "sketch.pattern.circular",
                 json!({"entities": entities, "center": center, "count": count, "angle": angle, "alignment": alignment, "reversed": reversed}),
             )
+        }
+        Mod::Fillet3d { radius } => {
+            let curves = [curve_ids(inputs, 0), curve_ids(inputs, 1)].concat();
+            if curves.len() != 2 || curves[0] == curves[1] {
+                return Err("Select two different straight lines to round their corner".into());
+            }
+            corner_size(app, "Radius", radius, ValueKind::Length)?;
+            let radius = crate::length_input::expression(&app.session.doc, radius, ValueKind::Length);
+            ("sketch.fillet3d", json!({"curves":curves, "radius":radius}))
         }
         Mod::Corner { chamfer: false, size, .. } => {
             let corners = corner_ids(app, inputs, 0);

@@ -700,6 +700,7 @@ impl<'d> Reader<'d, '_, '_> {
                 continue;
             }
             self.meshes.push(MeshData {
+            appearance: None,
                 name,
                 positions: positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
                 triangles: triangles.iter().flatten().copied().collect(),

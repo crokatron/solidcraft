@@ -50,15 +50,18 @@ crate::dialog_descriptor::dialog_descriptors! {
             keep_edges: bool = true => *keep_edges,
             tolerance: String = String::new() => tolerance.to_string(),
         } => json!({"strength": strength, "iterations": iterations, "keep_edges": keep_edges});
-        Match("surface.match", "ui.match_surface_title", [("Surface or face", BODIES | FACES, true), ("Target", BODIES | FACES, false), ("Target edges", EDGES, true)],
-            FeatureKind::SurfaceMatch { order, .. }) {
+        Match("surface.match", "ui.match_surface_title", [("Surface or face", BODIES | FACES, true), ("Target", BODIES | FACES, false), ("Target edges", EDGES, true), ("Source boundary edges", EDGES, true)],
+            FeatureKind::SurfaceMatch { order, cross_scale, reverse_target, .. }) {
             order: usize = 1 => MATCH_CONTINUITY.iter().position(|(_, word)| *word == order.as_str()).unwrap_or(1),
-        } => json!({"order": MATCH_CONTINUITY.get(*order).map_or("g2", |(_, word)| *word)});
+            cross_scale: String = "1".into() => cross_scale.to_string(),
+            reverse_target: bool = true => *reverse_target,
+        } => json!({"order": MATCH_CONTINUITY.get(*order).map_or("g2", |(_, word)| *word),"reverse_target":reverse_target});
         ; custom {
             /// `direction`: an index into [`EXTRUDE_SIDES`].
             Extrude {
                 distance: String,
                 direction: usize,
+                edge: EdgeExtrude,
             },
             /// `axis`: a stored {origin, dir} axis, used while no axis is picked.
             Revolve {
@@ -100,6 +103,7 @@ crate::dialog_descriptor::dialog_descriptors! {
                 angle: String,
                 flip: bool,
                 round: bool,
+                vector: [String; 3],
             },
             /// `direction`: the stored sweep direction of trimming curves (none: the sketch's normal).
             Trim {
@@ -207,7 +211,8 @@ fn boundary_orders() -> Vec<Continuity> {
 }
 
 /// The continuity of a surface matched to its target's edge chain.
-const MATCH_CONTINUITY: [(&str, &str); 3] = [("Tangent (G1)", "g1"), ("Curvature (G2)", "g2"), ("Curvature change (G3)", "g3")];
+const MATCH_CONTINUITY: [(&str, &str); 4] =
+    [("Tangent (G1)", "g1"), ("Curvature (G2)", "g2"), ("Curvature change (G3)", "g3"), ("Position (G0)", "g0")];
 
 /// What a boundary surface becomes: a body of its own, or part of the body of its edges.
 const BOUNDARY_OPS: [&str; 2] = ["New Body", "Join"];
@@ -216,14 +221,46 @@ const BOUNDARY_OPS: [&str; 2] = ["New Body", "Join"];
 const UNTRIM_HOLES: [&str; 3] = ["All", "Picked", "None"];
 
 /// The sides a surface extrude goes to (labels, and the `direction` parameter).
+pub(crate) const SYMMETRIC: usize = 1;
+pub(crate) const FLIPPED: usize = 2;
 const EXTRUDE_SIDES: [(&str, &str); 3] = [("One Side", "positive"), ("Symmetric", "symmetric"), ("Flipped", "negative")];
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeExtrude {
+    pub method: usize,
+    pub vector: [String; 3],
+    pub flip: bool,
+}
+
+impl Default for EdgeExtrude {
+    fn default() -> Self {
+        Self { method: 0, vector: ["0".into(), "0".into(), "1".into()], flip: false }
+    }
+}
+
+pub(crate) const CUSTOM_VECTOR: usize = 1;
+pub(crate) const EXTEND_FACE: usize = 2;
+
+pub(crate) fn direction_vector(fields: &[String; 3]) -> Option<Vec3> {
+    let read = |i: usize| fields[i].trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    Vec3::new(read(0)?, read(1)?, read(2)?).normalized()
+}
+
+fn vector_rows(ui: &mut egui::Ui, vector: &mut [String; 3]) -> bool {
+    let mut enter = false;
+    for (label, value) in ["Direction X", "Direction Y", "Direction Z"].into_iter().zip(vector) {
+        enter |= expr_row(ui, label, value);
+    }
+    ui_kit::text(ui, solidcraft_ui_text::tr_label("Click an axis or drag a rotation ring."), ui_kit::Text::Hint("csys"));
+    enter
+}
 
 /// The ways a ruled surface leaves its edges (labels, and the `mode` parameter).
 const RULED_MODES: [(&str, &str); 4] = [("Normal", "normal"), ("Tangent", "tangent"), ("Angle", "angle"), ("Direction", "direction")];
 
 fn inputs(k: &Surf) -> Vec<SelInput> {
     match k {
-        Surf::Extrude { .. } => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true)],
+        Surf::Extrude { .. } => vec![SelInput::new("Profiles, curves or edges", PROFILES | CURVES | EDGES, true)],
         Surf::Revolve { .. } => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true), SelInput::new("Axis", AXIS_PICKS, false)],
         Surf::Sweep(_) => {
             let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
@@ -263,7 +300,9 @@ fn inputs(k: &Surf) -> Vec<SelInput> {
 /// The dialog for a surface command.
 pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     let k = match id {
-        "surface.extrude" => Surf::Extrude { distance: crate::dialogs::length_default(&app.session, "10"), direction: 0 },
+        "surface.extrude" | "surface.extrude_edge" => {
+            Surf::Extrude { distance: crate::dialogs::length_default(&app.session, "10"), direction: 0, edge: EdgeExtrude::default() }
+        }
         "surface.revolve" => Surf::Revolve { angle: "360 deg".into(), symmetric: false, axis: None },
         "surface.sweep" => Surf::Sweep(crate::dialogs_sweep::SweepOpts::default()),
         "surface.loft" => Surf::Loft { rail_fit: 0 },
@@ -272,9 +311,14 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         "surface.patch" => Surf::Patch { continuity: Continuity::G0 },
         "surface.unstitch" => Surf::Unstitch,
         "surface.reverse_normal" => Surf::ReverseNormal,
-        "surface.ruled" => {
-            Surf::Ruled { distance: crate::dialogs::length_default(&app.session, "10"), mode: 0, angle: "5 deg".into(), flip: false, round: false }
-        }
+        "surface.ruled" => Surf::Ruled {
+            distance: crate::dialogs::length_default(&app.session, "10"),
+            mode: 0,
+            angle: "5 deg".into(),
+            flip: false,
+            round: false,
+            vector: Default::default(),
+        },
         "surface.trim" => Surf::Trim { extend: false, stitch: false, direction: None },
         "surface.untrim" => Surf::Untrim { holes: 0, outer: false, in_place: false },
         "solid.split_face" => Surf::SplitFace,
@@ -285,7 +329,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
 }
 
 /// The rows after the inputs; true when Enter was pressed in a field.
-pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
+pub fn rows(ui: &mut egui::Ui, k: &mut Surf, inputs: &mut Vec<SelInput>, active: &mut usize) -> bool {
     let mut enter = false;
     match k {
         Surf::Fair { strength, iterations, keep_edges, tolerance } => {
@@ -298,8 +342,11 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
             enter |= hint_row(ui, "Tolerance", tolerance, solidcraft_ui_text::tr_label("ui.fair_tolerance_default"));
             ui_kit::options(ui, "fair_options", &mut [("ui.fair_keep_edges", keep_edges)]);
         }
-        Surf::Match { order } => {
+        Surf::Match { order, cross_scale, reverse_target } => {
             choice_row(ui, "Continuity", "match_order", order, &MATCH_CONTINUITY.map(|(label, _)| label));
+            enter |= expr_row(ui, solidcraft_ui_text::tr("ui.surface_match.cross_scale"), cross_scale);
+            ui.checkbox(reverse_target, solidcraft_ui_text::tr("ui.surface_match.reverse"));
+            ui.add(egui::Label::new(solidcraft_ui_text::tr("ui.surface_match.help")).wrap());
         }
         Surf::Stitch { tolerance } => {
             enter |= hint_row(ui, "Tolerance", tolerance, solidcraft_ui_text::tr("ui.stitch_tolerance_hint"));
@@ -328,11 +375,14 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
             enter |= expr_row(ui, "Distance", distance);
             ui_kit::options(ui, "offset_options", &mut [("Tangent chain", chain)]);
         }
-        Surf::Ruled { distance, mode, angle, flip, round } => {
+        Surf::Ruled { distance, mode, angle, flip, round, vector } => {
             enter |= expr_row(ui, "Distance", distance);
             choice_row(ui, "Type", "ru_mode", mode, &RULED_MODES.map(|(label, _)| label));
             if RULED_MODES.get(*mode).is_some_and(|(_, m)| *m == "angle") {
                 enter |= expr_row(ui, "Angle", angle);
+            }
+            if *mode == 3 && items(inputs, 2).is_empty() {
+                enter |= vector_rows(ui, vector);
             }
             form_row(ui, "Corners", |ui| {
                 let mut corner = usize::from(*round);
@@ -341,11 +391,29 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
             });
             ui_kit::options(ui, "ruled_options", &mut [("Flip", flip)]);
         }
-        Surf::Extrude { distance, direction } => {
+        Surf::Extrude { distance, direction, edge } => {
             enter |= expr_row(ui, "Distance", distance);
-            form_row(ui, "Direction", |ui| {
-                ui_kit::segmented(ui, direction, &EXTRUDE_SIDES.map(|(label, _)| label), Default::default());
-            });
+            let edges = items(inputs, 0).iter().any(|s| matches!(s, Sel::Edge { .. }));
+            if edges {
+                choice_row(ui, "Edge method", "surface_edge_method", &mut edge.method, &["Face Normal", "Custom Vector", "Extend Face"]);
+                if edge.method == CUSTOM_VECTOR {
+                    enter |= vector_rows(ui, &mut edge.vector);
+                }
+                if edge.method != EXTEND_FACE {
+                    ui_kit::options(ui, "edge_extrude_options", &mut [("Reverse direction", &mut edge.flip)]);
+                }
+            } else {
+                form_row(ui, "Direction", |ui| {
+                    ui_kit::segmented(ui, direction, &EXTRUDE_SIDES.map(|(label, _)| label), Default::default());
+                });
+            }
+            let support = edges && edge.method == 0;
+            if support && inputs.len() == 1 {
+                inputs.push(SelInput::new("Support face", FACES, false));
+            } else if !support && inputs.len() > 1 {
+                inputs.truncate(1);
+                *active = 0;
+            }
         }
         Surf::Untrim { holes, outer, in_place } => {
             choice_row(ui, "Holes", "ut_holes", holes, &UNTRIM_HOLES);
@@ -551,12 +619,37 @@ fn chains(app: &SolveApp, picks: &[Sel]) -> Result<Vec<Chain>, String> {
 pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<String, Value>) -> Result<Vec<(String, Value)>, String> {
     let need = |i: usize, what: &str| if items(inputs, i).is_empty() { Err(format!("select {what} first")) } else { Ok(()) };
     let (cmd, mut p) = match k {
-        Surf::Extrude { distance, direction } => {
-            need(0, "profiles or curves to extrude")?;
-            let mut p = sheet_picks(app, items(inputs, 0))?;
-            p["distance"] = json!(distance);
-            p["direction"] = json!(EXTRUDE_SIDES.get(*direction).map_or("positive", |(_, d)| *d));
-            ("surface.extrude", p)
+        Surf::Extrude { distance, direction, edge } => {
+            need(0, "profiles, curves or edges to extrude")?;
+            let picked = items(inputs, 0);
+            if picked.iter().any(|s| matches!(s, Sel::Edge { .. })) {
+                let (body, edges) = body_and_edges(picked)?;
+                let mode = match edge.method {
+                    CUSTOM_VECTOR => "direction",
+                    EXTEND_FACE => "extend",
+                    _ => "normal",
+                };
+                let mut p = json!({"body":body,"edges":edges,"mode":mode,"distance":distance});
+                if edge.method == CUSTOM_VECTOR {
+                    p["direction"] = pt(direction_vector(&edge.vector).ok_or("enter a non-zero direction vector")?);
+                } else if edge.method == 0
+                    && let Some(Sel::Face { body: face_body, point, .. }) = items(inputs, 1).first()
+                {
+                    if face_body != &body {
+                        return Err("pick a support face on the edges' body".into());
+                    }
+                    p["face"] = pt(*point);
+                }
+                if edge.method != EXTEND_FACE && edge.flip {
+                    p["flip"] = json!(true);
+                }
+                ("surface.extrude_edge", p)
+            } else {
+                let mut p = sheet_picks(app, picked)?;
+                p["distance"] = json!(distance);
+                p["direction"] = json!(EXTRUDE_SIDES.get(*direction).map_or("positive", |(_, d)| *d));
+                ("surface.extrude", p)
+            }
         }
         Surf::Revolve { angle, symmetric, axis } => {
             need(0, "profiles or curves to revolve")?;
@@ -728,7 +821,7 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             }
             ("surface.offset", p)
         }
-        Surf::Ruled { distance, mode, angle, flip, round } => {
+        Surf::Ruled { distance, mode, angle, flip, round, vector } => {
             need(0, "the edges to rule from")?;
             let (body, edges) = body_and_edges(items(inputs, 0))?;
             let mode = RULED_MODES.get(*mode).map_or("normal", |(_, m)| *m);
@@ -746,6 +839,9 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             let kept = extra.get("direction").and_then(|v| serde_json::from_value::<[f64; 3]>(v.clone()).ok()).map(|a| Vec3::new(a[0], a[1], a[2]));
             let dir = match items(inputs, 2).first() {
                 Some(x) => Some(crate::dialogs::axis_of(app, x).ok_or("the direction must be an axis, a sketch line or a straight edge")?.1),
+                None if mode == "direction" && vector.iter().any(|s| !s.is_empty()) => {
+                    Some(direction_vector(vector).ok_or("enter a non-zero direction vector")?)
+                }
                 None => kept,
             };
             match (mode, dir) {
@@ -767,7 +863,7 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             put(&mut p, &[("tolerance", tolerance)]);
             ("surface.fair", p)
         }
-        Surf::Match { .. } => {
+        Surf::Match { cross_scale, order, .. } => {
             let (body, faces) = body_and_faces(items(inputs, 0))?;
             if items(inputs, 1).len() != 1 {
                 return Err("select the target body first".into());
@@ -777,7 +873,22 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             if edge_body != target {
                 return Err("pick edges of the target body".into());
             }
-            ("surface.match", json!({"body": body, "faces": faces, "target": target, "edges": edges}))
+            let scale = app.session.doc.eval(cross_scale, ValueKind::Unitless).map_err(|e| e.to_string())?;
+            if !scale.is_finite() || scale <= 0. {
+                return Err(solidcraft_ui_text::tr("ui.surface_match.bad_scale").into());
+            }
+            let mut p = json!({"body": body, "faces": faces, "target": target, "edges": edges,"cross_scale":scale});
+            if !items(inputs, 3).is_empty() {
+                if items(inputs, 3).len() != 1 || items(inputs, 2).len() != 1 || *order == 2 {
+                    return Err(solidcraft_ui_text::tr("ui.surface_match.explicit_edges").into());
+                }
+                let (source, source_edges) = body_and_edges(items(inputs, 3))?;
+                if source != body {
+                    return Err(solidcraft_ui_text::tr("ui.surface_match.source_error").into());
+                }
+                p["source_edges"] = json!(source_edges);
+            }
+            ("surface.match", p)
         }
         Surf::Unstitch | Surf::ReverseNormal => {
             need(0, "a body or some of its faces")?;
@@ -1048,10 +1159,10 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
             let sels = sheet_sels(app, sketch.0, profiles.as_ref(), curves);
             let direction = match extent.direction {
                 Direction::Positive => 0,
-                Direction::Symmetric => 1,
-                Direction::Negative => 2,
+                Direction::Symmetric => SYMMETRIC,
+                Direction::Negative => FLIPPED,
             };
-            let k = Surf::Extrude { distance: extent.distance.to_string(), direction };
+            let k = Surf::Extrude { distance: extent.distance.to_string(), direction, edge: EdgeExtrude::default() };
             let mut ins = inputs(&k);
             if let Some(input) = ins.first_mut() {
                 input.items = sels;
@@ -1059,6 +1170,9 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
             // A symmetric extrude keeps the reading it was made with; a one-sided one made
             // symmetric here takes a new one's (timeline.redefine fills it in either way).
             let mut extra = Map::new();
+            if let Some(start) = &extent.start_offset {
+                extra.insert("start_offset".into(), json!(start.to_string()));
+            }
             if extent.direction == Direction::Symmetric {
                 extra.insert("convention".into(), json!(extent.convention));
             }
@@ -1095,7 +1209,9 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
         FeatureKind::SurfaceOffset { faces, .. } => {
             (Surf::simple_restore(kind)?, vec![faces.iter().filter_map(|p| crate::dialogs::face_sel(s, p.0)).collect()])
         }
-        FeatureKind::SurfaceRuled { edges, distance, mode, angle, direction, flip, corners, face, .. } => {
+        FeatureKind::SurfaceRuled { body, edges, distance, mode, angle, direction, flip, corners, face, .. } => {
+            let to_world = |p| solidcraft_engine::doc::apply_point(frame, p);
+            let direction = direction.as_ref().map(|d| solidcraft_engine::doc::apply_vector(frame, d.0));
             let k = Surf::Ruled {
                 distance: distance.to_string(),
                 mode: match mode {
@@ -1107,15 +1223,21 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
                 angle: angle.as_deref().map(str::to_string).unwrap_or_else(|| "5 deg".into()),
                 flip: *flip,
                 round: *corners == RuledCorners::Round,
+                vector: direction.map(|d| [d.x, d.y, d.z].map(|n| n.to_string())).unwrap_or_default(),
             };
             let mut ins = inputs(&k);
-            let fill = [edges.iter().filter_map(edge).collect(), face.and_then(|p| crate::dialogs::face_sel(s, p.0)).into_iter().collect()];
+            let picks: Vec<_> = edges.iter().filter_map(|p| crate::dialogs::world_edge_on(s, body.as_ref(), to_world(p.0))).collect();
+            let support = picks.first().and_then(|sel| match sel {
+                Sel::Edge { body, .. } => face.and_then(|p| crate::dialogs::world_face_on(s, body, to_world(p.0))),
+                _ => None,
+            });
+            let fill = [picks, support.into_iter().collect()];
             for (inp, items) in ins.iter_mut().zip(fill) {
                 inp.items = items;
             }
             let mut extra = Map::new();
             if let Some(d) = direction {
-                extra.insert("direction".into(), pt(d.0));
+                extra.insert("direction".into(), pt(d));
             }
             return Some((Kind::Surface(k), ins, extra));
         }
@@ -1127,9 +1249,10 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
                 faces.iter().map(|p| crate::dialogs::face_sel_on(s, Some(body.as_ref()), p.0)).collect::<Option<Vec<_>>>()?
             };
             let mut fill = vec![source];
-            if let FeatureKind::SurfaceMatch { target, edges, .. } = kind {
+            if let FeatureKind::SurfaceMatch { target, edges, source_edges, .. } = kind {
                 fill.push(vec![Sel::Body { name: target.to_string() }]);
                 fill.push(edges.iter().map(|p| crate::dialogs::edge_sel_on(s, Some(target.as_ref()), p.0)).collect::<Option<Vec<_>>>()?);
+                fill.push(source_edges.iter().map(|p| crate::dialogs::edge_sel_on(s, Some(body.as_ref()), p.0)).collect::<Option<Vec<_>>>()?);
             }
             (Surf::simple_restore(kind)?, fill)
         }
@@ -1145,7 +1268,7 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
         FeatureKind::Thicken { bodies, .. } => {
             (Surf::simple_restore(kind)?, vec![bodies.iter().map(|n| Sel::Body { name: n.to_string() }).collect()])
         }
-        FeatureKind::SurfaceExtend { edges, mode, up_to, neighbours, .. } => {
+        FeatureKind::SurfaceExtend { body, edges, mode, up_to, neighbours, .. } => {
             // The dialog edits the edges and the distance; the rest is kept as it was.
             let mut extra = Map::new();
             if !mode.is_natural() {
@@ -1173,7 +1296,15 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
             let k = Surf::simple_restore(kind)?;
             let mut ins = inputs(&k);
             if let Some(inp) = ins.first_mut() {
-                inp.items = edges.iter().filter_map(edge).collect();
+                // Extend stores picks in the source body's coordinates, including its own offset.
+                let frames = s.placed_document().body_frames_with_source(&s.model.state());
+                let name = frames
+                    .iter()
+                    .filter(|(_, source, ..)| source == body.as_ref())
+                    .min_by_key(|(_, _, _, path, _)| Some(path) != s.active_occurrence_path.as_ref())
+                    .map(|f| f.0.as_str())
+                    .unwrap_or(body.as_ref());
+                inp.items = edges.iter().filter_map(|p| crate::dialogs::edge_sel_on(s, Some(name), p.0)).collect();
             }
             return Some((Kind::Surface(k), ins, extra));
         }

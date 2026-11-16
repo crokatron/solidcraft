@@ -1,0 +1,917 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Bind native topology selections to decoded B-rep identities.
+
+use crate::brep::feature_source::FeatureSourceId;
+use crate::records::{FeatureHistory, FeatureInputSurfaceSelection};
+use cadmpeg_core::decode::View;
+use cadmpeg_core::CodecError;
+use cadmpeg_ir::geometry::{Curve, SolvedSurfaceGeometry, Surface, SurfaceGeometry};
+use cadmpeg_ir::math::{Point3, Vector3};
+use cadmpeg_ir::topology::{Body, Edge, Face};
+use cadmpeg_ir::{
+    features::{
+        BodySelection, DatumPlaneReference, EdgeSelection, ExtrudeExtent, ExtrudeSide,
+        FaceSelection, FeatureDefinition, FeatureOperation, LinearTermination, PathRef,
+        PlanarProfileRef, ProfileRef,
+    },
+    scalar::Length,
+};
+use std::collections::{BTreeMap, HashMap};
+
+use crate::history::literals::{parse_point3_mm, parse_vector3};
+use crate::records::FeatureSource;
+use crate::resolved_features::scalars::FeatureObjectNames;
+
+const EPS_SELECTIONS_RESOLVE_PLANAR_FACE_SELECTION_E9: f64 = 1e-9;
+const EPS_SELECTIONS_RESOLVE_PLANAR_FACE_SELECTION_E8: f64 = 1e-8;
+
+type SurfaceSelectionFaceBindings = HashMap<(String, String), Option<cadmpeg_ir::ids::FaceId>>;
+
+struct FaceSelectionContext<'a> {
+    ids: &'a HashMap<&'a str, Option<&'a cadmpeg_ir::ids::FaceId>>,
+    feature_ref: Option<&'a str>,
+    surface_selection_faces: &'a SurfaceSelectionFaceBindings,
+}
+
+pub(crate) struct TopologySelectionInputs<'a> {
+    pub(crate) bodies: &'a [Body],
+    pub(crate) faces: &'a [Face],
+    pub(crate) surfaces: &'a [Surface],
+    pub(crate) edges: &'a [Edge],
+    pub(crate) curves: &'a [Curve],
+    pub(crate) lanes: &'a [crate::records::FeatureInputLane],
+    pub(crate) face_identities:
+        &'a [(cadmpeg_ir::ids::FaceId, crate::brep::PersistentFaceIdentity)],
+}
+
+const SURFACE_COMPONENT_SELECTION_PREFIX: &str = "sldprt:feature-input:surface-component-ids";
+
+/// Resolve the support origin represented by a frame-backed offset reference.
+/// An explicit reference-face origin takes precedence. A surface-component
+/// selection stores the resulting plane origin, so its support is one signed
+/// `D1` displacement along the stored normal.
+fn offset_plane_support_origin(
+    source_properties: &BTreeMap<cadmpeg_core::text::NonBlankString, String>,
+    native: Option<&str>,
+    fallback_origin: Point3,
+    normal: Vector3,
+    distance: Length,
+) -> Point3 {
+    if let Some(origin) = source_properties
+        .get("ReferenceFaceOrigin")
+        .and_then(|value| parse_point3_mm(value))
+        .map(cadmpeg_ir::features::FinitePoint3::get)
+    {
+        return origin;
+    }
+    let origin = source_properties
+        .get("Origin")
+        .and_then(|value| parse_point3_mm(value))
+        .map_or(fallback_origin, cadmpeg_ir::features::FinitePoint3::get);
+    if native.is_some_and(|native| native.starts_with(SURFACE_COMPONENT_SELECTION_PREFIX)) {
+        return Point3::new(
+            origin.x + normal.x * distance.get(),
+            origin.y + normal.y * distance.get(),
+            origin.z + normal.z * distance.get(),
+        );
+    }
+    origin
+}
+
+fn surface_selection_face_bindings<'a>(
+    selections: impl IntoIterator<Item = &'a FeatureInputSurfaceSelection>,
+    feature_sources: &HashMap<&str, Option<FeatureSourceId>>,
+    face_identities: &[(cadmpeg_ir::ids::FaceId, crate::brep::PersistentFaceIdentity)],
+) -> SurfaceSelectionFaceBindings {
+    let mut faces_by_identity = HashMap::new();
+    for (target, identity) in face_identities {
+        let entry = faces_by_identity
+            .entry((identity.feature_source_id, identity.local_id))
+            .or_insert(Some(target));
+        if entry.as_ref().is_some_and(|existing| *existing != target) {
+            *entry = None;
+        }
+    }
+    let mut bindings = SurfaceSelectionFaceBindings::new();
+    for selection in selections {
+        let candidate = selection
+            .components
+            .last()
+            .and_then(|component| {
+                let feature_source_id = match selection.terminal_feature_ref.as_deref() {
+                    Some(terminal) => feature_sources.get(terminal).copied().flatten(),
+                    None => View::u32_le_at(component.type_signature.as_ref(), 4)
+                        .and_then(|source| FeatureSourceId::try_from(source).ok()),
+                }?;
+                faces_by_identity
+                    .get(&(feature_source_id, component.local_id?))
+                    .copied()
+                    .flatten()
+            })
+            .cloned();
+        let native = crate::resolved_features::terminations::compact_surface_selection_value(
+            &selection.components,
+        );
+        let key = (selection.feature_ref.clone(), native);
+        match bindings.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get() != &candidate {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    bindings
+}
+
+fn extrude_extent_sides_mut(extent: &mut ExtrudeExtent) -> Vec<&mut ExtrudeSide> {
+    match extent {
+        ExtrudeExtent::OneSided { side } | ExtrudeExtent::Symmetric { side } => vec![side],
+        ExtrudeExtent::TwoSided { first, second } => vec![first, second],
+    }
+}
+
+pub(crate) fn bind_topology_selections(
+    features: &mut [cadmpeg_ir::features::Feature],
+    histories: &[FeatureHistory],
+    inputs: &TopologySelectionInputs<'_>,
+) -> Result<(), cadmpeg_core::CodecError> {
+    let bodies = inputs.bodies;
+    let faces = inputs.faces;
+    let surfaces = inputs.surfaces;
+    let edges = inputs.edges;
+    let curves = inputs.curves;
+    let lanes = inputs.lanes;
+    let face_identities = inputs.face_identities;
+    let body_ids = selection_ids(
+        bodies
+            .iter()
+            .map(|body| (body.id.as_str(), body.name.as_deref(), &body.id)),
+    );
+    let face_ids = selection_ids(
+        faces
+            .iter()
+            .map(|face| (face.id.as_str(), face.name.as_deref(), &face.id)),
+    );
+    let edge_ids = selection_ids(edges.iter().map(|edge| (edge.id.as_str(), None, &edge.id)));
+    let curve_ids = selection_ids(
+        curves
+            .iter()
+            .map(|curve| (curve.id.as_str(), None, &curve.id)),
+    );
+    let mut surfaces_by_id = HashMap::new();
+    for surface in surfaces {
+        surfaces_by_id.insert(&surface.id, surface);
+    }
+    let feature_sources = history_feature_sources(histories, lanes);
+    let surface_selection_faces = surface_selection_face_bindings(
+        lanes.iter().flat_map(|lane| lane.surface_selections.iter()),
+        &feature_sources,
+        face_identities,
+    );
+    for feature in features {
+        if let Some(scope) = feature
+            .native_ref
+            .as_deref()
+            .and_then(|native_ref| {
+                histories
+                    .iter()
+                    .flat_map(|history| &history.features)
+                    .find(|record| record.id == native_ref)
+            })
+            .and_then(|record| record.properties.get("Scope"))
+        {
+            if let Some(outputs) = resolve_ids(scope, &body_ids) {
+                feature
+                    .evaluation
+                    .set_outputs(cadmpeg_ir::features::DistinctMembers::try_from(outputs)?);
+            }
+        }
+        let source_properties = &feature.source_properties;
+        let feature_native_ref = feature.native_ref.as_deref();
+        let mut edited: Result<(), CodecError> = Ok(());
+        feature.evaluation.edit(|definition, _outputs| {
+            edited = (|| {
+                'feature_edit: {
+                    let face_selection_context = FaceSelectionContext {
+                        ids: &face_ids,
+                        feature_ref: feature_native_ref,
+                        surface_selection_faces: &surface_selection_faces,
+                    };
+                    let resolve_face = |selection: &mut FaceSelection| {
+                        resolve_face_selection(selection, &face_selection_context);
+                    };
+                    match definition {
+                        FeatureDefinition::Operation(FeatureOperation::DatumOffsetPlane {
+                            reference,
+                            distance,
+                        }) => match reference {
+                            Some(DatumPlaneReference::Face { face: reference }) => {
+                                resolve_face(reference);
+                            }
+                            Some(DatumPlaneReference::ResolvedPlane { frame }) => {
+                                let origin = frame.origin();
+                                let normal = frame.normal().get();
+                                let native = source_properties
+                                    .get("ReferenceFaceNative")
+                                    .map(String::as_str);
+                                let support_origin = offset_plane_support_origin(
+                                    source_properties,
+                                    native,
+                                    origin.get(),
+                                    normal,
+                                    *distance,
+                                );
+                                let mut face = match native {
+                                    Some(native) => FaceSelection::Native(native.to_owned()),
+                                    None => FaceSelection::Unresolved,
+                                };
+                                resolve_offset_plane_face_selection(
+                                    &mut face,
+                                    support_origin,
+                                    normal,
+                                    &face_selection_context,
+                                    faces,
+                                    &surfaces_by_id,
+                                );
+                                if !matches!(face, FaceSelection::Unresolved) {
+                                    *reference = Some(DatumPlaneReference::Face { face });
+                                }
+                            }
+                            None => {
+                                let Some(origin) = source_properties
+                                    .get("Origin")
+                                    .and_then(|value| parse_point3_mm(value))
+                                    .map(cadmpeg_ir::features::FinitePoint3::get)
+                                else {
+                                    break 'feature_edit;
+                                };
+                                let Some(normal) = source_properties
+                                    .get("Normal")
+                                    .and_then(|value| parse_vector3(value))
+                                else {
+                                    break 'feature_edit;
+                                };
+                                let mut face = FaceSelection::Unresolved;
+                                resolve_planar_face_selection(
+                                    &mut face,
+                                    origin,
+                                    normal,
+                                    faces,
+                                    &surfaces_by_id,
+                                );
+                                if !matches!(face, FaceSelection::Unresolved) {
+                                    *reference = Some(DatumPlaneReference::Face { face });
+                                }
+                            }
+                            Some(DatumPlaneReference::Feature { .. }) => {}
+                        },
+                        FeatureDefinition::Operation(FeatureOperation::Extrude {
+                            profile,
+                            extent,
+                            ..
+                        }) => {
+                            resolve_profile_ref(profile, &face_ids);
+                            for side in extrude_extent_sides_mut(extent) {
+                                if let LinearTermination::ToFace { face, .. }
+                                | LinearTermination::OffsetFromFace { face, .. } =
+                                    &mut side.termination
+                                {
+                                    resolve_face(face);
+                                }
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Revolve {
+                            construction,
+                            ..
+                        }) => {
+                            if let Some(profile) = construction.profile_mut() {
+                                resolve_planar_profile_ref(profile, &face_ids);
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Rib {
+                            construction,
+                            ..
+                        }) => {
+                            if let Some(profile) = &mut construction.profile {
+                                resolve_planar_profile_ref(profile, &face_ids);
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Sweep {
+                            shape,
+                            path,
+                            ..
+                        }) => {
+                            if let Some(profile) = shape.referenced_profile_mut() {
+                                resolve_planar_profile_ref(profile, &face_ids);
+                            }
+                            if let Some(path) = path {
+                                resolve_path_ref(path, &edge_ids, &curve_ids);
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Loft {
+                            sections,
+                            guidance,
+                            ..
+                        }) => {
+                            for section in sections {
+                                if let cadmpeg_ir::features::LoftSection::Profile(profile) = section
+                                {
+                                    resolve_profile_ref(profile, &face_ids);
+                                }
+                            }
+                            match guidance {
+                                cadmpeg_ir::features::LoftGuidance::Guides(guides) => {
+                                    for path in guides {
+                                        resolve_path_ref(path, &edge_ids, &curve_ids);
+                                    }
+                                }
+                                cadmpeg_ir::features::LoftGuidance::Centerline(centerline) => {
+                                    resolve_path_ref(centerline, &edge_ids, &curve_ids);
+                                }
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Fillet { groups }) => {
+                            for group in groups {
+                                resolve_edge_selection(&mut group.edges, &edge_ids);
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Chamfer {
+                            groups, ..
+                        }) => {
+                            for group in groups {
+                                resolve_edge_selection(&mut group.edges, &edge_ids);
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Shell {
+                            removed_faces,
+                            ..
+                        }) => {
+                            resolve_face(removed_faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Thicken {
+                            faces, ..
+                        }) => {
+                            resolve_face(faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::OffsetSurface {
+                            faces,
+                            ..
+                        }) => {
+                            resolve_face(faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::KnitSurface {
+                            faces,
+                            ..
+                        }) => {
+                            resolve_face(faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::FilledSurface {
+                            boundary,
+                            support_faces,
+                            ..
+                        }) => {
+                            if let cadmpeg_ir::features::SurfaceBoundary::Edges(edges) = boundary {
+                                resolve_edge_selection(edges, &edge_ids);
+                            }
+                            resolve_face(support_faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::TrimSurface {
+                            faces,
+                            tool,
+                            ..
+                        }) => {
+                            resolve_face(faces);
+                            resolve_path_ref(tool, &edge_ids, &curve_ids);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::ExtendSurface {
+                            faces,
+                            ..
+                        }) => {
+                            resolve_face(faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::RuledSurface {
+                            edges,
+                            support_faces,
+                            ..
+                        }) => {
+                            resolve_edge_selection(edges, &edge_ids);
+                            resolve_face(support_faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Draft {
+                            faces,
+                            anchor,
+                            ..
+                        }) => {
+                            resolve_face(faces);
+                            match anchor {
+                                cadmpeg_ir::features::DraftAnchor::NeutralPlane {
+                                    plane, ..
+                                } => {
+                                    resolve_face(plane);
+                                }
+                                cadmpeg_ir::features::DraftAnchor::PartingLine { tool, .. } => {
+                                    resolve_face(tool);
+                                }
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Combine {
+                            operands,
+                            ..
+                        }) => {
+                            let empty = cadmpeg_ir::features::CombineOperands::new(
+                                BodySelection::Unresolved,
+                                BodySelection::Unresolved,
+                            )
+                            .map_err(CodecError::malformed)?;
+                            let (mut target, mut tools) =
+                                std::mem::replace(operands, empty).into_parts();
+                            resolve_body_selection(&mut target, &body_ids);
+                            resolve_body_selection(&mut tools, &body_ids);
+                            *operands = cadmpeg_ir::features::CombineOperands::new(target, tools)
+                                .map_err(CodecError::malformed)?;
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::CutWithSurface {
+                            targets,
+                            tools,
+                            ..
+                        }) => {
+                            resolve_body_selection(targets, &body_ids);
+                            resolve_face(tools);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::DeleteBody {
+                            bodies,
+                            ..
+                        }) => {
+                            resolve_body_selection(bodies, &body_ids);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Pattern {
+                            pattern, ..
+                        }) => {
+                            if let Some(Some(path)) = pattern.curve_path_mut() {
+                                resolve_path_ref(path, &edge_ids, &curve_ids);
+                            }
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Scale {
+                            bodies, ..
+                        }) => {
+                            resolve_body_selection(bodies, &body_ids);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::MoveBody {
+                            bodies, ..
+                        }) => {
+                            resolve_body_selection(bodies, &body_ids);
+                        }
+                        FeatureDefinition::Operation(
+                            FeatureOperation::DeleteFace { faces, .. }
+                            | FeatureOperation::MoveFace { faces, .. }
+                            | FeatureOperation::Dome { faces, .. },
+                        ) => {
+                            resolve_face(faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::ReplaceFace {
+                            operands,
+                        }) => {
+                            let empty = cadmpeg_ir::features::ReplaceFaceOperands::new(
+                                FaceSelection::Unresolved,
+                                FaceSelection::Unresolved,
+                            )
+                            .map_err(CodecError::malformed)?;
+                            let (mut targets, mut replacements) =
+                                std::mem::replace(operands, empty).into_parts();
+                            resolve_face(&mut targets);
+                            resolve_face(&mut replacements);
+                            *operands = cadmpeg_ir::features::ReplaceFaceOperands::new(
+                                targets,
+                                replacements,
+                            )
+                            .map_err(CodecError::malformed)?;
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Hole {
+                            face: Some(face),
+                            ..
+                        }) => {
+                            resolve_face(face);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::Wrap {
+                            profile,
+                            face,
+                            ..
+                        }) => {
+                            resolve_planar_profile_ref(profile, &face_ids);
+                            resolve_face(face);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::ProjectedCurve {
+                            source,
+                            target_faces,
+                            ..
+                        }) => {
+                            resolve_path_ref(source, &edge_ids, &curve_ids);
+                            resolve_face(target_faces);
+                        }
+                        FeatureDefinition::Operation(FeatureOperation::CompositeCurve {
+                            segments,
+                            ..
+                        }) => {
+                            for segment in segments {
+                                resolve_path_ref(segment, &edge_ids, &curve_ids);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })();
+        });
+        edited?;
+    }
+
+    Ok(())
+}
+
+fn resolve_planar_face_selection(
+    selection: &mut FaceSelection,
+    origin: Point3,
+    normal: Vector3,
+    faces: &[Face],
+    surfaces: &HashMap<&cadmpeg_ir::ids::SurfaceId, &Surface>,
+) {
+    let has_native = match selection {
+        FaceSelection::Unresolved => false,
+        FaceSelection::Native(_) => true,
+        _ => return,
+    };
+    let normal_length = normal.norm();
+    if !normal_length.is_finite() || normal_length <= f64::EPSILON {
+        return;
+    }
+    let candidates = faces.iter().filter_map(|face| {
+        let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(plane_surface)) =
+            &surfaces.get(&face.surface)?.geometry
+        else {
+            return None;
+        };
+        let candidate_origin = plane_surface.origin();
+        let candidate_normal = plane_surface.frame().axis().as_raw();
+        let candidate_length = candidate_normal.norm();
+        if !candidate_length.is_finite() || candidate_length <= f64::EPSILON {
+            return None;
+        }
+        let alignment = (normal.x * candidate_normal.x
+            + normal.y * candidate_normal.y
+            + normal.z * candidate_normal.z)
+            / (normal_length * candidate_length);
+        let displacement = Vector3::new(
+            origin.x - candidate_origin.x,
+            origin.y - candidate_origin.y,
+            origin.z - candidate_origin.z,
+        );
+        let separation = (displacement.x * candidate_normal.x
+            + displacement.y * candidate_normal.y
+            + displacement.z * candidate_normal.z)
+            / candidate_length;
+        ((alignment.abs() - 1.0).abs() <= EPS_SELECTIONS_RESOLVE_PLANAR_FACE_SELECTION_E9
+            && separation.abs() <= EPS_SELECTIONS_RESOLVE_PLANAR_FACE_SELECTION_E8)
+            .then_some(&face.id)
+    });
+    let matching = candidates.cloned().collect::<Vec<_>>();
+    if (has_native && !matching.is_empty()) || (!has_native && matching.len() == 1) {
+        let old = std::mem::replace(selection, FaceSelection::Unresolved);
+        *selection = match old {
+            FaceSelection::Native(native) => FaceSelection::Resolved {
+                faces: matching,
+                native,
+            },
+            _ => FaceSelection::Faces(matching),
+        };
+    }
+}
+
+fn resolve_offset_plane_face_selection(
+    selection: &mut FaceSelection,
+    origin: Point3,
+    normal: Vector3,
+    context: &FaceSelectionContext<'_>,
+    faces: &[Face],
+    surfaces: &HashMap<&cadmpeg_ir::ids::SurfaceId, &Surface>,
+) {
+    if !matches!(selection, FaceSelection::Native(_)) {
+        return;
+    }
+    resolve_face_selection(selection, context);
+    if !matches!(selection, FaceSelection::Native(_)) {
+        return;
+    }
+    resolve_planar_face_selection(selection, origin, normal, faces, surfaces);
+}
+
+fn resolve_planar_profile_ref(
+    profile: &mut PlanarProfileRef,
+    faces: &HashMap<&str, Option<&cadmpeg_ir::ids::FaceId>>,
+) {
+    if let PlanarProfileRef::Native(native) = profile {
+        if let Some(ids) = resolve_ids(native, faces) {
+            *profile = PlanarProfileRef::Faces(ids);
+        }
+    }
+}
+
+fn resolve_profile_ref(
+    profile: &mut ProfileRef,
+    faces: &HashMap<&str, Option<&cadmpeg_ir::ids::FaceId>>,
+) {
+    if let ProfileRef::Planar(profile) = profile {
+        resolve_planar_profile_ref(profile, faces);
+    }
+}
+
+fn resolve_path_ref(
+    path: &mut PathRef,
+    edges: &HashMap<&str, Option<&cadmpeg_ir::ids::EdgeId>>,
+    curves: &HashMap<&str, Option<&cadmpeg_ir::ids::CurveId>>,
+) {
+    if let PathRef::Native(native) = path {
+        if let Some(ids) = resolve_ids(native, edges) {
+            *path = PathRef::Edges(ids);
+        } else if let Some(ids) = resolve_ids(native, curves) {
+            *path = PathRef::Curves(ids);
+        }
+    }
+}
+
+fn selection_ids<'a, Id: 'a>(
+    values: impl Iterator<Item = (&'a str, Option<&'a str>, &'a Id)>,
+) -> HashMap<&'a str, Option<&'a Id>> {
+    let mut ids = HashMap::new();
+    for (id, name, value) in values {
+        ids.insert(id, Some(value));
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            match ids.entry(name) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(value));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn resolve_ids<Id: Clone>(native: &str, ids: &HashMap<&str, Option<&Id>>) -> Option<Vec<Id>> {
+    let mut resolved = Vec::new();
+    for token in native
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let Some(Some(id)) = ids.get(token) else {
+            return None;
+        };
+        resolved.push((*id).clone());
+    }
+    (!resolved.is_empty()).then_some(resolved)
+}
+
+fn resolve_face_selection(selection: &mut FaceSelection, context: &FaceSelectionContext<'_>) {
+    if let FaceSelection::Native(native) = selection {
+        let mut faces = resolve_ids(native, context.ids);
+        if faces.is_none() {
+            if let Some(feature_ref) = context.feature_ref {
+                if let Some(Some(face)) =
+                    context
+                        .surface_selection_faces
+                        .iter()
+                        .find_map(|((owner, key), value)| {
+                            (owner == feature_ref && key == native).then_some(value)
+                        })
+                {
+                    faces = Some(vec![face.clone()]);
+                }
+            }
+        }
+        if let Some(faces) = faces {
+            let old = std::mem::replace(selection, FaceSelection::Unresolved);
+            if let FaceSelection::Native(native) = old {
+                *selection = FaceSelection::Resolved { faces, native };
+            }
+        }
+    }
+}
+
+fn history_feature_sources<'a>(
+    histories: &'a [FeatureHistory],
+    lanes: &[crate::records::FeatureInputLane],
+) -> HashMap<&'a str, Option<FeatureSourceId>> {
+    let lane_names = lanes
+        .iter()
+        .map(|lane| FeatureObjectNames::new(&lane.names))
+        .collect::<Vec<_>>();
+    let mut sources = HashMap::new();
+    for feature in histories.iter().flat_map(|history| &history.features) {
+        let mut source = feature.source_id;
+        if source.is_none() {
+            let mut candidates = lane_names
+                .iter()
+                .filter_map(|names| names.of(feature)?.object_id?.value());
+            if let Some(first) = candidates.next() {
+                if candidates.all(|candidate| candidate == first) {
+                    source = FeatureSource::from_value(first);
+                }
+            }
+        }
+        let source = source.and_then(FeatureSource::id);
+        match sources.entry(feature.id.as_str()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(source);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get() != &source {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    sources
+}
+
+fn resolve_edge_selection(
+    selection: &mut EdgeSelection,
+    ids: &HashMap<&str, Option<&cadmpeg_ir::ids::EdgeId>>,
+) {
+    if let EdgeSelection::Native(native) = selection {
+        if let Some(edges) = resolve_ids(native, ids) {
+            let old = std::mem::replace(selection, EdgeSelection::Unresolved);
+            if let EdgeSelection::Native(native) = old {
+                *selection = EdgeSelection::Resolved { edges, native };
+            }
+        }
+    }
+}
+
+fn resolve_body_selection(
+    selection: &mut BodySelection,
+    ids: &HashMap<&str, Option<&cadmpeg_ir::ids::BodyId>>,
+) {
+    if let BodySelection::Native(native) = selection {
+        let bodies = resolve_ids(native, ids)
+            .and_then(|bodies| cadmpeg_ir::features::DistinctMembers::try_from(bodies).ok());
+        if let Some(bodies) = bodies {
+            let old = std::mem::replace(selection, BodySelection::Unresolved);
+            if let BodySelection::Native(native) = old {
+                *selection = BodySelection::Resolved { bodies, native };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod offset_plane_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::surface_selection_face_bindings;
+    use crate::records::FeatureInputComponentPathEntry;
+    use crate::records::FeatureInputSurfaceSelection;
+    use std::collections::HashMap;
+
+    fn component(feature_source_id: u32, local_face_id: u32) -> FeatureInputComponentPathEntry {
+        let mut type_signature = [0; 12];
+        type_signature[4..8].copy_from_slice(&feature_source_id.to_le_bytes());
+        FeatureInputComponentPathEntry {
+            instance: Some(0x8001),
+            type_signature: type_signature.into(),
+            local_id: Some(local_face_id),
+        }
+    }
+
+    fn surface_selection(
+        feature_ref: &str,
+        components: Vec<FeatureInputComponentPathEntry>,
+    ) -> FeatureInputSurfaceSelection {
+        FeatureInputSurfaceSelection {
+            id: "selection".into(),
+            parent: "lane".into(),
+            ordinal: 0,
+            offset: 0,
+            selector: 2,
+            kind: crate::records::FeatureInputSurfaceSelectionKind::Component,
+            object_name_ref: "feature".into(),
+            feature_ref: feature_ref.into(),
+            producer_feature_refs: Vec::new(),
+            terminal_feature_ref: None,
+            components,
+        }
+    }
+
+    #[test]
+    fn surface_selection_binds_terminal_component_identity() {
+        let selection = surface_selection("feature", vec![component(47, 8), component(50, 5)]);
+        let feature_sources = HashMap::new();
+        let bindings = surface_selection_face_bindings(
+            std::iter::once(&selection),
+            &feature_sources,
+            &[
+                (
+                    cadmpeg_ir::ids::FaceId::mint("test:model:entity#intermediate-face")
+                        .expect("identity grammar"),
+                    crate::brep::PersistentFaceIdentity {
+                        feature_source_id: 47_u32.try_into().unwrap(),
+                        local_id: 8,
+                        trailing_fields: Vec::new(),
+                    },
+                ),
+                (
+                    cadmpeg_ir::ids::FaceId::mint("test:model:entity#terminal-face")
+                        .expect("identity grammar"),
+                    crate::brep::PersistentFaceIdentity {
+                        feature_source_id: 50_u32.try_into().unwrap(),
+                        local_id: 5,
+                        trailing_fields: Vec::new(),
+                    },
+                ),
+            ],
+        );
+        let key = (
+            "feature".to_string(),
+            "sldprt:feature-input:surface-component-ids:8,5".to_string(),
+        );
+        assert_eq!(
+            bindings.get(&key).cloned(),
+            Some(Some(
+                cadmpeg_ir::ids::FaceId::mint("test:model:entity#terminal-face")
+                    .expect("identity grammar")
+            ))
+        );
+    }
+
+    #[test]
+    fn surface_selection_keeps_ambiguous_terminal_identity_native() {
+        let selection = surface_selection("feature", vec![component(50, 5)]);
+        let feature_sources = HashMap::new();
+        let bindings = surface_selection_face_bindings(
+            std::iter::once(&selection),
+            &feature_sources,
+            &[
+                (
+                    cadmpeg_ir::ids::FaceId::mint("test:model:entity#first-face")
+                        .expect("identity grammar"),
+                    crate::brep::PersistentFaceIdentity {
+                        feature_source_id: 50_u32.try_into().unwrap(),
+                        local_id: 5,
+                        trailing_fields: vec![10],
+                    },
+                ),
+                (
+                    cadmpeg_ir::ids::FaceId::mint("test:model:entity#second-face")
+                        .expect("identity grammar"),
+                    crate::brep::PersistentFaceIdentity {
+                        feature_source_id: 50_u32.try_into().unwrap(),
+                        local_id: 5,
+                        trailing_fields: vec![15],
+                    },
+                ),
+            ],
+        );
+        let key = (
+            "feature".to_string(),
+            "sldprt:feature-input:surface-component-ids:5".to_string(),
+        );
+        assert_eq!(bindings.get(&key).cloned(), Some(None));
+    }
+
+    #[test]
+    fn explicit_terminal_owner_overrides_component_source() {
+        let mut selection = surface_selection("feature", vec![component(47, 8), component(99, 5)]);
+        selection.terminal_feature_ref = Some("terminal".into());
+        let feature_sources = HashMap::from([("terminal", Some(50_u32.try_into().unwrap()))]);
+        let bindings = surface_selection_face_bindings(
+            std::iter::once(&selection),
+            &feature_sources,
+            &[(
+                cadmpeg_ir::ids::FaceId::mint("test:model:entity#terminal-face")
+                    .expect("identity grammar"),
+                crate::brep::PersistentFaceIdentity {
+                    feature_source_id: 50_u32.try_into().unwrap(),
+                    local_id: 5,
+                    trailing_fields: Vec::new(),
+                },
+            )],
+        );
+        let key = (
+            "feature".to_string(),
+            "sldprt:feature-input:surface-component-ids:8,5".to_string(),
+        );
+        assert_eq!(
+            bindings.get(&key).cloned(),
+            Some(Some(
+                cadmpeg_ir::ids::FaceId::mint("test:model:entity#terminal-face")
+                    .expect("identity grammar")
+            ))
+        );
+    }
+}

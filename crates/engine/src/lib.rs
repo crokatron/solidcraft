@@ -19,6 +19,7 @@ pub mod crash;
 pub mod easyprint;
 pub mod frames;
 pub mod fuzz;
+pub mod geometry_snap;
 pub mod licences;
 mod mesh_lines;
 pub mod occurrences;
@@ -503,7 +504,7 @@ pub struct Session {
     /// file is refused; Save As to another file is how its changes are kept.
     pub read_only: bool,
     /// Whether the design's name is one its user chose for it (`file.new {name}`) rather than
-    /// one it borrowed — from a file's name, a sample's name, or a file that stored another
+    /// one it borrowed â€” from a file's name, a sample's name, or a file that stored another
     /// design's name. A borrowed name follows Save As to the new file's name (#4907); a name
     /// the user chose is kept.
     pub user_named: bool,
@@ -687,7 +688,7 @@ pub(crate) struct Checkpoint {
 pub enum SurfaceAnalysis {
     /// Reflected stripes: `stripes` across the view.
     Zebra { stripes: f64 },
-    /// Faces by draft angle to `pull`: past +`angle` green, past −`angle` red, between yellow.
+    /// Faces by draft angle to `pull`: past +`angle` green, past âˆ’`angle` red, between yellow.
     Draft { pull: Vec3, angle: f64 },
     /// Colour by curvature: blue flat, through green, to red at 1 / `radius`.
     Curvature { radius: f64 },
@@ -1419,7 +1420,7 @@ impl Session {
         let mut pins: Vec<(u64, Vec<String>)> = Vec::new();
         let mut reserve: Vec<String> = Vec::new();
         // The names of the bodies each feature made, kept with the state they were read from:
-        // every command pins, and reading them again searched every result's bodies (features ×
+        // every command pins, and reading them again searched every result's bodies (features Ã—
         // bodies per command). A state is the same while it is the same allocation (the weak
         // reference keeps that address from being reused), and its bodies never change in place.
         let mut known = std::mem::take(&mut self.made_bodies);
@@ -2350,7 +2351,7 @@ impl Session {
     }
 
     /// Measure one or two selections (see `inspect.measure` with `items`); errors come back as
-    /// `{"error": …}`.
+    /// `{"error": â€¦}`.
     pub fn measure_items(&self, items: &[Sel]) -> Value {
         let v = serde_json::to_value(items).unwrap_or(Value::Null);
         cmd::measure_items(self, &v).unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }))
@@ -2593,3 +2594,5 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *visibility == b.visibility
         && *next_component_color_index == b.next_component_color_index
 }
+
+pub use cmd::live_slice::SliceGeometry;

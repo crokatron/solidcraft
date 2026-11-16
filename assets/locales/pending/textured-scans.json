@@ -1,0 +1,5 @@
+{
+  "en": {
+    "ui.scan_texture_failed": "The scan texture could not be displayed; its original texture data is still saved"
+  }
+}

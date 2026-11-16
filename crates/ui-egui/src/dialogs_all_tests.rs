@@ -225,9 +225,10 @@ fn move_and_hole_recall_rebuild_the_inputs_of_the_remembered_mode() {
 }
 
 #[test]
-fn command_dialog_value_memory_is_off_by_default_and_resets_each_time() {
+fn command_dialog_value_memory_can_be_disabled_and_resets_each_time() {
     let mut h = Harness::new();
-    assert!(!h.app.preferences.remember_dialog_values);
+    assert!(h.app.preferences.remember_dialog_values);
+    h.app.preferences.remember_dialog_values = false;
     let mut pattern = Dialog::for_command(&h.app, "solid.pattern.rectangular").unwrap();
     if let Kind::PatternRect { count, .. } = &mut pattern.kind {
         *count = "7".into();
@@ -1170,6 +1171,7 @@ fn draft_uses_the_picked_solid_beside_a_hidden_overlapping_mesh() {
                 triangles: mesh.triangles.iter().flatten().copied().collect(),
                 color: None,
                 corner_normals: Default::default(),
+                appearance: None,
             }],
         },
         Some("Imported mesh"),
@@ -1808,4 +1810,216 @@ fn dialog_sketch_selection_labels_translate_and_keep_identifiers() {
     }
     let missing = Sel::Profile { sketch: 999, index: 0 };
     assert_eq!(selection_label(&h.app.session, h.app.preferences.origin_plane_names, &d, &d.inputs[0], &missing), "Sketch999 · profile 1");
+}
+
+#[test]
+fn mesh_dialog_settings_survive_restart_without_model_references() {
+    let mut h = Harness::new();
+    let mut d = Dialog::for_command(&h.app, "mesh.align_plane_to_csys").unwrap();
+    if let Kind::MeshEdit { amount, plane, side, delta, .. } = &mut d.kind {
+        *amount = "27 deg".into();
+        *plane = 2;
+        *side = 1;
+        *delta = ["3 mm".into(), "4 mm".into(), "0 mm".into()];
+    }
+    d.inputs[0].items = vec![Sel::Body { name: "Old scan".into() }];
+    d.extra.insert("alignment_plane".into(), json!(9876));
+    remember(&mut h.app, &d);
+    let serialized = h.app.prefs();
+    assert!(!serialized.contains("Old scan"));
+    assert!(!serialized.contains("alignment_plane"));
+    let mut next = Harness::new();
+    next.app.load_prefs(&serialized);
+    let got = Dialog::for_command(&next.app, "mesh.align_plane_to_csys").unwrap();
+    assert!(matches!(got.kind,Kind::MeshEdit {amount,plane:2,side:1,..} if amount=="27 deg"));
+    assert!(got.inputs.iter().all(|i| i.items.is_empty()));
+    assert!(!got.extra.contains_key("alignment_plane"));
+    next.app.preferences.command_dialog_values.clear();
+    let reset = Dialog::for_command(&next.app, "mesh.align_plane_to_csys").unwrap();
+    assert!(matches!(reset.kind,Kind::MeshEdit{amount,plane:0,side:0,..} if amount=="0 deg"));
+}
+
+#[test]
+fn lasso_memory_restores_options_with_an_empty_selection_and_defaults_through() {
+    let mut h = Harness::new();
+    for command in ["mesh.delete_facets", "mesh.isolate_facets", "mesh.copy_facet_cloud"] {
+        let mut d = Dialog::for_command(&h.app, command).unwrap();
+        assert_eq!(d.facet_lasso.options(), (true, 0));
+        d.facet_lasso.restore_options(false, 1);
+        remember(&mut h.app, &d);
+        let mut restored = Harness::new();
+        restored.app.load_prefs(&h.app.prefs());
+        let next = Dialog::for_command(&restored.app, command).unwrap();
+        assert_eq!(next.facet_lasso.options(), (false, 1));
+        assert!(next.facet_lasso.selection().is_none());
+        assert!(next.facet_lasso.params("Old body", 123).is_err());
+    }
+}
+
+#[test]
+fn remembered_manual_operation_stays_manual_after_restart() {
+    let mut h = Harness::new();
+    let mut d = Dialog::for_command(&h.app, "solid.box").unwrap();
+    d.op_auto.manual = true;
+    if let Kind::Primitive { operation, .. } = &mut d.kind {
+        *operation = 3;
+    }
+    remember(&mut h.app, &d);
+    let mut restored = Harness::new();
+    restored.app.load_prefs(&h.app.prefs());
+    let next = Dialog::for_command(&restored.app, "solid.box").unwrap();
+    assert!(next.op_auto.manual);
+    assert!(matches!(next.kind, Kind::Primitive { operation: 3, .. }));
+}
+
+#[test]
+fn stored_feature_values_keep_units_and_drop_context_when_restarted() {
+    let mut h = Harness::new();
+    h.app.session.doc_mut().units = "in".into();
+    let mut d = Dialog::for_command(&h.app, "solid.extrude").unwrap();
+    if let Kind::Extrude { distance, thin, wall, direction, .. } = &mut d.kind {
+        *distance = "2".into();
+        *wall = "0.125".into();
+        *thin = true;
+        *direction = 3;
+    }
+    preset_to_object(&mut d, true);
+    d.inputs.iter_mut().find(|i| i.label == "To Object").unwrap().items = vec![Sel::Vertex { body: "Prior".into(), point: Vec3::X }];
+    remember(&mut h.app, &d);
+    let mut restored = Harness::new();
+    restored.app.load_prefs(&h.app.prefs());
+    let next = Dialog::for_command(&restored.app, "solid.extrude").unwrap();
+    assert!(matches!(&next.kind,Kind::Extrude {distance,thin:true,wall,direction:3,..} if distance=="50.8 mm"&&wall=="3.175 mm"));
+    assert!(next.inputs.iter().any(|i| i.label == "To Object" && i.items.is_empty()));
+    assert!(next.inputs.iter().all(|i| i.items.is_empty()));
+    restored
+        .app
+        .preferences
+        .command_dialog_values
+        .insert("solid.extrude".into(), json!({"version":1,"fields":{"direction":99999999,"operation":-3,"distance":false}}));
+    let malformed = Dialog::for_command(&restored.app, "solid.extrude").unwrap();
+    assert!(matches!(malformed.kind, Kind::Extrude { direction: 0, operation: 0, .. }));
+}
+
+#[test]
+fn scan_section_settings_remember_completed_values_in_physical_units() {
+    let mut h = Harness::new();
+    h.app.session.doc_mut().units = "in".into();
+    let mut d = Dialog::for_command(&h.app, "mesh.auto_sections").unwrap();
+    d.scan_copy.restore_memory(&json!({"axis":3,"count":"7","offsets":"1, 2","tolerance":"0.01","hide":true,"close_open":true}));
+    remember(&mut h.app, &d);
+    let saved = h.app.prefs();
+    let mut next = Harness::new();
+    next.app.load_prefs(&saved);
+    let d = Dialog::for_command(&next.app, "mesh.auto_sections").unwrap();
+    let settings = d.scan_copy.memory(&next.app.session.doc);
+    assert_eq!(settings["axis"], 3);
+    assert_eq!(settings["count"], "7");
+    assert_eq!(settings["offsets"], "25.4 mm, 50.8 mm");
+    assert_eq!(settings["tolerance"], "0.254 mm");
+    assert_eq!(settings["hide"], true);
+    assert_eq!(settings["close_open"], true);
+    assert!(d.scan_copy.cloud.is_none());
+    assert!(d.scan_copy.name.is_empty());
+}
+
+#[test]
+fn move_memory_retains_fresh_body_selection_when_rebuilding_mode_inputs() {
+    let mut h = Harness::new();
+    let mut d = Dialog::for_command(&h.app, "solid.move").unwrap();
+    d.kind = crate::dialogs_move::kind(crate::dialogs_move::ROTATE, &h.app.session.doc);
+    remember(&mut h.app, &d);
+    let mut fresh =
+        Dialog::new(crate::dialogs_move::kind(crate::dialogs_move::FREE, &h.app.session.doc), crate::dialogs_move::inputs(crate::dialogs_move::FREE));
+    fresh.inputs[0].items = vec![Sel::Body { name: "Current body".into() }];
+    recall(&h.app, &mut fresh);
+    assert_eq!(fresh.inputs[0].items, vec![Sel::Body { name: "Current body".into() }]);
+    assert!(fresh.inputs.iter().any(|i| i.label == "Axis"));
+    assert!(fresh.inputs.iter().skip(1).all(|i| i.items.is_empty()));
+}
+
+#[test]
+fn scan_workflow_opens_without_mutating_document_or_creating_dialog() {
+    let mut h = Harness::new();
+    let revision = h.app.session.revision;
+    h.app.start("scan.workflow");
+    assert!(h.app.scan_workflow.is_some());
+    assert_eq!(h.app.session.revision, revision);
+    let inventory = h.app.session.execute("scan.workflow", &json!({})).unwrap();
+    assert_eq!(inventory["meshes"], json!([]));
+    assert_eq!(inventory["cad_to_scan_deviation_available"], false);
+    assert_eq!(h.app.session.revision, revision);
+}
+
+#[test]
+fn scan_surface_fit_requires_a_patch_and_remembers_physical_options() {
+    let mut h = Harness::new();
+    h.app.session.doc_mut().units = "in".into();
+    let mut d = Dialog::for_command(&h.app, "mesh.fit_surface").unwrap();
+    let defaults = d.scan_surface_fit.memory(&h.app.session.doc);
+    assert_eq!(defaults["boundary_tolerance"], "0.5 mm");
+    assert_eq!(defaults["fairing"], "0.0001");
+    d.inputs[0].items = vec![Sel::Body { name: "Scan".into() }];
+    assert!(crate::scan_surface_fit::commands(&h.app, &d, "20").is_err(), "a whole scan must not be fitted implicitly");
+    d.inputs[0].items = vec![Sel::Face { body: "Scan".into(), index: 0, point: Vec3::new(1., 2., 3.) }];
+    d.scan_surface_fit.restore_memory(&json!({"selection":0,"kind":2,"tolerance":"0.01","fairing":"0.2","flow":4,"vector":[1.,2.,0.]}));
+    let commands = crate::scan_surface_fit::commands(&h.app, &d, "25").unwrap();
+    assert_eq!(commands[0].0, "mesh.fit_surface");
+    assert_eq!(commands[0].1["point"], json!([1., 2., 3.]));
+    assert_eq!(commands[0].1["kind"], "cone");
+    assert!((commands[0].1["tolerance"].as_f64().unwrap() - 0.254).abs() < 1e-10);
+    assert!(commands[0].1.get("flow").is_none(), "analytic cylinder/cone seam is automatic");
+    assert!(commands[0].1.get("fairing").is_none(), "hidden freeform fairing is not an analytic input");
+    remember(&mut h.app, &d);
+    let mut next = Harness::new();
+    next.app.load_prefs(&h.app.prefs());
+    let restored = Dialog::for_command(&next.app, "mesh.fit_surface").unwrap();
+    let memory = restored.scan_surface_fit.memory(&next.app.session.doc);
+    assert_eq!(memory["kind"], 2);
+    assert_eq!(memory["tolerance"], "0.254 mm");
+    assert_eq!(memory["flow"], 4);
+    assert!(restored.inputs.iter().all(|i| i.items.is_empty()), "source selections must not leak across designs");
+    assert!(restored.facet_lasso.options().0, "selection-through starts enabled");
+    d.scan_surface_fit.selection = 1;
+    assert!(crate::scan_surface_fit::commands(&h.app, &d, "25").is_err(), "empty lasso must not mean the entire scan");
+}
+
+#[test]
+fn scan_mirror_plane_inputs_and_plane_offsets_preserve_explicit_settings() {
+    let mut h = Harness::new();
+    let mut d = Dialog::for_command(&h.app, "mesh.symmetry_plane").unwrap();
+    d.inputs[0].items = vec![Sel::Body { name: "Scan".into() }];
+    if let Kind::MeshEdit { delta, .. } = &mut d.kind {
+        *delta = ["10 mm".into(), "20 mm".into(), "30 mm".into()];
+    }
+    d.extra.insert("symmetry_normal".into(), json!(["0", "1", "0"]));
+    let p = crate::scan_alignment_ui::symmetry_params(&h.app, &d).unwrap();
+    assert_eq!(p["origin"], json!([10., 20., 30.]));
+    assert_eq!(p["normal"], json!([0., 1., 0.]));
+    assert!(p.get("pairs").is_none());
+    remember(&mut h.app, &d);
+    let mut next = Harness::new();
+    next.app.load_prefs(&h.app.prefs());
+    let saved = Dialog::for_command(&next.app, "mesh.symmetry_plane").unwrap();
+    assert_eq!(saved.extra["symmetry_normal"], json!(["0", "1", "0"]));
+    assert!(saved.inputs[0].items.is_empty());
+    d.extra.insert("symmetry_normal".into(), json!(["0", "0", "0"]));
+    assert!(crate::scan_alignment_ui::symmetry_params(&h.app, &d).is_err());
+    if let Kind::MeshEdit { side, .. } = &mut d.kind {
+        *side = 1;
+    }
+    d.inputs = (0..6)
+        .map(|i| {
+            let mut input = SelInput::new("Point", selection::FACES, false).places();
+            input.items = vec![Sel::Face { body: "Scan".into(), index: 0, point: Vec3::new(i as f64, 0., 0.) }];
+            input
+        })
+        .collect();
+    let pairs = crate::scan_alignment_ui::symmetry_params(&h.app, &d).unwrap();
+    assert_eq!(pairs["pairs"].as_array().unwrap().len(), 3);
+    assert!(pairs.get("normal").is_none());
+    d.inputs[5].items = vec![Sel::Face { body: "Other".into(), index: 0, point: Vec3::ZERO }];
+    assert!(crate::scan_alignment_ui::symmetry_params(&h.app, &d).is_err());
+    let values = ["1 in".into(), "5 mm".into(), "0 mm".into()];
+    assert_eq!(crate::scan_alignment_ui::offset(&h.app.session, &values).unwrap(), [25.4, 5.]);
 }

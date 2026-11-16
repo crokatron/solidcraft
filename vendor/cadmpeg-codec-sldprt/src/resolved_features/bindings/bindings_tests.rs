@@ -1,0 +1,952 @@
+//! Tests for the `bindings` module.
+
+use super::super::{LEGACY_SKETCH_MARKER, SKETCH_MARKER};
+use super::{
+    bind_detached_legacy_sketch_objects, bind_mirror_surface_planes, bind_pattern_inputs,
+    bind_resolved_curve_vertices, bind_scalar_operands, normalize_indexed_curve_entities,
+    represented_sketch_features,
+};
+use crate::layout::temporary_axis_reference_nine_scalar as temporary_axis;
+use crate::records::FeatureSource;
+use crate::records::ObjectId;
+use crate::records::{
+    Feature as NativeFeature, FeatureHistory, FeatureInputClass, FeatureInputComponentPathEntry,
+    FeatureInputGeneratedSurfaceIdentity, FeatureInputLane, FeatureInputName, FeatureInputScalar,
+    FeatureInputScalarRole, FeatureInputSurfaceSelection, SketchInputEntity, SketchInputKind,
+};
+use cadmpeg_ir::features::{
+    patterns::{PatternKind, PatternSeed, PatternTransform},
+    Feature, FeatureDefinition, FeatureId, FeatureOperation,
+};
+use cadmpeg_ir::geometry::{SolvedSurfaceGeometry, Surface, SurfaceGeometry};
+use cadmpeg_ir::ids::{FaceId, ShellId, SurfaceId};
+use cadmpeg_ir::math::{Point3, Vector3};
+use cadmpeg_ir::topology::{Face, Sense};
+use std::collections::{BTreeMap, HashSet};
+
+fn bind_pattern_inputs_test(
+    features: &mut [Feature],
+    histories: &[FeatureHistory],
+    lanes: &[FeatureInputLane],
+) -> Result<(), cadmpeg_core::CodecError> {
+    bind_pattern_inputs(features, histories, lanes)
+}
+
+#[test]
+fn dissected_profile_scalar_tail_belongs_to_parent_extrusion() {
+    let native_feature = |id: &str,
+                          source_id: &str,
+                          ordinal,
+                          name: &str,
+                          xml_tag: &str,
+                          input_class: Option<&str>| NativeFeature {
+        id: id.into(),
+        parent: "history".into(),
+        xml_tag: xml_tag.into(),
+        tree_parent: None,
+        source_id: Some(FeatureSource::try_from(source_id).expect("test feature source id")),
+        ordinal,
+        name: name.into(),
+        kind: name.into(),
+        input_class: input_class.map(str::to_string),
+        suppressed: false,
+        parameters: BTreeMap::new(),
+        dimension_properties: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        text: None,
+        content: Vec::new(),
+    };
+    let mut extrusion = native_feature("extrusion", "10", 0, "Cut-Extrude-Thin", "Extrusion", None);
+    extrusion
+        .parameters
+        .insert(cadmpeg_core::nonblank_literal!("D5"), "0.3".into());
+    let mut child = native_feature(
+        "profile-child",
+        "11",
+        1,
+        "Sketch4<3>",
+        "Sketch",
+        Some("moProfileFeature_c"),
+    );
+    child.properties.insert(
+        cadmpeg_core::nonblank_literal!("Description"),
+        child.name.clone(),
+    );
+    let following = native_feature("following", "12", 2, "Following", "Feature", None);
+    let attribute = native_feature(
+        "attribute",
+        "-1",
+        3,
+        "Attribute-Definition",
+        "Feature",
+        None,
+    );
+    let history = FeatureHistory {
+        id: "history".into(),
+        part_name: None,
+        properties: BTreeMap::new(),
+        content: Vec::new(),
+        configurations: Vec::new(),
+        features: vec![extrusion, child, following, attribute],
+    };
+    let name = |id: &str, offset, object_id, value: &str| FeatureInputName {
+        id: id.into(),
+        parent: "lane".into(),
+        ordinal: 0,
+        offset,
+        object_id: ObjectId::try_from(object_id).ok(),
+        value: value.into(),
+    };
+    let scalar = |id: &str, offset, name: &str| FeatureInputScalar {
+        id: id.into(),
+        parent: "lane".into(),
+        feature_ref: None,
+        ordinal: 0,
+        offset,
+        object_id: 20,
+        name: name.into(),
+        value: cadmpeg_ir::scalar::FiniteReal::new(0.001).expect("finite test scalar"),
+        role: FeatureInputScalarRole::Driving,
+        operands: Vec::new(),
+        archive_class: None,
+    };
+    let mut lane = FeatureInputLane {
+        id: "lane".into(),
+        configuration: None,
+        native_payload: vec![0; 500].into(),
+        classes: Vec::new(),
+        names: vec![
+            name("extrusion-name", 100, 10, "Cut-Extrude-Thin"),
+            name("child-name", 200, 11, "Sketch4<3>"),
+            name("d5-name", 240, 20, "D5"),
+            name("d6-name", 280, 21, "D6"),
+            name("d7-name", 320, 22, "D7"),
+            name("attribute-name", 360, 99, "Attribute-Definition"),
+            name("following-name", 400, 12, "Following"),
+            name("later-name", 440, 23, "later"),
+        ],
+        scalars: vec![
+            scalar("d5", 250, "d5-name"),
+            scalar("d6", 290, "d6-name"),
+            scalar("d7", 330, "d7-name"),
+            scalar("later", 450, "later-name"),
+        ],
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: vec![{
+            let marker_id: String = "sketch-marker".into();
+            let marker_parent: String = "lane".into();
+            let mut constructed_marker =
+                SketchInputEntity::new(marker_id, marker_parent, 0, 370, SketchInputKind::Point);
+            constructed_marker.feature_ref = None;
+            constructed_marker = constructed_marker.with_test_identity(Some(1), None);
+            constructed_marker.state_value = cadmpeg_ir::scalar::FiniteReal::new(1.0);
+            constructed_marker.coordinates_m = cadmpeg_ir::units::FiniteVector::new([0.0, 0.0]);
+            constructed_marker.links = None;
+            constructed_marker
+        }],
+    };
+
+    bind_scalar_operands(
+        &cadmpeg_test_support::service_decode_context(),
+        std::slice::from_ref(&history),
+        std::slice::from_mut(&mut lane),
+    )
+    .unwrap();
+
+    assert!(lane.scalars[..3]
+        .iter()
+        .all(|scalar| scalar.feature_ref.as_deref() == Some("extrusion")));
+    assert_eq!(lane.scalars[3].feature_ref.as_deref(), Some("following"));
+    assert_eq!(
+        lane.sketch_entities[0].feature_ref.as_deref(),
+        Some("profile-child")
+    );
+    assert_eq!(
+        represented_sketch_features(std::slice::from_ref(&history), std::slice::from_ref(&lane)),
+        HashSet::from([String::from("profile-child")])
+    );
+}
+
+#[test]
+fn mirror_plane_binds_through_one_persistent_face_identity() {
+    let mut signature = [0; 12];
+    signature[4..8].copy_from_slice(&45u32.to_le_bytes());
+    let selection = FeatureInputSurfaceSelection {
+        id: "selection".into(),
+        parent: "lane".into(),
+        ordinal: 0,
+        offset: 0,
+        selector: 0,
+        kind: crate::records::FeatureInputSurfaceSelectionKind::Component,
+        object_name_ref: "name".into(),
+        feature_ref: "mirror-native".into(),
+        producer_feature_refs: Vec::new(),
+        terminal_feature_ref: None,
+        components: vec![FeatureInputComponentPathEntry {
+            instance: None,
+            type_signature: signature.into(),
+            local_id: Some(7),
+        }],
+    };
+    let lane = FeatureInputLane {
+        id: "lane".into(),
+        configuration: None,
+        native_payload: Vec::new().into(),
+        classes: Vec::new(),
+        names: Vec::new(),
+        scalars: Vec::new(),
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: vec![selection],
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: Vec::new(),
+    };
+    let mut feature = Feature {
+        product_definition: None,
+        id: FeatureId::mint("synthetic:test:id#mirror").expect("identity grammar"),
+        ordinal: 0,
+        name: None,
+        suppressed: None,
+        dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+        source_properties: BTreeMap::new(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+            FeatureDefinition::Operation(FeatureOperation::Pattern {
+                seeds: Vec::new(),
+                pattern: PatternKind::UNRESOLVED_MIRROR,
+            }),
+        ),
+        native_ref: Some("mirror-native".into()),
+    };
+    let history = FeatureHistory {
+        id: "history".into(),
+        part_name: None,
+        properties: BTreeMap::new(),
+        content: Vec::new(),
+        configurations: Vec::new(),
+        features: vec![NativeFeature {
+            id: "mirror-native".into(),
+            parent: "history".into(),
+            xml_tag: "Feature".into(),
+            tree_parent: None,
+            source_id: FeatureSource::from_value(50),
+            ordinal: 0,
+            name: "Mirror".into(),
+            kind: "Mirror".into(),
+            input_class: Some("moMirrorSolid_c".into()),
+            suppressed: false,
+            parameters: BTreeMap::new(),
+            dimension_properties: BTreeMap::new(),
+            properties: BTreeMap::new(),
+            text: None,
+            content: Vec::new(),
+        }],
+    };
+    let face = Face {
+        id: FaceId::mint("test:model:entity#face").expect("identity grammar"),
+        shell: ShellId::mint("test:model:entity#shell").expect("identity grammar"),
+        surface: SurfaceId::mint("test:model:entity#surface").expect("identity grammar"),
+        sense: Sense::Forward,
+        loops: cadmpeg_ir::topology::FaceLoops::unspecified(Vec::new()),
+        name: None,
+        color: None,
+        tolerance: None,
+    };
+    let transform = cadmpeg_ir::transform::Transform::affine([
+        [1.0, 0.0, 0.0, 12.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ])
+    .expect("affine transform");
+    let surface = Surface {
+        id: SurfaceId::mint("test:model:entity#surface").expect("identity grammar"),
+        geometry: SurfaceGeometry::Solved(SolvedSurfaceGeometry::Transformed(
+            cadmpeg_ir::geometry::PlacedSurface::try_new(
+                Box::new(SolvedSurfaceGeometry::Plane(
+                    cadmpeg_ir::geometry::analytic::PlaneSurface::try_new(
+                        Point3::new(1.0, 2.0, 3.0),
+                        Vector3::new(0.0, 0.0, 1.0),
+                        Vector3::new(1.0, 0.0, 0.0),
+                    )
+                    .unwrap(),
+                )),
+                transform,
+            )
+            .expect("placed surface"),
+        )),
+        source_object: None,
+    };
+
+    bind_mirror_surface_planes(
+        std::slice::from_mut(&mut feature),
+        std::slice::from_ref(&history),
+        std::slice::from_ref(&lane),
+        &[(
+            cadmpeg_ir::ids::FaceId::mint("test:model:entity#face").expect("identity grammar"),
+            crate::brep::PersistentFaceIdentity {
+                feature_source_id: 45_u32.try_into().unwrap(),
+                local_id: 7,
+                trailing_fields: Vec::new(),
+            },
+        )],
+        std::slice::from_ref(&face),
+        std::slice::from_ref(&surface),
+    )
+    .unwrap();
+    assert!(matches!(&(feature.evaluation.definition()),
+        FeatureDefinition::Operation(FeatureOperation::Pattern {
+            pattern: admitted_pattern,
+            ..
+        }) if matches!(admitted_pattern.definition(), PatternTransform::Mirror {
+                plane_origin,
+                plane_normal,
+            } if *plane_origin == Point3::new(13.0, 2.0, 3.0)
+                && *plane_normal == Vector3::new(0.0, 0.0, 1.0))
+    ));
+
+    feature
+        .evaluation
+        .set_definition(FeatureDefinition::Operation(FeatureOperation::Pattern {
+            seeds: Vec::new(),
+            pattern: PatternKind::UNRESOLVED_MIRROR,
+        }));
+    let mut nonmirror_history = history.clone();
+    nonmirror_history.features[0].input_class = Some("moCirPattern_c".into());
+    bind_mirror_surface_planes(
+        std::slice::from_mut(&mut feature),
+        std::slice::from_ref(&nonmirror_history),
+        std::slice::from_ref(&lane),
+        &[(
+            cadmpeg_ir::ids::FaceId::mint("test:model:entity#face").expect("identity grammar"),
+            crate::brep::PersistentFaceIdentity {
+                feature_source_id: 45_u32.try_into().unwrap(),
+                local_id: 7,
+                trailing_fields: Vec::new(),
+            },
+        )],
+        std::slice::from_ref(&face),
+        std::slice::from_ref(&surface),
+    )
+    .unwrap();
+    assert!(matches!(&(feature.evaluation.definition()),
+        FeatureDefinition::Operation(FeatureOperation::Pattern {
+            pattern: admitted_pattern,
+            ..
+        }) if matches!(admitted_pattern.definition(), PatternTransform::Unresolved { form: Some(cadmpeg_ir::features::patterns::PatternForm::Mirror) })
+    ));
+
+    let mut second_face = face.clone();
+    second_face.id = FaceId::mint("test:model:entity#other-face").expect("identity grammar");
+    bind_mirror_surface_planes(
+        std::slice::from_mut(&mut feature),
+        std::slice::from_ref(&history),
+        std::slice::from_ref(&lane),
+        &[
+            (
+                cadmpeg_ir::ids::FaceId::mint("test:model:entity#face").expect("identity grammar"),
+                crate::brep::PersistentFaceIdentity {
+                    feature_source_id: 45_u32.try_into().unwrap(),
+                    local_id: 7,
+                    trailing_fields: Vec::new(),
+                },
+            ),
+            (
+                cadmpeg_ir::ids::FaceId::mint("test:model:entity#other-face")
+                    .expect("identity grammar"),
+                crate::brep::PersistentFaceIdentity {
+                    feature_source_id: 45_u32.try_into().unwrap(),
+                    local_id: 7,
+                    trailing_fields: Vec::new(),
+                },
+            ),
+        ],
+        &[face, second_face],
+        std::slice::from_ref(&surface),
+    )
+    .unwrap();
+    assert!(matches!(&(feature.evaluation.definition()),
+        FeatureDefinition::Operation(FeatureOperation::Pattern {
+            pattern: admitted_pattern,
+            ..
+        }) if matches!(admitted_pattern.definition(), PatternTransform::Unresolved { form: Some(cadmpeg_ir::features::patterns::PatternForm::Mirror) })
+    ));
+}
+
+#[test]
+fn circular_pattern_seed_binds_from_generated_identity_path() {
+    let signature = |source: u32, identity: u32| {
+        let mut signature = [0; 12];
+        signature[4..8].copy_from_slice(&source.to_le_bytes());
+        signature[8..12].copy_from_slice(&identity.to_le_bytes());
+        signature
+    };
+    let pattern_native = NativeFeature {
+        id: "pattern-native".into(),
+        parent: "history".into(),
+        xml_tag: "Feature".into(),
+        tree_parent: None,
+        source_id: FeatureSource::from_value(228),
+        ordinal: 1,
+        name: "CirPattern1".into(),
+        kind: "CirPattern".into(),
+        input_class: Some("moCirPattern_c".into()),
+        suppressed: false,
+        parameters: BTreeMap::new(),
+        dimension_properties: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        text: None,
+        content: Vec::new(),
+    };
+    let seed_native = NativeFeature {
+        id: "seed-native".into(),
+        parent: "history".into(),
+        xml_tag: "Feature".into(),
+        tree_parent: None,
+        source_id: FeatureSource::from_value(224),
+        ordinal: 0,
+        name: "HoleWizard1".into(),
+        kind: "HoleWizard".into(),
+        input_class: Some("moHoleWzd_c".into()),
+        suppressed: false,
+        parameters: BTreeMap::new(),
+        dimension_properties: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        text: None,
+        content: Vec::new(),
+    };
+    let history = FeatureHistory {
+        id: "history".into(),
+        part_name: None,
+        properties: BTreeMap::new(),
+        content: Vec::new(),
+        configurations: Vec::new(),
+        features: vec![pattern_native, seed_native],
+    };
+    let mut lane = FeatureInputLane {
+        id: "lane".into(),
+        configuration: None,
+        native_payload: vec![0; 256].into(),
+        classes: Vec::new(),
+        names: vec![FeatureInputName {
+            id: "pattern-name".into(),
+            parent: "lane".into(),
+            ordinal: 0,
+            offset: 100,
+            object_id: ObjectId::from_value(228),
+            value: "CirPattern1".into(),
+        }],
+        scalars: Vec::new(),
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: vec![FeatureInputGeneratedSurfaceIdentity {
+            id: "identity".into(),
+            parent: "lane".into(),
+            ordinal: 0,
+            offset: 150,
+            type_prefix: [0xc2, 0x83, 0xfb, 0x08].into(),
+            feature_source_id: 224_u32.try_into().unwrap(),
+            local_identity: 2,
+            components: vec![
+                FeatureInputComponentPathEntry {
+                    instance: Some(0x8aaa),
+                    type_signature: signature(228, 1).into(),
+                    local_id: None,
+                },
+                FeatureInputComponentPathEntry {
+                    instance: Some(0x89c9),
+                    type_signature: signature(224, 2).into(),
+                    local_id: Some(2),
+                },
+            ],
+        }],
+        references: Vec::new(),
+        sketch_entities: Vec::new(),
+    };
+    let mut features = vec![
+        Feature {
+            product_definition: None,
+            id: FeatureId::mint("synthetic:test:id#pattern").expect("identity grammar"),
+            ordinal: 0,
+            name: Some("CirPattern1".into()),
+            suppressed: Some(false),
+            dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+            source_properties: BTreeMap::new(),
+            source_tag: None,
+            source_text: None,
+            source_content: cadmpeg_ir::features::FeatureContent::default(),
+            evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+                FeatureDefinition::Operation(FeatureOperation::Pattern {
+                    seeds: Vec::new(),
+                    pattern: PatternKind::UNRESOLVED_CIRCULAR,
+                }),
+            ),
+            native_ref: Some("pattern-native".into()),
+        },
+        Feature {
+            product_definition: None,
+            id: FeatureId::mint("synthetic:test:id#seed").expect("identity grammar"),
+            ordinal: 1,
+            name: Some("HoleWizard1".into()),
+            suppressed: Some(false),
+            dependencies: cadmpeg_ir::features::DistinctMembers::default(),
+            source_properties: BTreeMap::new(),
+            source_tag: None,
+            source_text: None,
+            source_content: cadmpeg_ir::features::FeatureContent::default(),
+            evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+                FeatureDefinition::Operation(FeatureOperation::Pattern {
+                    seeds: Vec::new(),
+                    pattern: PatternKind::UNRESOLVED,
+                }),
+            ),
+            native_ref: Some("seed-native".into()),
+        },
+    ];
+
+    bind_pattern_inputs_test(
+        &mut features,
+        std::slice::from_ref(&history),
+        std::slice::from_mut(&mut lane),
+    )
+    .unwrap();
+
+    assert_eq!(
+        features[0].dependencies.as_slice(),
+        vec![FeatureId::mint("synthetic:test:id#seed").expect("identity grammar")]
+    );
+    assert!(matches!(
+        features[0].evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Pattern { seeds, pattern: admitted_pattern })
+            if matches!(
+                admitted_pattern.definition(),
+                PatternTransform::Unresolved {
+                    form: Some(cadmpeg_ir::features::patterns::PatternForm::Circular)
+                }
+                    if seeds
+                    == &[
+                        PatternSeed::Feature(
+                            FeatureId::mint("synthetic:test:id#seed").expect("identity grammar")
+                        )
+                    ]
+            )
+    ));
+}
+
+#[test]
+fn circular_pattern_axis_binds_from_unique_temporary_axis() {
+    let declaration = 120;
+    let mut payload = vec![0; 512];
+    payload[declaration + temporary_axis::CLASS_MARKER
+        ..declaration + temporary_axis::CLASS_MARKER + temporary_axis::CLASS_MARKER_VALUE.len()]
+        .copy_from_slice(&temporary_axis::CLASS_MARKER_VALUE);
+    payload
+        [declaration + temporary_axis::NAME_LENGTH..declaration + temporary_axis::NAME_LENGTH + 2]
+        .copy_from_slice(&temporary_axis::NAME_LENGTH_VALUE.to_le_bytes());
+    payload[declaration + temporary_axis::NAME
+        ..declaration + temporary_axis::NAME + temporary_axis::NAME_VALUE.len()]
+        .copy_from_slice(&temporary_axis::NAME_VALUE);
+    payload[declaration + temporary_axis::HANDLES
+        ..declaration + temporary_axis::HANDLES + temporary_axis::HANDLES_VALUE.len()]
+        .copy_from_slice(&temporary_axis::HANDLES_VALUE);
+    payload[declaration + temporary_axis::STREAM_ADDRESS
+        ..declaration + temporary_axis::STREAM_ADDRESS + 4]
+        .copy_from_slice(&5000u32.to_le_bytes());
+    for (index, value) in [0.012f64, -0.034, 0.056, 0.1, 0.2, 0.3, 0.0, 1.0, 0.0]
+        .into_iter()
+        .enumerate()
+    {
+        let offset = declaration + temporary_axis::AXIS_FRAME + index * 8;
+        payload[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    payload[declaration + 312..declaration + 318].copy_from_slice(&[0xff, 0xff, 1, 0, 11, 0]);
+    payload[declaration + 318..declaration + 329].copy_from_slice(b"AxisChild_c");
+
+    let native_pattern = NativeFeature {
+        id: "pattern-native".into(),
+        parent: "history".into(),
+        xml_tag: "Feature".into(),
+        tree_parent: None,
+        source_id: FeatureSource::from_value(228),
+        ordinal: 1,
+        name: "CirPattern1".into(),
+        kind: "CirPattern".into(),
+        input_class: Some("moCirPattern_c".into()),
+        suppressed: false,
+        parameters: BTreeMap::from([
+            (cadmpeg_core::nonblank_literal!("Angle"), "90deg".into()),
+            (cadmpeg_core::nonblank_literal!("Count"), "4".into()),
+        ]),
+        dimension_properties: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        text: None,
+        content: Vec::new(),
+    };
+    let history = FeatureHistory {
+        id: "history".into(),
+        part_name: None,
+        properties: BTreeMap::new(),
+        content: Vec::new(),
+        configurations: Vec::new(),
+        features: vec![native_pattern],
+    };
+    let lane = FeatureInputLane {
+        id: "lane".into(),
+        configuration: None,
+        native_payload: payload.into(),
+        classes: Vec::new(),
+        names: vec![FeatureInputName {
+            id: "pattern-name".into(),
+            parent: "lane".into(),
+            ordinal: 0,
+            offset: 100,
+            object_id: ObjectId::from_value(228),
+            value: "CirPattern1".into(),
+        }],
+        scalars: Vec::new(),
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: Vec::new(),
+    };
+    let mut features = vec![Feature {
+        product_definition: None,
+        id: FeatureId::mint("synthetic:test:id#pattern").expect("identity grammar"),
+        ordinal: 0,
+        name: Some("CirPattern1".into()),
+        suppressed: Some(false),
+        dependencies: cadmpeg_ir::features::DistinctMembers::try_from(vec![FeatureId::mint(
+            "synthetic:test:id#seed",
+        )
+        .expect("identity grammar")])
+        .unwrap(),
+        source_properties: BTreeMap::new(),
+        source_tag: None,
+        source_text: None,
+        source_content: cadmpeg_ir::features::FeatureContent::default(),
+        evaluation: cadmpeg_ir::features::FeatureEvaluation::from_definition(
+            FeatureDefinition::Operation(FeatureOperation::Pattern {
+                seeds: vec![PatternSeed::Feature(
+                    FeatureId::mint("synthetic:test:id#seed").expect("identity grammar"),
+                )],
+                pattern: PatternKind::UNRESOLVED_CIRCULAR,
+            }),
+        ),
+        native_ref: Some("pattern-native".into()),
+    }];
+
+    bind_pattern_inputs_test(&mut features, std::slice::from_ref(&history), &[lane]).unwrap();
+
+    assert!(matches!(
+        features[0].evaluation.definition(),
+        FeatureDefinition::Operation(FeatureOperation::Pattern {
+            pattern: admitted_pattern,
+            ..
+        }) if matches!(admitted_pattern.definition(), PatternTransform::Circular {
+                axis_origin,
+                axis_dir,
+                angle,
+                count,
+            } if *axis_origin == Point3::new(100.0, 200.0, 300.0)
+            && *axis_dir == Vector3::new(0.0, 1.0, 0.0)
+            && angle.get() == std::f64::consts::FRAC_PI_2
+            && *count == 4)
+    ));
+}
+
+#[test]
+fn indexed_curve_vertex_binding_follows_the_resolved_coordinate_roster() {
+    let mut payload = vec![0; 104 + LEGACY_SKETCH_MARKER.len()];
+    payload[..LEGACY_SKETCH_MARKER.len()].copy_from_slice(LEGACY_SKETCH_MARKER);
+    payload[5..13].fill(0xff);
+    payload[13..17].copy_from_slice(&[0x00, 0x00, 0x80, 0xbf]);
+    payload[17..21].copy_from_slice(&2u32.to_le_bytes());
+    payload[23..29].copy_from_slice(&[0x05, 0x00, 0x01, 0x00, 0x01, 0x00]);
+    payload[31..39].copy_from_slice(&[0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x04, 0x00]);
+    payload[48..56].copy_from_slice(&1.0f64.to_le_bytes());
+    payload[56..58].copy_from_slice(&1u16.to_le_bytes());
+    payload[58..60].copy_from_slice(&3u16.to_le_bytes());
+    payload[60..64].copy_from_slice(&1u32.to_le_bytes());
+    payload[64..72].copy_from_slice(&(-1.0f64).to_le_bytes());
+    payload[72..76].copy_from_slice(&1i32.to_le_bytes());
+    payload[76..78].copy_from_slice(&2u16.to_le_bytes());
+    for start in (78..94).step_by(4) {
+        payload[start..start + 4].copy_from_slice(&(-2i32).to_le_bytes());
+    }
+    payload[104..].copy_from_slice(LEGACY_SKETCH_MARKER);
+    let entity = |id: &str, offset, object_index, kind, coordinates_m: Option<[f64; 2]>| {
+        let marker_id: String = id.into();
+        let marker_parent: String = "lane".into();
+        let mut constructed_marker =
+            SketchInputEntity::new(marker_id, marker_parent, 0, offset, kind);
+        constructed_marker.feature_ref = Some("profile".into());
+        constructed_marker = constructed_marker.with_test_identity(object_index, None);
+        constructed_marker.state_value = cadmpeg_ir::scalar::FiniteReal::new(1.0);
+        constructed_marker.coordinates_m =
+            coordinates_m.and_then(cadmpeg_ir::units::FiniteVector::new);
+        constructed_marker.links = None;
+        constructed_marker
+    };
+    let mut lane = FeatureInputLane {
+        id: "lane".into(),
+        configuration: None,
+        native_payload: payload.into(),
+        classes: Vec::new(),
+        names: Vec::new(),
+        scalars: Vec::new(),
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: vec![
+            entity("curve", 0, Some(1), SketchInputKind::Arc, None),
+            entity("handle", 1, None, SketchInputKind::Point, Some([-1.0, 0.0])),
+            entity(
+                "start",
+                2,
+                Some(2),
+                SketchInputKind::Point,
+                Some([0.0, 0.0]),
+            ),
+            entity("center", 3, None, SketchInputKind::Point, Some([0.5, 0.5])),
+            entity(
+                "end",
+                4,
+                Some(3),
+                SketchInputKind::LineOrCircle,
+                Some([1.0, 0.0]),
+            ),
+        ],
+    };
+
+    normalize_indexed_curve_entities(&mut lane);
+    bind_resolved_curve_vertices(&mut lane);
+
+    assert_eq!(lane.sketch_entities[4].kind(), SketchInputKind::Point);
+}
+
+#[test]
+fn local_link_promotes_a_coordinate_bearing_curve_to_a_profile_vertex() {
+    let mut payload = vec![0; 157];
+    payload[..SKETCH_MARKER.len()].copy_from_slice(SKETCH_MARKER);
+    payload[5..13].fill(0xff);
+    payload[13..17].copy_from_slice(&[0x00, 0x00, 0x80, 0xbf]);
+    payload[17..21].copy_from_slice(&1u32.to_le_bytes());
+    payload[23..27].copy_from_slice(&[0x05, 0x00, 0x01, 0x00]);
+    payload[27..29].copy_from_slice(&1u16.to_le_bytes());
+    payload[31..39].copy_from_slice(&[0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x04, 0x00]);
+    payload[48..56].copy_from_slice(&1.0f64.to_le_bytes());
+    payload[64..66].copy_from_slice(&[0x1e, 0x00]);
+    payload[82..86].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+    payload[86..88].copy_from_slice(&0xbc87u16.to_le_bytes());
+    payload[88..90].copy_from_slice(&22u16.to_le_bytes());
+    payload[90..94].fill(0xff);
+    payload[102..106].copy_from_slice(&(-2i32).to_le_bytes());
+    payload[152..].copy_from_slice(SKETCH_MARKER);
+    let entity = |id: &str, offset, local_id, kind, coordinates_m: Option<[f64; 2]>| {
+        let marker_id: String = id.into();
+        let marker_parent: String = "lane".into();
+        let mut constructed_marker =
+            SketchInputEntity::new(marker_id, marker_parent, 0, offset, kind);
+        constructed_marker.feature_ref = Some("feature".into());
+        constructed_marker = constructed_marker.with_test_identity(None, local_id);
+        constructed_marker.state_value = None;
+        constructed_marker.coordinates_m =
+            coordinates_m.and_then(cadmpeg_ir::units::FiniteVector::new);
+        constructed_marker.links = None;
+        constructed_marker
+    };
+    let mut lane = FeatureInputLane {
+        id: "lane".into(),
+        configuration: None,
+        native_payload: payload.into(),
+        classes: Vec::new(),
+        names: Vec::new(),
+        scalars: Vec::new(),
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: vec![
+            entity(
+                "line",
+                0,
+                Some(1),
+                SketchInputKind::LineOrCircle,
+                Some([2.0, 3.0]),
+            ),
+            entity(
+                "curve-vertex",
+                152,
+                Some(22),
+                SketchInputKind::LineOrCircle,
+                Some([4.0, 5.0]),
+            ),
+        ],
+    };
+
+    bind_resolved_curve_vertices(&mut lane);
+
+    assert_eq!(
+        lane.sketch_entities[0].kind(),
+        SketchInputKind::LineOrCircle
+    );
+    assert_eq!(lane.sketch_entities[1].kind(), SketchInputKind::Point);
+}
+
+#[test]
+fn detached_spatial_relation_group_binds_by_its_complete_dimension_signature() {
+    let feature = NativeFeature {
+        id: "spatial".into(),
+        parent: "history".into(),
+        xml_tag: "Sketch".into(),
+        tree_parent: None,
+        source_id: FeatureSource::from_value(7),
+        ordinal: 0,
+        name: "Position".into(),
+        kind: "3DSketch".into(),
+        input_class: Some("mo3DProfileFeature_c".into()),
+        suppressed: false,
+        parameters: BTreeMap::from([
+            (cadmpeg_core::nonblank_literal!("D1"), "10".into()),
+            (cadmpeg_core::nonblank_literal!("D2"), "20".into()),
+            (cadmpeg_core::nonblank_literal!("D3"), "30".into()),
+            (cadmpeg_core::nonblank_literal!("Mode"), "authored".into()),
+        ]),
+        dimension_properties: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        text: None,
+        content: Vec::new(),
+    };
+    let class = |offset, name: &str| FeatureInputClass {
+        id: format!("class-{offset}"),
+        parent: "sldprt:feature-input:config-objects#1".into(),
+        ordinal: 0,
+        offset,
+        name: name.into(),
+    };
+    let name = |index, value: &str| FeatureInputName {
+        id: format!("name-{index}"),
+        parent: "sldprt:feature-input:config-objects#1".into(),
+        ordinal: index,
+        offset: 250 + u64::from(index),
+        object_id: None,
+        value: value.into(),
+    };
+    let scalar = |index, value| FeatureInputScalar {
+        id: format!("scalar-{index}"),
+        parent: "sldprt:feature-input:config-objects#1".into(),
+        feature_ref: None,
+        ordinal: index,
+        offset: 300 + 20 * u64::from(index),
+        object_id: index,
+        name: format!("name-{index}"),
+        value: cadmpeg_ir::scalar::FiniteReal::new(value).expect("finite test scalar"),
+        role: FeatureInputScalarRole::Driving,
+        operands: Vec::new(),
+        archive_class: None,
+    };
+    let entity = |id: &str, offset| {
+        let marker_id: String = id.into();
+        let marker_parent: String = "sldprt:feature-input:config-objects#1".into();
+        let mut constructed_marker =
+            SketchInputEntity::new(marker_id, marker_parent, 0, offset, SketchInputKind::Point);
+        constructed_marker.feature_ref = None;
+        constructed_marker = constructed_marker.with_test_identity(Some(1), None);
+        constructed_marker.state_value = cadmpeg_ir::scalar::FiniteReal::new(1.0);
+        constructed_marker.coordinates_m = None;
+        constructed_marker.links = None;
+        constructed_marker
+    };
+    let mut lane = FeatureInputLane {
+        id: "sldprt:feature-input:config-objects#1".into(),
+        configuration: Some("0".into()),
+        native_payload: vec![0; 700].into(),
+        classes: vec![
+            class(100, "moRelMgr_c"),
+            class(200, "sg3DPlaneHandle"),
+            class(500, "suObList"),
+        ],
+        names: vec![name(0, "D1"), name(1, "D2"), name(2, "D3")],
+        scalars: vec![scalar(0, 0.01), scalar(1, 0.02), scalar(2, 0.03)],
+        relation_bindings: Vec::new(),
+        relation_instances: Vec::new(),
+        body_selections: Vec::new(),
+        edge_selections: Vec::new(),
+        surface_selections: Vec::new(),
+        generated_surface_identities: Vec::new(),
+        references: Vec::new(),
+        sketch_entities: vec![entity("inside", 150), entity("outside", 550)],
+    };
+    let history = FeatureHistory {
+        id: "history".into(),
+        part_name: None,
+        properties: BTreeMap::new(),
+        content: Vec::new(),
+        configurations: Vec::new(),
+        features: vec![feature.clone()],
+    };
+
+    bind_detached_legacy_sketch_objects(
+        &cadmpeg_test_support::service_decode_context(),
+        std::slice::from_ref(&history),
+        &HashSet::default(),
+        &mut lane,
+    )
+    .unwrap();
+    assert_eq!(
+        lane.sketch_entities[0].feature_ref.as_deref(),
+        Some("spatial")
+    );
+    assert_eq!(lane.sketch_entities[1].feature_ref, None);
+    assert!(lane
+        .scalars
+        .iter()
+        .all(|scalar| scalar.feature_ref.as_deref() == Some("spatial")));
+
+    let mut ambiguous = lane;
+    for entity in &mut ambiguous.sketch_entities {
+        entity.feature_ref = None;
+    }
+    for scalar in &mut ambiguous.scalars {
+        scalar.feature_ref = None;
+    }
+    let mut second = feature;
+    second.id = "other-spatial".into();
+    let mut ambiguous_history = history;
+    ambiguous_history.features.push(second);
+    bind_detached_legacy_sketch_objects(
+        &cadmpeg_test_support::service_decode_context(),
+        std::slice::from_ref(&ambiguous_history),
+        &HashSet::default(),
+        &mut ambiguous,
+    )
+    .unwrap();
+    assert!(ambiguous
+        .sketch_entities
+        .iter()
+        .all(|entity| entity.feature_ref.is_none()));
+}

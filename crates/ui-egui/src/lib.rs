@@ -134,6 +134,7 @@ pub mod mesh_units;
 pub mod messages;
 pub(crate) mod motion;
 pub mod occurrence_drag;
+mod occurrence_move_value;
 #[cfg(test)]
 mod pattern_arrow_tests;
 #[cfg(test)]
@@ -191,6 +192,7 @@ mod file_picker;
 pub(crate) mod frame_watch;
 #[cfg(test)]
 mod history_off_thread_tests;
+mod mesh_edit_overlay;
 mod move_preview;
 pub use file_picker::FilePickerFuture;
 #[cfg(test)]
@@ -205,6 +207,8 @@ mod file_load_ui_tests;
 #[cfg(test)]
 mod fillet_spline_handle_tests;
 pub mod mouse_gesture;
+pub mod move_handle_snap;
+pub mod move_handles;
 use solidcraft_ui_kit::nav_bar;
 pub(crate) mod navigation;
 pub use solidcraft_ui_kit::navigation_bar;
@@ -214,6 +218,8 @@ mod navigation_bar_view;
 pub mod navigation_slots;
 pub use navigation::WebWheelGestures;
 pub mod network_prompt;
+pub(crate) mod nx_shortcuts;
+mod nx_shortcuts_ui;
 pub mod op_auto;
 pub mod open_elsewhere;
 pub(crate) mod open_meshing;
@@ -251,12 +257,22 @@ mod revolve_edit_tests;
 #[cfg(test)]
 mod revolve_manipulator_tests;
 pub use solidcraft_ui_kit::ribbon;
+mod live_slice;
+mod mesh_cut_handles;
+mod mesh_lasso;
+mod mesh_region_colors;
+mod mesh_report;
+mod mesh_textures;
 #[cfg(test)]
 mod round_pick_tests;
 mod rule_editor;
 #[cfg(test)]
 mod rule_editor_tests;
 pub mod save_job;
+mod scan_alignment_ui;
+mod scan_copy_ui;
+mod scan_surface_fit;
+mod scan_workflow;
 pub mod scenario;
 pub(crate) mod scene_palette;
 pub mod select_other;
@@ -312,6 +328,8 @@ pub mod space_mouse;
 pub mod space_mouse_calibration;
 pub mod space_mouse_model;
 pub mod space_mouse_offer;
+mod spatial_dimensions;
+mod spatial_freedom;
 pub mod stand_up;
 pub use solidcraft_ui_kit::start_page;
 mod status_bar;
@@ -625,13 +643,18 @@ pub struct SolveApp {
     /// The joint dialogs' picked and hovered snaps ([`dialogs_assembly::picked_snap`]).
     pub(crate) snaps: dialogs_assembly::SnapMemo,
     /// Each command dialog's options and values as last applied (this session only).
-    pub(crate) remembered_commands: Vec<dialogs::RememberedCommand>,
     /// The Change Parameters window, when open.
     pub params: Option<params_dialog::ParamsDialog>,
     /// The Design Properties window, when open.
     pub design_properties: Option<design_properties::DesignProperties>,
     /// The Sketch report window (`sketch.inspect` from the ribbon), when open.
     pub sketch_report: Option<sketch_report::SketchReport>,
+    pub(crate) mesh_report: Option<Value>,
+    pub(crate) live_slice: Option<live_slice::State>,
+    pub(crate) scan_workflow: Option<scan_workflow::State>,
+    pub(crate) spatial_dimensions: Option<spatial_dimensions::State>,
+    pub(crate) mesh_region_colors: Option<mesh_region_colors::RegionColors>,
+    pub(crate) dense_lasso: Option<mesh_region_colors::DenseLasso>,
     /// The Bill of Materials window, when open.
     pub bom: Option<bom_panel::BomPanel>,
     material_card_review: Option<material_card_review::ReviewWindow>,
@@ -929,10 +952,15 @@ impl SolveApp {
             tool: None,
             dialog: None,
             snaps: Default::default(),
-            remembered_commands: Vec::new(),
             params: None,
             design_properties: None,
             sketch_report: None,
+            mesh_report: None,
+            live_slice: None,
+            scan_workflow: None,
+            spatial_dimensions: None,
+            mesh_region_colors: None,
+            dense_lasso: None,
             bom: None,
             material_card_review: None,
             menu: context_menu::MenuState::default(),
@@ -1413,6 +1441,13 @@ impl SolveApp {
             self.status = None;
         }
         let done = self.command_completed(id, r);
+        let exported = id.starts_with("file.export") || id == "file.save_mesh";
+        if done.is_ok() && (exported || matches!(id, "file.insert_step" | "file.insert_mesh" | "pointcloud.insert")) {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                let text = solidcraft_ui_text::format(if exported { "notifications.exported" } else { "notifications.imported" }, &[("path", path)]);
+                self.set_file_status(text, path);
+            }
+        }
         if self.session.revision != revision {
             timeline::stop_playback(self);
         }
@@ -1701,6 +1736,8 @@ impl SolveApp {
                     render_workspace::reset_document(self);
                     dim_view::cancel();
                     self.bom = None;
+                    self.mesh_report = None;
+                    self.mesh_region_colors = None;
                     design_properties::close_object(self);
                     timeline::stop_playback(self);
                     self.menu.props = None;
@@ -1832,6 +1869,15 @@ impl SolveApp {
     }
 
     fn start_with_variant_memory(&mut self, id: &str, remember_variant: bool, opener: Option<egui::Rect>, section_edit: bool) {
+        if id == "scan.workflow" {
+            self.scan_workflow = Some(scan_workflow::State::default());
+            return;
+        }
+        if id == "scan.live_slice" {
+            self.live_slice = Some(live_slice::State::new(self));
+            return;
+        }
+
         // A tool can be started outside the frame's scope (a direct `start`, a shortcut in
         // `logic`): build its hint in the user's language, not the thread default.
         let _language = solidcraft_ui_text::scope(&self.preferences.language);
@@ -2206,7 +2252,11 @@ impl SolveApp {
             design_properties::open(self);
             return;
         }
-        if id == "sketch.inspect" {
+        if matches!(id, "sketch.dimension3d" | "sketch.dimension3d.edit") || (id == "sketch.dimension" && sketch3d::active(self)) {
+            spatial_dimensions::open(self);
+            return;
+        }
+        if matches!(id, "sketch.inspect" | "sketch.freedom3d") {
             sketch_report::open(self);
             return;
         }
@@ -2384,7 +2434,12 @@ impl SolveApp {
                 let _ = self.session.execute("select.clear", &json!({}));
             }
             self.tool = Some(t);
-            self.set_status(tools::hint(id), false);
+            let mut hint = tools::hint(id);
+            if crate::sketch3d::drawing(self) {
+                hint.push(' ');
+                hint.push_str(self.tr("sketch.hint.cycle_world_axis"));
+            }
+            self.set_status(hint, false);
             return;
         }
         if let Some(mut d) = dialogs::Dialog::for_command(self, id) {
@@ -2395,11 +2450,7 @@ impl SolveApp {
             if d.wants_picks() && !self.session.selection.is_empty() {
                 let _ = self.session.execute("select.clear", &json!({}));
             }
-            let extrude = matches!(d.kind, dialogs::Kind::Extrude { .. });
-            self.dialog = Some(d);
-            if extrude {
-                self.turn_for_extrude();
-            }
+            self.open_model_dialog(d);
             return;
         }
         // Undo and redo can recompute much of the history: off the window thread when slow.
@@ -2564,7 +2615,8 @@ impl SolveApp {
                 if !d.previews() {
                     self.editing_state = None;
                 }
-                self.dialog = Some(d);
+                self.pre_command_cam = None;
+                self.open_model_dialog(d);
             }
             None => {
                 dialogs::restore_editing(self, marker);
@@ -2647,6 +2699,13 @@ impl SolveApp {
         turn
     }
 
+    fn open_model_dialog(&mut self, dialog: dialogs::Dialog) {
+        if dialog.is_extrude() {
+            self.turn_for_extrude();
+        }
+        self.dialog = Some(dialog);
+    }
+
     /// Extrude opened: turn the view to isometric when Preferences say so, and remember the view
     /// from before for when the dialog closes (#9176).
     fn turn_for_extrude(&mut self) {
@@ -2663,7 +2722,7 @@ impl SolveApp {
     /// Once Extrude has closed, however it closed, the view goes back to where it was before
     /// Extrude turned it (#9176). Going back keeps the projection, as at the end of a sketch.
     fn return_from_extrude_view(&mut self) {
-        if self.dialog.as_ref().is_some_and(|d| matches!(d.kind, dialogs::Kind::Extrude { .. })) {
+        if self.dialog.as_ref().is_some_and(dialogs::Dialog::is_extrude) {
             return;
         }
         if let Some(before) = self.pre_extrude_cam.take() {
@@ -2825,6 +2884,14 @@ impl SolveApp {
         let (text, at) = (i18n::tr_diagnostic(&s.into()), now_ms());
         self.messages.push(&text, error, at);
         self.status = Some((text, at, error));
+        self.status_undo = false;
+    }
+
+    pub fn set_file_status(&mut self, text: impl Into<String>, path: &str) {
+        let text = text.into();
+        let at = now_ms();
+        self.messages.file(&text, path, at);
+        self.status = Some((text, at, false));
         self.status_undo = false;
     }
 
@@ -3744,6 +3811,11 @@ impl SolveApp {
         params_dialog::show(self, ui.ctx());
         design_properties::show(self, ui.ctx());
         sketch_report::show(self, ui.ctx());
+        spatial_dimensions::show(self, ui.ctx());
+        mesh_region_colors::sync_lasso(self, ui.ctx());
+        mesh_report::show(self, ui.ctx());
+        live_slice::show(self, ui.ctx());
+        scan_workflow::show(self, ui.ctx());
         if !panel_runtime::production_active(self) {
             bom_panel::show(self, ui.ctx());
         }

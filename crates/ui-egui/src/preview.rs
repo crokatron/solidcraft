@@ -81,6 +81,7 @@ impl Colors {
 pub struct SketchPreview {
     pub sketch: std::sync::Arc<solidcraft_engine::doc::SolvedSketch>,
     pub curves: Vec<usize>,
+    pub wires: Vec<usize>,
     pub points: Vec<usize>,
 }
 
@@ -493,6 +494,7 @@ pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
                 | "sketch.pattern.circular"
                 | "sketch.offset"
                 | "sketch.point.divide"
+                | "sketch.fillet3d"
                 | "sketch.fillet"
                 | "sketch.chamfer.equal_distance"
                 | "sketch.chamfer.two_distance"
@@ -838,7 +840,14 @@ pub(crate) fn sketch_changes(
         .enumerate()
         .filter_map(|(i, p)| if old_points.get(p.id.as_str()) == Some(&p.pos) { None } else { Some(i) })
         .collect::<Vec<_>>();
-    if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
+    let previous = old.into_iter().flat_map(|s| &s.sketch.wires).map(|w| (w.id.as_str(), &w.pts)).collect::<std::collections::HashMap<_, _>>();
+    let wires: Vec<_> =
+        sketch.sketch.wires.iter().enumerate().filter_map(|(i, w)| (previous.get(w.id.as_str()) != Some(&&w.pts)).then_some(i)).collect();
+    if indices.is_empty() && wires.is_empty() && points.is_empty() {
+        None
+    } else {
+        Some(SketchPreview { sketch: sketch.clone(), curves: indices, wires, points })
+    }
 }
 
 /// Which of the `nf` faces of `m` are new surface, i.e. not on the old mesh? Each is decided by
@@ -1012,12 +1021,18 @@ pub(crate) fn paint_sketch(
     for index in &preview.curves {
         crate::tools::paint_curve(&sketch.sketch, *index, &sketch.plane, painter, proj, stroke, budget);
     }
+    for &index in &preview.wires {
+        let wire = &sketch.sketch.wires[index];
+        let count = wire.pts.len().min(budget.remaining_vertices);
+        crate::tools::paint_sketch_path(&wire.pts[..count], 0, painter, proj, stroke);
+        budget.remaining_vertices -= count;
+    }
     for index in &preview.points {
         if let Some(point) = sketch.sketch.point(*index).and_then(|p| proj.to_screen(sketch.plane.to_world(p))) {
             painter.circle_filled(point, 3.0, stroke.color);
         }
     }
-    preview.curves.len()
+    preview.curves.len() + preview.wires.len()
 }
 
 #[cfg(test)]

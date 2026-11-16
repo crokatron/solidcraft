@@ -1,0 +1,16 @@
+{
+  "en": {
+    "nx_shortcuts.import_hint": "Import accepts SolidCraft profiles and your NX .mtx file, including Export for SolidCraft from NX Shortcut Workbench.",
+    "nx_shortcuts.report": "NX shortcut import report",
+    "nx_shortcuts.limit": "Only explicit custom shortcuts in the file are imported. Unavailable commands and disabled NX keys remain listed; no substitute action is silently assigned.",
+    "nx_shortcuts.replace": "Replace conflicting SolidCraft shortcuts",
+    "nx_shortcuts.apply": "Apply supported shortcuts",
+    "nx_shortcuts.restore": "Restore previous shortcuts",
+    "nx_shortcuts.save_report": "Save report",
+    "nx_shortcuts.ready": "Ready",
+    "nx_shortcuts.applied": "Applied",
+    "nx_shortcuts.unsupported": "No equivalent",
+    "nx_shortcuts.suppressed": "Disabled in NX",
+    "nx_shortcuts.conflict": "Conflict"
+  }
+}

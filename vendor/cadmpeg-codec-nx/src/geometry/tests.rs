@@ -1,0 +1,431 @@
+// SPDX-License-Identifier: Apache-2.0
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::default_trait_access)]
+
+use crate::decode::emit::decoded_tolerance;
+use crate::test_support::test_bytes::encoded_xmt;
+use crate::test_support::test_bytes::put_f64;
+use crate::test_support::test_bytes::put_ref;
+use crate::test_support::test_bytes::put_vec3;
+use crate::test_support::test_bytes::record;
+use crate::test_support::test_deltas::trimmed_topology_partition_stream;
+use crate::test_support::test_streams::blend_surface_topology_partition_stream;
+use crate::test_support::test_streams::offset_surface_topology_partition_stream;
+use crate::test_support::test_streams::topology_partition_stream;
+
+use crate::framing::node_kind::NodeKind;
+use cadmpeg_ir::geometry::{SolvedSurfaceGeometry, SurfaceGeometry};
+
+fn analytic_points(stream: &[u8]) -> Vec<cadmpeg_ir::features::FinitePoint3> {
+    super::points(stream)
+}
+
+fn analytic_surfaces(stream: &[u8]) -> Vec<SurfaceGeometry> {
+    super::surfaces(stream)
+}
+
+fn analytic_curves(stream: &[u8]) -> Vec<cadmpeg_ir::geometry::CurveGeometry> {
+    super::curves(stream)
+}
+
+#[test]
+fn nx_offset_surface_accepts_unbounded_representable_distance() {
+    let mut stream = offset_surface_topology_partition_stream();
+    let offset = stream
+        .windows(4)
+        .position(|window| window == [0, 60, 0, 12])
+        .expect("offset record");
+    put_f64(&mut stream, offset + 23, 1_001.0);
+    let surfaces = crate::topology::offset_surfaces(&stream);
+    let [surface] = surfaces.as_slice() else {
+        panic!("offset surface")
+    };
+    assert_eq!(surface.state.distance().get(), 1_001_000.0);
+
+    put_f64(&mut stream, offset + 23, f64::INFINITY);
+    assert!(crate::topology::offset_surfaces(&stream).is_empty());
+
+    put_f64(&mut stream, offset + 23, f64::MAX);
+    assert!(crate::topology::offset_surfaces(&stream).is_empty());
+}
+
+#[test]
+fn offset_surface_envelope_does_not_consume_the_following_record() {
+    let mut stream = offset_surface_topology_partition_stream();
+    let offset_end = stream.len();
+    let mut point = record(29, 40);
+    put_ref(&mut point, 2, 20);
+    put_vec3(&mut point, 16, [0.001, 0.002, 0.003]);
+    stream.extend(point);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(
+        graph
+            .get(NodeKind::OffsetSurface, 12)
+            .map(crate::topology::Node::end),
+        Some(offset_end)
+    );
+    assert!(graph.get(NodeKind::Point, 20).is_some());
+}
+
+#[test]
+fn nx_blend_surface_requires_a_nonzero_rolling_ball_radius() {
+    let mut stream = blend_surface_topology_partition_stream();
+    let blend = stream
+        .windows(4)
+        .position(|window| window == [0, 56, 0, 12])
+        .expect("blend record");
+    put_f64(&mut stream, blend + 26, 0.0);
+    put_f64(&mut stream, blend + 34, 0.0);
+    assert!(crate::topology::blend_surfaces(&stream).is_empty());
+
+    put_f64(&mut stream, blend + 26, 0.5e-9);
+    assert!(crate::topology::blend_surfaces(&stream).is_empty());
+
+    put_f64(&mut stream, blend + 26, f64::MAX);
+    put_f64(&mut stream, blend + 34, f64::MAX);
+    assert!(crate::topology::blend_surfaces(&stream).is_empty());
+}
+
+#[test]
+fn trimmed_curves_reject_nonfinite_endpoint_witnesses() {
+    let mut stream = trimmed_topology_partition_stream();
+    let trim = stream
+        .windows(4)
+        .position(|window| window == [0, 133, 0, 12])
+        .expect("trimmed curve");
+    put_f64(&mut stream, trim + 21, f64::NAN);
+    assert!(crate::topology::trimmed_curves(&stream).is_empty());
+
+    put_f64(&mut stream, trim + 21, f64::MAX);
+    assert!(crate::topology::trimmed_curves(&stream).is_empty());
+}
+
+#[test]
+fn analytic_scanner_accepts_positive_subnormal_radius() {
+    let mut cy = record(0x33, 99);
+    put_ref(&mut cy, 2, 2);
+    cy[18] = b'+';
+    put_vec3(&mut cy, 19, [0.003_175, 0.0, 0.0]);
+    put_vec3(&mut cy, 43, [0.0, 0.0, 1.0]);
+    put_f64(&mut cy, 67, f64::from_bits(1)); // smallest positive subnormal
+    put_vec3(&mut cy, 75, [1.0, 0.0, 0.0]);
+    assert_eq!(analytic_surfaces(&cy).len(), 1);
+}
+
+#[test]
+fn graph_owned_analytic_geometry_has_no_scanner_magnitude_limit() {
+    let mut cylinder = record(0x33, 99);
+    put_ref(&mut cylinder, 2, 2);
+    cylinder[18] = b'+';
+    put_vec3(&mut cylinder, 19, [1_001.0, 0.0, 0.0]);
+    put_vec3(&mut cylinder, 43, [0.0, 0.0, 1.0]);
+    put_f64(&mut cylinder, 67, f64::from_bits(1));
+    put_vec3(&mut cylinder, 75, [1.0, 0.0, 0.0]);
+
+    assert_eq!(analytic_surfaces(&cylinder).len(), 1);
+    let geometry = crate::geometry::decode_surface_record(&cylinder, NodeKind::Cylinder, 0)
+        .expect("graph-owned cylinder");
+    let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(cylinder_surface)) = geometry
+    else {
+        panic!("cylinder")
+    };
+    let origin = cylinder_surface.origin();
+    let radius = cylinder_surface.radius().get();
+    assert_eq!(origin.x, 1_001_000.0);
+    assert_eq!(radius, f64::from_bits(1) * 1000.0);
+
+    put_f64(&mut cylinder, 67, f64::INFINITY);
+    assert!(crate::geometry::decode_surface_record(&cylinder, NodeKind::Cylinder, 0).is_err());
+}
+
+#[test]
+fn ellipse_requires_ordered_serialized_radii() {
+    let mut ellipse = record(0x20, 107);
+    put_ref(&mut ellipse, 2, 2);
+    ellipse[18] = b'+';
+    put_vec3(&mut ellipse, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut ellipse, 43, [0.0, 0.0, 1.0]);
+    put_vec3(&mut ellipse, 67, [1.0, 0.0, 0.0]);
+    put_f64(&mut ellipse, 91, 0.01);
+    put_f64(&mut ellipse, 99, 0.01 + 5.0e-10);
+
+    assert!(analytic_curves(&ellipse).is_empty());
+    assert!(crate::geometry::decode_curve_record(&ellipse, NodeKind::Ellipse, 0).is_none());
+
+    put_f64(&mut ellipse, 99, 0.01);
+    assert_eq!(analytic_curves(&ellipse).len(), 1);
+}
+
+#[test]
+fn analytic_scanners_refuse_metre_values_that_overflow_in_millimetres() {
+    let mut cylinder = record(0x33, 99);
+    put_ref(&mut cylinder, 2, 2);
+    cylinder[18] = b'+';
+    put_vec3(&mut cylinder, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut cylinder, 43, [0.0, 0.0, 1.0]);
+    put_f64(&mut cylinder, 67, 0.01);
+    put_vec3(&mut cylinder, 75, [1.0, 0.0, 0.0]);
+    assert!(crate::geometry::decode_surface_record(&cylinder, NodeKind::Cylinder, 0).is_ok());
+
+    put_f64(&mut cylinder, 67, f64::MAX);
+    assert!(crate::geometry::decode_surface_record(&cylinder, NodeKind::Cylinder, 0).is_err());
+
+    put_f64(&mut cylinder, 67, 0.01);
+    put_vec3(&mut cylinder, 19, [f64::MAX, 0.0, 0.0]);
+    assert!(crate::geometry::decode_surface_record(&cylinder, NodeKind::Cylinder, 0).is_err());
+
+    assert_eq!(decoded_tolerance(-31_415_800_000_000.0), None);
+}
+
+#[test]
+fn ellipse_order_is_read_from_the_metre_radii() {
+    let major = 0.010_000_000_000_000_045_f64;
+    let minor = f64::from_bits(major.to_bits() + 1);
+    assert_eq!(major * 1000.0, minor * 1000.0);
+
+    let mut ellipse = record(0x20, 107);
+    put_ref(&mut ellipse, 2, 2);
+    ellipse[18] = b'+';
+    put_vec3(&mut ellipse, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut ellipse, 43, [0.0, 0.0, 1.0]);
+    put_vec3(&mut ellipse, 67, [1.0, 0.0, 0.0]);
+    put_f64(&mut ellipse, 91, major);
+    put_f64(&mut ellipse, 99, minor);
+    assert!(crate::geometry::decode_curve_record(&ellipse, NodeKind::Ellipse, 0).is_none());
+
+    put_f64(&mut ellipse, 99, major);
+    assert!(crate::geometry::decode_curve_record(&ellipse, NodeKind::Ellipse, 0).is_some());
+}
+
+#[test]
+fn graph_owned_point_has_no_scanner_magnitude_limit() {
+    let mut stream = topology_partition_stream();
+    let point = stream
+        .windows(4)
+        .position(|window| window == [0, 29, 0, 11])
+        .expect("point record");
+    put_vec3(&mut stream, point + 16, [1_001.0, f64::from_bits(1), 0.0]);
+
+    assert_eq!(analytic_points(&stream).len(), 1);
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(
+        graph
+            .get(NodeKind::Point, 11)
+            .and_then(crate::topology::Node::point_position)
+            .map(cadmpeg_ir::features::FinitePoint3::get),
+        Some(cadmpeg_ir::math::Point3::new(
+            1_001_000.0,
+            f64::from_bits(1) * 1000.0,
+            0.0,
+        ))
+    );
+
+    put_vec3(&mut stream, point + 16, [f64::INFINITY, 0.0, 0.0]);
+    assert!(crate::topology::Graph::parse(&stream)
+        .get(NodeKind::Point, 11)
+        .is_none());
+}
+
+#[test]
+fn decoded_tolerance_has_no_model_magnitude_limit() {
+    assert_eq!(
+        decoded_tolerance(1_001.0).map(cadmpeg_ir::scalar::PositiveReal::get),
+        Some(1_001_000.0)
+    );
+    assert_eq!(decoded_tolerance(0.0), None);
+    assert_eq!(decoded_tolerance(f64::INFINITY), None);
+    assert_eq!(decoded_tolerance(f64::MAX), None);
+}
+
+#[test]
+fn analytic_frame_gate_rejects_nonorthogonal_reference_direction() {
+    let mut plane = record(0x32, 91);
+    put_ref(&mut plane, 2, 2);
+    plane[18] = b'+';
+    put_vec3(&mut plane, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut plane, 43, [0.0, 0.0, 1.0]);
+    put_vec3(&mut plane, 67, [0.0, 0.0, 1.0]);
+    assert!(analytic_surfaces(&plane).is_empty());
+
+    put_vec3(&mut plane, 67, [1.0, 0.0, 0.0]);
+    assert_eq!(analytic_surfaces(&plane).len(), 1);
+}
+
+#[test]
+fn analytic_scanner_does_not_rescan_a_complete_invalid_frame() {
+    let mut stream = vec![0; 91];
+    stream[1] = 0x32;
+    put_ref(&mut stream, 2, 2);
+    stream[18] = b'+';
+
+    // A valid LINE-looking record begins inside the complete PLANE frame. The
+    // outer plane remains invalid because its normal reads the line origin.
+    stream[24] = 0;
+    stream[25] = 0x1e;
+    put_ref(&mut stream, 26, 3);
+    stream[42] = b'+';
+    put_vec3(&mut stream, 43, [0.0, 0.0, 0.0]);
+    put_vec3(&mut stream, 67, [1.0, 0.0, 0.0]);
+
+    assert!(analytic_surfaces(&stream).is_empty());
+    assert!(analytic_curves(&stream).is_empty());
+}
+
+#[test]
+fn cone_gate_rejects_nonfinite_or_degenerate_half_angle() {
+    let mut cone = record(0x34, 115);
+    put_ref(&mut cone, 2, 2);
+    cone[18] = b'+';
+    put_vec3(&mut cone, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut cone, 43, [0.0, 0.0, 1.0]);
+    put_f64(&mut cone, 67, 0.0);
+    put_f64(&mut cone, 75, std::f64::consts::FRAC_1_SQRT_2);
+    put_f64(&mut cone, 83, std::f64::consts::FRAC_1_SQRT_2);
+    put_vec3(&mut cone, 91, [1.0, 0.0, 0.0]);
+    assert_eq!(analytic_surfaces(&cone).len(), 1);
+
+    for (sine, cosine) in [(f64::NAN, 1.0), (0.0, 1.0), (1.0, 0.0)] {
+        put_f64(&mut cone, 75, sine);
+        put_f64(&mut cone, 83, cosine);
+        assert!(analytic_surfaces(&cone).is_empty());
+    }
+}
+
+#[test]
+fn analytic_scanners_include_extended_reference_shifts_in_record_ownership() {
+    let mut surfaces = vec![0; 184];
+    surfaces[1] = 0x32;
+    surfaces[2..6].copy_from_slice(&encoded_xmt(32_768));
+    surfaces[20] = b'+';
+    put_vec3(&mut surfaces, 21, [0.0, 0.0, 0.0]);
+    put_vec3(&mut surfaces, 45, [0.0, 0.0, 1.0]);
+    put_vec3(&mut surfaces, 69, [1.0, 0.0, 0.0]);
+    surfaces[93] = 0;
+    surfaces[94] = 0x32;
+    put_ref(&mut surfaces, 95, 3);
+    surfaces[111] = b'+';
+    put_vec3(&mut surfaces, 112, [0.0, 0.0, 0.0]);
+    put_vec3(&mut surfaces, 136, [0.0, 0.0, 1.0]);
+    put_vec3(&mut surfaces, 160, [1.0, 0.0, 0.0]);
+    assert_eq!(analytic_surfaces(&surfaces).len(), 2);
+
+    let mut curves = vec![0; 136];
+    curves[1] = 0x1e;
+    curves[2..6].copy_from_slice(&encoded_xmt(32_768));
+    curves[20] = b'+';
+    put_vec3(&mut curves, 21, [0.0, 0.0, 0.0]);
+    put_vec3(&mut curves, 45, [1.0, 0.0, 0.0]);
+    curves[69] = 0;
+    curves[70] = 0x1e;
+    put_ref(&mut curves, 71, 3);
+    curves[87] = b'+';
+    put_vec3(&mut curves, 88, [0.0, 0.0, 0.0]);
+    put_vec3(&mut curves, 112, [1.0, 0.0, 0.0]);
+    assert_eq!(analytic_curves(&curves).len(), 2);
+}
+
+#[test]
+fn analytic_scanner_resolves_envelope_escape_framing() {
+    let mut plane = vec![0; 92];
+    plane[1] = 0x32;
+    plane[2] = 0xff;
+    put_ref(&mut plane, 3, 2);
+    plane[19] = b'+';
+    put_vec3(&mut plane, 20, [0.0, 0.0, 0.0]);
+    put_vec3(&mut plane, 44, [0.0, 0.0, 1.0]);
+    put_vec3(&mut plane, 68, [1.0, 0.0, 0.0]);
+
+    assert_eq!(analytic_surfaces(&plane).len(), 1);
+}
+
+#[test]
+fn analytic_record_ownership_is_shared_across_carrier_families() {
+    let mut stream = vec![0; 158];
+    stream[1] = 0x1e;
+    put_ref(&mut stream, 2, 2);
+    stream[18] = b'+';
+    put_vec3(&mut stream, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut stream, 43, [1.0, 0.0, 0.0]);
+
+    stream[67] = 0;
+    stream[68] = 0x32;
+    put_ref(&mut stream, 69, 3);
+    stream[85] = b'+';
+    put_vec3(&mut stream, 86, [0.0, 0.0, 0.0]);
+    put_vec3(&mut stream, 110, [0.0, 0.0, 1.0]);
+    put_vec3(&mut stream, 134, [1.0, 0.0, 0.0]);
+
+    assert_eq!(analytic_curves(&stream).len(), 1);
+    assert_eq!(analytic_surfaces(&stream).len(), 1);
+    assert!(analytic_points(&stream).is_empty());
+}
+
+#[test]
+fn a_cone_with_a_negative_half_angle_field_has_no_nx_surface() {
+    let mut bytes = record(0x34, 115);
+    put_ref(&mut bytes, 2, 2);
+    bytes[18] = b'+';
+    put_vec3(&mut bytes, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut bytes, 43, [0.0, 0.0, 1.0]);
+    put_f64(&mut bytes, 67, 1.0);
+    put_vec3(&mut bytes, 91, [1.0, 0.0, 0.0]);
+    let root_half = std::f64::consts::FRAC_1_SQRT_2;
+    put_f64(&mut bytes, 75, root_half);
+    put_f64(&mut bytes, 83, root_half);
+    let surfaces = analytic_surfaces(&bytes);
+    let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(cone)) = &surfaces[0] else {
+        panic!("cone carrier required");
+    };
+    assert!((cone.half_angle().get() - std::f64::consts::FRAC_PI_4).abs() <= 4.0 * f64::EPSILON);
+    assert_eq!(cone.radius().get(), 1000.0);
+    for (sine_sign, cosine_sign) in [(-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+        put_f64(&mut bytes, 75, sine_sign * root_half);
+        put_f64(&mut bytes, 83, cosine_sign * root_half);
+        assert!(analytic_surfaces(&bytes).is_empty());
+        assert_eq!(
+            crate::geometry::decode_surface_record(&bytes, NodeKind::Cone, 0),
+            Err(crate::geometry::SurfaceRefusal::Analytic(
+                cadmpeg_parasolid::geometry::Refusal::ConeHalfAngleSign
+            ))
+        );
+    }
+}
+
+#[test]
+fn a_cone_pair_off_the_unit_identity_by_1e7_has_no_nx_surface() {
+    let mut bytes = record(0x34, 115);
+    put_ref(&mut bytes, 2, 2);
+    bytes[18] = b'+';
+    put_vec3(&mut bytes, 43, [0.0, 0.0, 1.0]);
+    put_f64(&mut bytes, 67, 1.0);
+    put_vec3(&mut bytes, 91, [1.0, 0.0, 0.0]);
+    let sine = 0.6_f64;
+    put_f64(&mut bytes, 75, sine);
+    put_f64(&mut bytes, 83, (1.0 + 1.0e-7 - sine * sine).sqrt());
+    assert!(analytic_surfaces(&bytes).is_empty());
+    assert_eq!(
+        crate::geometry::decode_surface_record(&bytes, NodeKind::Cone, 0),
+        Err(crate::geometry::SurfaceRefusal::Analytic(
+            cadmpeg_parasolid::geometry::Refusal::ConeHalfAngleIdentity
+        ))
+    );
+}
+
+#[test]
+fn a_torus_with_a_negative_major_radius_has_no_nx_surface() {
+    let mut bytes = record(0x36, 107);
+    put_ref(&mut bytes, 2, 2);
+    bytes[18] = b'+';
+    put_vec3(&mut bytes, 19, [0.0, 0.0, 0.0]);
+    put_vec3(&mut bytes, 43, [0.0, 0.0, 1.0]);
+    put_f64(&mut bytes, 75, 0.003);
+    put_vec3(&mut bytes, 83, [1.0, 0.0, 0.0]);
+    put_f64(&mut bytes, 67, 0.002);
+    assert!(matches!(
+        analytic_surfaces(&bytes).as_slice(),
+        [SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(_))]
+    ));
+    put_f64(&mut bytes, 67, -0.002);
+    assert!(analytic_surfaces(&bytes).is_empty());
+}

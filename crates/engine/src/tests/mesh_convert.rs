@@ -12,6 +12,7 @@ pub(crate) fn imported_box() -> Session {
         FeatureKind::MeshImport {
             file: "public-safe-box.stl".into(),
             meshes: vec![MeshData {
+                appearance: None,
                 name: "Mesh".into(),
                 positions: mesh.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
                 triangles: mesh.triangles.iter().flatten().copied().collect(),
@@ -23,6 +24,120 @@ pub(crate) fn imported_box() -> Session {
     )
     .unwrap();
     Session::new(doc)
+}
+
+/// Two coplanar triangles share a diagonal but use separate source indices along it,
+/// as they would in STL. A picked midpoint must split both facets without leaving a crack.
+#[test]
+fn direct_mesh_edits_keep_shared_topology_and_survive_undo_and_reload() {
+    let mut doc = Document::default();
+    doc.add_feature(
+        FeatureKind::MeshImport {
+            file: "patch.stl".into(),
+            meshes: vec![MeshData {
+                appearance: None,
+                name: "Patch".into(),
+                positions: vec![0., 0., 0., 4., 0., 0., 4., 4., 0., 0., 0., 0., 4., 4., 0., 0., 4., 0.].into(),
+                triangles: vec![0, 1, 2, 3, 4, 5].into(),
+                color: None,
+                corner_normals: [0., 0., 1.].repeat(6).into(),
+            }],
+        },
+        None,
+    )
+    .unwrap();
+    // file.insert_mesh pins output names as part of import; mirror that in this in-memory fixture.
+    doc.features[0].body_names = vec!["Patch".into()];
+    let mut s = Session::new(doc);
+    let original = s.doc.to_json();
+    s.execute("mesh.flip_edge", &json!({"body":"Patch","point":[1.99,2.0,0.0]})).unwrap();
+    let FeatureKind::MeshImport { meshes, .. } = &s.doc.features[0].kind else { panic!("mesh import") };
+    // Both new triangles share the diagonal from (4,0) to (0,4), with positive winding.
+    assert_eq!(&*meshes[0].triangles, &[1, 2, 5, 5, 3, 1]);
+    assert_eq!(&*meshes[0].corner_normals, &[0., 0., 1.].repeat(6));
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc.to_json(), original);
+    assert!(s.execute("mesh.flip_edge", &json!({"body":"Patch","triangle":0,"corner":0})).is_err());
+    assert!(s.execute("mesh.delete_island", &json!({"body":"Patch","triangle":0})).is_err());
+    assert_eq!(s.doc.to_json(), original);
+    let result = s.execute("mesh.split_edge", &json!({"body":"Patch","point":[2.,1.99,0.]})).unwrap();
+    assert_eq!(result["triangles_after"], 4);
+    assert_eq!(result["vertices_after"], 7);
+    let edited = s.doc.to_json();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc.to_json(), original);
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(s.doc.to_json(), edited);
+    s = Session::new(Document::from_json(&edited).unwrap());
+    s.execute("mesh.move_vertex", &json!({"body":"Patch","point":[0.1,0.05,0.],"delta":[0.,0.,1.]})).unwrap();
+    let FeatureKind::MeshImport { meshes, .. } = &s.doc.features[0].kind else { panic!("import") };
+    assert_eq!(meshes[0].positions.as_chunks::<3>().0.iter().filter(|p| **p == [0., 0., 1.]).count(), 2);
+    assert_eq!(meshes[0].triangles.len() * 3, meshes[0].corner_normals.len());
+    let result = s.execute("mesh.subdivide_face", &json!({"body":"Patch","triangle":1})).unwrap();
+    assert_eq!(result["triangles_after"], 6);
+    let result = s.execute("mesh.delete_face", &json!({"body":"Patch","triangle":1})).unwrap();
+    assert_eq!(result["triangles_after"], 5);
+    let before = s.doc.to_json();
+    for args in [json!({"body":"Patch","triangle":99999}), json!({"body":"Patch","point":[0,0,0],"triangle":0})] {
+        assert!(s.execute("mesh.delete_face", &args).is_err());
+    }
+    assert_eq!(s.doc.to_json(), before);
+}
+
+#[test]
+fn invalid_mesh_edge_flips_leave_the_original_triangles_untouched() {
+    let vertices = [[0., 0., 0.], [4., 0., 0.], [4., 4., 0.], [0., 4., 0.], [-2., 0., 0.]];
+    for (faces, message, d) in [
+        (vec![0, 1, 2], "boundary", vertices[3]),
+        (vec![0, 1, 2, 2, 0, 3], "winding", vertices[3]),
+        (vec![0, 1, 2, 0, 2, 3, 0, 2, 4], "non-manifold", vertices[3]),
+        (vec![0, 1, 2, 0, 2, 3, 1, 3, 4], "already exists", vertices[3]),
+        (vec![0, 1, 2, 0, 2, 1], "same opposite vertex", vertices[3]),
+        (vec![0, 1, 2, 0, 2, 3], "invert", [6., 8., 0.]),
+    ] {
+        let mut v = vertices;
+        v[3] = d;
+        let mesh = MeshData {
+            appearance: None,
+            name: "Patch".into(),
+            positions: v.as_flattened().to_vec().into(),
+            triangles: faces.into(),
+            corner_normals: Default::default(),
+            color: None,
+        };
+        let mut doc = Document::default();
+        doc.add_feature(FeatureKind::MeshImport { file: "patch.stl".into(), meshes: vec![mesh] }, None).unwrap();
+        doc.features[0].body_names = vec!["Patch".into()];
+        let mut s = Session::new(doc);
+        let original = s.doc.to_json();
+        let e = s.execute("mesh.flip_edge", &json!({"body":"Patch","triangle":0,"corner":2})).unwrap_err();
+        assert!(e.to_string().contains(message), "{e}");
+        assert_eq!(s.doc.to_json(), original);
+    }
+}
+
+#[test]
+fn deleting_an_island_uses_the_picked_face_and_can_be_undone() {
+    let mut doc = Document::default();
+    let mesh = MeshData {
+        appearance: None,
+        name: "Scan".into(),
+        positions: vec![0., 0., 0., 2., 0., 0., 0., 2., 0., 0., -2., 0., -2., 0., 0.].into(),
+        triangles: vec![0, 1, 2, 0, 3, 4].into(),
+        corner_normals: Default::default(),
+        color: None,
+    };
+    doc.add_feature(FeatureKind::MeshImport { file: "islands.stl".into(), meshes: vec![mesh] }, None).unwrap();
+    doc.features[0].body_names = vec!["Scan".into()];
+    let mut s = Session::new(doc);
+    let original = s.doc.to_json();
+    let result = s.execute("mesh.delete_island", &json!({"body":"Scan","point":[-0.5,-0.5,0.0]})).unwrap();
+    assert_eq!(result["triangles_after"], 1);
+    assert_eq!(result["vertices_after"], 3);
+    let FeatureKind::MeshImport { meshes, .. } = &s.doc.features[0].kind else { panic!("mesh import") };
+    assert_eq!(&*meshes[0].positions, &[0., 0., 0., 2., 0., 0., 0., 2., 0.]);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc.to_json(), original);
 }
 
 /// An edit keeps the design as it was for undo, and an imported mesh's triangles are shared
@@ -43,6 +158,7 @@ fn edits_share_an_imported_meshs_triangles_with_undo() {
     let (p, t) = arrays(&s);
     assert!(std::sync::Arc::ptr_eq(&p, &positions) && std::sync::Arc::ptr_eq(&t, &triangles), "shared after undo");
     let saved = serde_json::to_value(MeshData {
+        appearance: None,
         name: "M".into(),
         positions: vec![1.5, 2.0, 3.0].into(),
         triangles: vec![0, 0, 0].into(),
@@ -565,6 +681,7 @@ fn open_in_easyprint_reports_a_host_that_cannot_start_and_a_model_over_the_limit
         FeatureKind::MeshImport {
             file: "big.stl".into(),
             meshes: vec![MeshData {
+                appearance: None,
                 name: "Big".into(),
                 positions: vec![0., 0., 0., 1., 0., 0., 0., 1., 0.].into(),
                 triangles: [0u32, 1, 2].repeat(2_100_000).into(),
@@ -676,4 +793,212 @@ fn a_second_placements_mesh_body_converts_by_the_name_the_world_shows() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn textured_mesh_split_subdivide_and_delete_preserve_seams_and_undo() {
+    use solidcraft_geom::mesh_appearance::{MeshAppearance, MeshMaterial};
+    let appearance = std::sync::Arc::new(MeshAppearance {
+        corner_uvs: vec![[[0., 0.], [1., 0.], [1., 1.]], [[2., 0.], [3., 1.], [2., 1.]]].into(),
+        triangle_materials: vec![0, 1].into(),
+        materials: vec![
+            MeshMaterial { name: "first".into(), base_color: [1.; 4], texture: None },
+            MeshMaterial { name: "second".into(), base_color: [1.; 4], texture: None },
+        ]
+        .into(),
+        ..Default::default()
+    });
+    let mesh = MeshData {
+        name: "Patch".into(),
+        positions: vec![0., 0., 0., 4., 0., 0., 4., 4., 0., 0., 0., 0., 4., 4., 0., 0., 4., 0.].into(),
+        triangles: vec![0, 1, 2, 3, 4, 5].into(),
+        corner_normals: Default::default(),
+        color: None,
+        appearance: Some(appearance.clone()),
+    };
+    let mut doc = Document::default();
+    doc.add_feature(FeatureKind::MeshImport { file: "patch.obj".into(), meshes: vec![mesh] }, None).unwrap();
+    doc.features[0].body_names = vec!["Patch".into()];
+    let mut s = Session::new(doc);
+    let original = s.doc.to_json();
+    for cmd in ["mesh.split_edge", "mesh.subdivide_face", "mesh.delete_face"] {
+        let args = if cmd == "mesh.split_edge" { json!({"body":"Patch","triangle":0,"corner":2}) } else { json!({"body":"Patch","triangle":0}) };
+        s.execute(cmd, &args).unwrap();
+        let FeatureKind::MeshImport { meshes, .. } = &s.doc.features[0].kind else { panic!("mesh import") };
+        let mesh = &meshes[0];
+        let attributes = mesh.appearance.as_ref().unwrap();
+        attributes.validate(mesh.triangles.len() / 3).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&attributes.materials, &appearance.materials));
+        for (i, triangle) in mesh.triangles.as_chunks::<3>().0.iter().enumerate() {
+            for (j, &v) in triangle.iter().enumerate() {
+                let [x, y, _] = mesh.positions.as_chunks::<3>().0[v as usize];
+                let chart = attributes.triangle_materials[i];
+                let uv = attributes.corner_uvs[i][j];
+                assert!((f64::from(uv[0]) - x / 4. - 2. * f64::from(chart)).abs() < 1e-6);
+                assert!((f64::from(uv[1]) - y / 4.).abs() < 1e-6);
+            }
+        }
+        let saved = s.doc.to_json();
+        assert_eq!(Document::from_json(&saved).unwrap().to_json(), saved);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc.to_json(), original);
+    }
+    let report = s.execute("mesh.decimate", &json!({"body":"Patch"})).unwrap();
+    assert_eq!(report["triangles_after"], 2);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc.to_json(), original);
+}
+
+#[test]
+fn reverse_engineering_inventory_keeps_scan_and_revision_unchanged() {
+    let mut s = imported_box();
+    let before = s.doc.to_json();
+    let revision = s.revision;
+    let inventory = s.execute("scan.workflow", &json!({})).unwrap();
+    assert_eq!(inventory["meshes"], json!(["Mesh"]));
+    assert_eq!(inventory["cad_bodies"], json!([]));
+    assert_eq!(inventory["cad_to_scan_deviation_available"], false);
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.doc.to_json(), before);
+}
+
+
+fn bounded_fit_scan_fixture() -> Session {
+    let mut doc = Document::default();
+    let mut positions = Vec::new();
+    for y in 0..=8 { for x in 0..=8 { positions.extend([x as f64 * 5., y as f64 * 5., 2.]); } }
+    let mut triangles = Vec::new();
+    for y in 0..8u32 { for x in 0..8u32 {
+        let a=y*9+x; triangles.extend([a,a+1,a+10,a,a+10,a+9]);
+    } }
+    doc.add_feature(FeatureKind::MeshImport { file:"bounded-plane.stl".into(),meshes:vec![MeshData {
+        name:"Patch".into(),positions:positions.into(),triangles:triangles.into(),corner_normals:Default::default(),
+        color:Some([0.2,0.5,0.8]),appearance:None,
+    }] },Some("Scan")).unwrap();
+    doc.features[0].body_names=vec!["Patch".into()];
+    Session::new(doc)
+}
+
+#[test]
+fn bounded_scan_surface_is_a_sheet_preserves_source_and_refits_after_reload() {
+    let mut s=bounded_fit_scan_fixture();
+    let original=s.doc.features[0].kind.clone();
+    let before=s.doc.to_json();
+    let result=s.execute("mesh.fit_surface",&json!({"body":"Patch","ranges":[[0,127]],"kind":"plane","tolerance":0.01})).unwrap();
+    assert_eq!(result["within_tolerance"],true);
+    assert_eq!(result["boundary_loops"],1);
+    assert!(result["max_mm"].as_f64().unwrap()<1e-8);
+    let name=result["body"].as_str().unwrap();
+    let state=s.model.state();
+    let b=&state.body(name).unwrap().body;
+    assert!(!b.is_mesh()); assert_eq!(b.face_count(),1);
+    let measured=solidcraft_kernel::measure(b).unwrap();
+    assert!((measured.area-1600.).abs()<0.01);
+    assert_eq!(s.doc.features[0].kind,original);
+    let saved=s.doc.to_json();
+    s.execute("edit.undo",&json!({})).unwrap(); assert_eq!(s.doc.to_json(),before);
+    s.execute("edit.redo",&json!({})).unwrap(); assert_eq!(s.doc.to_json(),saved);
+    let mut reloaded=Session::new(Document::from_json(&saved).unwrap());
+    let changed=reloaded.execute("mesh.fit_surface.refit",&json!({"feature":result["feature"],"kind":"freeform","fairing":0.01,"auto_flow":true})).unwrap();
+    assert_eq!(changed["feature"],result["feature"]);
+    assert_eq!(changed["control_points_u"],4); assert_eq!(changed["control_points_v"],4);
+    assert_eq!(reloaded.doc.features.len(),2);
+    assert_eq!(reloaded.doc.features[0].kind,original);
+}
+
+#[test]
+fn bounded_scan_surface_rejects_stale_masks_bad_ranges_and_stale_refit() {
+    let mut s=bounded_fit_scan_fixture();
+    let before=s.doc.to_json();
+    for args in [json!({"body":"Patch","kind":"plane","ranges":[[127,128]]}),
+        json!({"body":"Patch","kind":"plane","ranges":[[2,1]]}),
+        json!({"body":"Patch","kind":"plane","ranges":[[0,5],[3,9]]}),
+        json!({"body":"Patch","kind":"plane","ranges":[[0,127]],"revision":s.revision+1}),
+        json!({"body":"Patch","kind":"plane","ranges":[[0,127]],"tolerance":-1.})] {
+        assert!(s.execute("mesh.fit_surface",&args).is_err()); assert_eq!(s.doc.to_json(),before);
+    }
+    let r=s.execute("mesh.fit_surface",&json!({"body":"Patch","kind":"plane","ranges":[[0,127]]})).unwrap();
+    s.execute("mesh.move_vertex",&json!({"body":"Patch","triangle":0,"corner":0,"delta":[0,0,1]})).unwrap();
+    let changed=s.doc.to_json();
+    let err=s.execute("mesh.fit_surface.refit",&json!({"feature":r["feature"]})).unwrap_err();
+    assert!(err.to_string().contains("stale")); assert_eq!(s.doc.to_json(),changed);
+}
+
+#[test]
+fn scan_mirror_plane_pairs_align_with_offsets_and_survive_reload_undo() {
+    let mut s = imported_box();
+    let before = s.doc.to_json();
+    let result = s.execute("mesh.symmetry_plane", &json!({
+        "body":"Mesh", "pairs":[[[0,0,0],[10,0,0]],[[1,20,0],[9,20,0]],[[2,0,30],[8,0,30]]]
+    })).unwrap();
+    assert!(result["rms_mm"].as_f64().unwrap() < 1e-9);
+    assert_eq!(result["pairs"],3);
+    let plane = result["feature"].as_u64().unwrap();
+    let defined = s.doc.to_json();
+    s = Session::new(Document::from_json(&defined).unwrap());
+    let aligned = s.execute("mesh.align_plane_to_csys", &json!({
+        "moving":"Mesh","plane":plane,"target":"yz","flip":true,"angle_deg":27.,"offset":[8.,-12.]
+    })).unwrap();
+    assert!(aligned["angular_error_deg"].as_f64().unwrap().abs() < 1e-8);
+    assert!(aligned["distance_error_mm"].as_f64().unwrap() < 1e-8);
+    s.execute("edit.undo",&json!({})).unwrap();
+    assert_eq!(s.doc.to_json(),defined);
+    let mut original = Session::new(Document::from_json(&before).unwrap());
+    for bad in [json!({"body":"Mesh","origin":[0,0,0],"normal":[0,0,0]}),
+        json!({"body":"Mesh","pairs":[[[0,0,0],[10,0,0]],[[0,1,0],[10,1,0]],[[0,2,0],[10,2,0]]]}),
+        json!({"body":"Mesh","origin":[0,0,0],"normal":[1,0,0],"pairs":[]})] {
+        assert!(original.execute("mesh.symmetry_plane",&bad).is_err());
+        assert_eq!(original.doc.to_json(),before);
+    }
+    let explicit = original.execute("mesh.symmetry_plane",&json!({"body":"Mesh","origin":[5,4,3],"normal":[1,0,0]})).unwrap();
+    assert!(explicit["rms_mm"].is_null());
+    assert_eq!(explicit["pairs"],0);
+    let repeated = original.execute("mesh.symmetry_plane",&json!({"body":"Mesh","origin":[5,4,3],"normal":[1,0,0]})).unwrap();
+    assert_ne!(explicit["feature"], repeated["feature"]);
+    let names: Vec<_> = original.doc.features.iter().map(|feature| feature.name.as_str()).collect();
+    assert!(names.contains(&"Scan mirror plane"));
+    assert!(names.contains(&"Scan mirror plane (2)"));
+}
+
+#[test]
+fn bounded_match_is_parametric_preserves_fixed_neighbour_and_undo() {
+    let mut doc = Document::default();
+    let mut meshes = Vec::new();
+    for (name, shift) in [("Left",0.),("Right",20.)] {
+        let mut positions = Vec::new();
+        for y in 0..=8 { for x in 0..=8 {
+            let x = shift + x as f64 * 2.5; let y = y as f64 * 2.5;
+            positions.extend([x,y,0.002*x*x+0.001*y*y+if name=="Right" {0.05} else {0.}]);
+        } }
+        let mut triangles = Vec::new();
+        for y in 0..8u32 { for x in 0..8u32 {let a=y*9+x;triangles.extend([a,a+1,a+10,a,a+10,a+9]);} }
+        meshes.push(MeshData {name:name.into(),positions:positions.into(),triangles:triangles.into(),corner_normals:Default::default(),color:None,appearance:None});
+    }
+    doc.add_feature(FeatureKind::MeshImport{file:"paired-scan.obj".into(),meshes},None).unwrap();
+    doc.features[0].body_names=vec!["Left".into(),"Right".into()];
+    let mut s=Session::new(doc);
+    let mut fitted=Vec::new();
+    for name in ["Left","Right"] {
+        let r=s.execute("mesh.fit_surface",&json!({"body":name,"kind":"freeform","ranges":[[0,127]],"boundary_tolerance":1.,"fairing":0.,"flow":[1,0.2,0]})).unwrap();
+        fitted.push(r["body"].as_str().unwrap().to_owned());
+    }
+    let edge = |s:&Session,name:&str| {
+        s.model.state().body(name).unwrap().body.edges(0.001).unwrap().into_iter()
+            .min_by(|a,b|(a.mid.x-20.).abs().total_cmp(&(b.mid.x-20.).abs())).unwrap().mid
+    };
+    let source=edge(&s,&fitted[1]);let target=edge(&s,&fitted[0]);
+    let before=s.doc.to_json();
+    let fixed=s.model.state().body(&fitted[0]).unwrap().body.record().clone();
+    let p=|v:Vec3|json!([v.x,v.y,v.z]);
+    let result=s.execute("surface.match",&json!({"body":fitted[1],"target":fitted[0],"source_edges":[p(source)],"edges":[p(target)],"order":"g2","cross_scale":1.,"reverse_target":true})).unwrap();
+    assert!(result["continuity"]["max_gap_mm"].as_f64().unwrap()<1e-7);
+    assert!(result["continuity"]["max_normal_angle_deg"].as_f64().unwrap()<1e-5);
+    assert!(result["continuity"]["max_curvature_jump_per_mm"].as_f64().unwrap()<1e-6);
+    assert_eq!(s.model.state().body(&fitted[0]).unwrap().body.record(),&fixed);
+    let saved=s.doc.to_json();
+    s.execute("edit.undo",&json!({})).unwrap();assert_eq!(s.doc.to_json(),before);
+    s.execute("edit.redo",&json!({})).unwrap();assert_eq!(s.doc.to_json(),saved);
+    let restored=Session::new(Document::from_json(&saved).unwrap());
+    assert!(restored.model.result(result["feature"].as_u64().unwrap()).unwrap().error.is_none());
+    assert_eq!(restored.model.state().body(&fitted[0]).unwrap().body.record(),&fixed);
 }

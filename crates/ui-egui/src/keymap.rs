@@ -68,6 +68,7 @@ pub struct Keymap {
     pub open: bool,
     /// Opened from Help: a list to read, not to edit.
     pub read_only: bool,
+    pub(crate) nx: crate::nx_shortcuts_ui::State,
     filter: String,
     /// The command waiting for a key press.
     capturing: Option<String>,
@@ -76,7 +77,7 @@ pub struct Keymap {
     recorder: Recorder,
     /// A key that another command uses: (command, key, its slot, the other commands).
     conflict: Option<(String, String, usize, Vec<String>)>,
-    message: Option<String>,
+    pub(crate) message: Option<String>,
 }
 
 /// A chord is one ordinary key plus modifier state, as in the platform key-event model.
@@ -232,7 +233,7 @@ pub(crate) fn saved_keys(id: &str, v: &Value) -> Option<Vec<String>> {
 
 /// Panel bindings own arrows only while shared chrome has actual keyboard focus.
 /// Every other application-reserved key remains protected for every command.
-fn reserved_for(id: &str, key: &str) -> bool {
+pub(crate) fn reserved_for(id: &str, key: &str) -> bool {
     RESERVED.contains(&key)
         && !(solidcraft_engine::panels::ContextualPanelAction::from_command_id(id).is_some()
             && key.rsplit('+').next().is_some_and(|name| matches!(name, "Left" | "Right" | "Up" | "Down")))
@@ -260,7 +261,7 @@ pub(crate) fn panel_shortcuts(app: &SolveApp) -> Vec<(solidcraft_engine::panels:
 /// Read the same chord that recording a key produces, independent of case and modifier order.
 /// The last token is the key; the preceding tokens are modifiers. Keep the historical primary
 /// Ctrl/Cmd alias, explicit Control+Command chords and old physical modifier-key names.
-fn canonical_key(text: &str) -> Option<String> {
+pub(crate) fn canonical_key(text: &str) -> Option<String> {
     chord(text).map(|shortcut| key_name(shortcut.logical_key, shortcut.modifiers))
 }
 
@@ -720,6 +721,7 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
             if app.keymap.read_only {
                 ui_kit::text(ui, app.tr_label("Read-only list: shortcuts can't be changed here."), ui_kit::Text::Note("shortcut_read_only"));
             }
+            crate::nx_shortcuts_ui::show(app, ui);
             ui_kit::checkbox(ui, app.tr("ui.sketch_keys_only"), &mut app.preferences.sketch_keys_only)
                 .backing_on_hover_text(app.tr("ui.sketch_keys_only_tip"));
             if let Some(chosen) = outcome(app, ui) {
@@ -850,8 +852,7 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
                 // Through `vfs`, like every other import: in the web app a picked file is there.
                 let r = solidcraft_engine::io::vfs::read_to_string(&path, crate::toolbar_custom::MAX_IMPORT_BYTES)
                     .map_err(|e| e.to_string())
-                    .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string()))
-                    .and_then(|v| crate::toolbar_custom::import(app, &v));
+                    .and_then(|t| crate::nx_shortcuts_ui::import(app, &path, &t));
                 app.keymap.message = r.err().map(|e| format!("import: {e}"));
             });
         }
@@ -2269,5 +2270,55 @@ mod card_tests {
             assert!(scenario::handle_at("keymap:import").is_some() && h.widget("Restore page defaults").is_some(), "{open}");
             assert!(scenario::handle_at("keymap:capture:solid.extrude").is_some(), "{open}: a binding can be recorded");
         }
+    }
+
+    #[test]
+    fn nx_shortcuts_preserve_profiles_suppression_and_unsupported_actions() {
+        use crate::nx_shortcuts::{Status, parse};
+        let xml = r#"<NX_PROFILES><Repository><Content><Actions>
+          <Action name="NX_SUPPRESSED_KEYS_SECTION"><Accelerators><Accel name="L"/></Accelerators></Action>
+          <Action name="CUSTOM&amp;ACTION"><Accelerators><Accel name="Alt+Q"/></Accelerators></Action>
+          </Actions></Content></Repository><Profile name="UG_APP_SKETCH_TASK"><Content><Actions>
+          <Action name="UG_SKETCH_LINE"><Accelerators><Accel name="L"/><Accel name="Shift+L"></Accel></Accelerators></Action>
+          </Actions></Content></Profile></NX_PROFILES>"#;
+        let report = parse(xml).unwrap();
+        assert_eq!(report.entries.len(), 4);
+        assert_eq!(report.entries[0].status, Status::Suppressed);
+        assert_eq!(report.entries[0].profile, "Global");
+        assert_eq!(report.entries[1].nx_command, "CUSTOM&ACTION");
+        assert_eq!(report.entries[1].status, Status::Unsupported);
+        assert_eq!(report.entries[2].profile, "UG_APP_SKETCH_TASK");
+        assert_eq!(report.entries[2].command_id.as_deref(), Some("sketch.line"));
+        assert_eq!(report.entries[3].key, "Shift+L");
+        assert!(parse("<NX_PROFILES><Profile>").is_err());
+        assert!(parse("<!DOCTYPE NX_PROFILES><NX_PROFILES/>").is_err());
+        assert!(parse("<other/>").is_err());
+        assert!(parse("<NX_PROFILES><Accel name='L'/></NX_PROFILES>").is_err());
+    }
+
+    #[test]
+    fn nx_shortcut_import_reports_collisions_and_keeps_suppressed_sketch_keys() {
+        use crate::nx_shortcuts::{Status, apply, parse};
+        let mut app = app();
+        let mut report = parse(
+            r#"<NX_PROFILES><Repository><Action name="NX_SUPPRESSED_KEYS_SECTION"><Accelerators><Accel name="L"/></Accelerators></Action></Repository>
+          <Profile name="UG_APP_SKETCH_TASK"><Action name="UG_SKETCH_LINE"><Accelerators><Accel name="L"/></Accelerators></Action>
+          <Action name="UG_SKETCH_CIRCLE"><Accelerators><Accel name="Ctrl+Shift+S"/></Accelerators></Action></Profile></NX_PROFILES>"#,
+        )
+        .unwrap();
+        apply(&mut app, &mut report, true);
+        assert_eq!(report.entries[0].status, Status::Suppressed);
+        assert_eq!(report.entries[1].status, Status::Applied);
+        assert!(keys(&app, "sketch.line").contains(&"L".to_owned()));
+        assert_eq!(report.entries[2].status, Status::Conflict);
+        let mut report = parse(
+            r#"<NX_PROFILES><Profile name="UG_APP_SKETCH_TASK">
+          <Action name="UG_SKETCH_LINE"><Accelerators><Accel name="Alt+L"/></Accelerators></Action>
+          <Action name="UG_SKETCH_CIRCLE"><Accelerators><Accel name="Alt+L"/></Accelerators></Action></Profile></NX_PROFILES>"#,
+        )
+        .unwrap();
+        apply(&mut app, &mut report, true);
+        assert!(report.entries.iter().all(|entry| entry.status == Status::Conflict));
+        assert!(!keys(&app, "sketch.line").contains(&"Alt+L".to_owned()));
     }
 }

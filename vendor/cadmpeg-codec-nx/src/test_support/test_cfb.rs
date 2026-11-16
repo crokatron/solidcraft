@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Legacy CFB container byte builders for the crate's `#[cfg(test)]` suites.
+//!
+//! An NX legacy part is a Compound File Binary image whose `UG_PART` storage
+//! holds the `UGII` payload. These builders write that image directly: sector
+//! table, directory entries, and the payload. The fixed builders write an
+//! uncompressed payload and pin no compressor output in a golden;
+//! `legacy_cfb_with_ug_payload` writes the payload it is given.
+#![allow(clippy::unwrap_used)]
+
+use cadmpeg_test_support::bytes::{put_u16, put_u32};
+
+pub(crate) fn legacy_cfb_with_ug_part() -> Vec<u8> {
+    let description = b": TRANSMIT FILE (partition) created by test";
+    let mut payload = b"\x0d\x01UGII  \x32".to_vec();
+    payload.extend_from_slice(b"PS");
+    payload.extend_from_slice(
+        &(u32::try_from(description.len()).expect("fixture value fits u32")).to_be_bytes(),
+    );
+    payload.extend_from_slice(description);
+    legacy_cfb_with_ug_payload(&payload)
+}
+
+/// A legacy CFB image whose 5120-byte `UG_PART/UG_PART` stream starts with
+/// `ug_payload` and is zero-filled after it.
+pub(crate) fn legacy_cfb_with_ug_payload(ug_payload: &[u8]) -> Vec<u8> {
+    const SECTOR: usize = 512;
+    const END: u32 = 0xffff_fffe;
+    const FREE: u32 = 0xffff_ffff;
+    const FAT: u32 = 0xffff_fffd;
+    const STREAM_SECTORS: usize = 10;
+    const FAT_SECTOR: usize = 11;
+    let mut file = vec![0; SECTOR * (1 + FAT_SECTOR + 1)];
+    file[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+    put_u16(&mut file, 24, 0x003e);
+    put_u16(&mut file, 26, 3);
+    put_u16(&mut file, 28, 0xfffe);
+    put_u16(&mut file, 30, 9);
+    put_u16(&mut file, 32, 6);
+    put_u32(&mut file, 40, 0);
+    put_u32(&mut file, 44, 1);
+    put_u32(&mut file, 48, 0);
+    put_u32(&mut file, 56, 4096);
+    put_u32(&mut file, 60, END);
+    put_u32(&mut file, 64, 0);
+    put_u32(&mut file, 68, END);
+    put_u32(&mut file, 72, 0);
+    for index in 0..109 {
+        put_u32(&mut file, 76 + index * 4, FREE);
+    }
+    put_u32(
+        &mut file,
+        76,
+        u32::try_from(FAT_SECTOR).expect("fixture value fits u32"),
+    );
+
+    let directory = sector_mut(&mut file, 0);
+    for index in 0..4 {
+        put_u32(directory, index * 128 + 68, FREE);
+        put_u32(directory, index * 128 + 72, FREE);
+        put_u32(directory, index * 128 + 76, FREE);
+    }
+    cfb_directory_entry(directory, 0, "Root Entry", 5, END, 1, 0);
+    cfb_directory_entry(directory, 1, "UG_PART", 1, END, 2, 0);
+    cfb_directory_entry(
+        directory,
+        2,
+        "UG_PART",
+        2,
+        1,
+        END,
+        cadmpeg_core::decode::u64_from_index(STREAM_SECTORS * SECTOR),
+    );
+
+    assert!(ug_payload.len() <= STREAM_SECTORS * SECTOR);
+    // Stream sector 1 follows the header sector, and sectors 1 through 10 are contiguous.
+    let start = 2 * SECTOR;
+    file[start..start + ug_payload.len()].copy_from_slice(ug_payload);
+
+    let fat = sector_mut(&mut file, FAT_SECTOR);
+    fat.fill(0xff);
+    put_u32(fat, 0, END);
+    for sector in 1..=STREAM_SECTORS {
+        put_u32(
+            fat,
+            sector * 4,
+            if sector == STREAM_SECTORS {
+                END
+            } else {
+                u32::try_from(sector + 1).expect("fixture value fits u32")
+            },
+        );
+    }
+    put_u32(fat, FAT_SECTOR * 4, FAT);
+    file
+}
+
+pub(crate) fn legacy_cfb_with_partial_ug_part() -> Vec<u8> {
+    const SECTOR: usize = 512;
+    const END: u32 = 0xffff_fffe;
+    const STREAM_LAST: usize = 10;
+    const FAT_SECTOR: usize = 11;
+    let mut file = legacy_cfb_with_ug_part();
+    file.resize(file.len() + SECTOR, 0);
+    let directory_entry = &mut file[SECTOR + 2 * 128..SECTOR + 3 * 128];
+    directory_entry[120..128].copy_from_slice(&5133_u64.to_le_bytes());
+    let unallocated_entry = &mut file[SECTOR + 3 * 128..SECTOR + 4 * 128];
+    unallocated_entry[..64].fill(0xa5);
+    unallocated_entry[68..80].fill(0xa5);
+    unallocated_entry[120..128].fill(0xa5);
+    let fat = sector_mut(&mut file, FAT_SECTOR);
+    put_u32(fat, STREAM_LAST * 4, 12);
+    put_u32(fat, 12 * 4, END);
+    file.truncate(SECTOR * 13 + 13);
+    file
+}
+
+pub(crate) fn legacy_cfb_with_two_streams() -> Vec<u8> {
+    const SECTOR: usize = 512;
+    const END: u32 = 0xffff_fffe;
+    const FAT: u32 = 0xffff_fffd;
+    const EXTRA_FIRST_SECTOR: usize = 12;
+    const EXTRA_SECTORS: usize = 8;
+    const FAT_SECTOR: usize = 20;
+    let mut file = legacy_cfb_with_ug_part();
+    file.resize(SECTOR * (1 + FAT_SECTOR + 1), 0);
+    put_u32(
+        &mut file,
+        76,
+        u32::try_from(FAT_SECTOR).expect("fixture value fits u32"),
+    );
+    sector_mut(&mut file, 11).fill(0xff);
+
+    let directory = sector_mut(&mut file, 0);
+    cfb_directory_entry(
+        directory,
+        3,
+        "Extra",
+        2,
+        u32::try_from(EXTRA_FIRST_SECTOR).expect("fixture value fits u32"),
+        END,
+        cadmpeg_core::decode::u64_from_index(EXTRA_SECTORS * SECTOR),
+    );
+    put_u32(directory, 128 + 76, 3);
+    put_u32(directory, 3 * 128 + 72, 2);
+
+    let extra = sector_mut(&mut file, EXTRA_FIRST_SECTOR);
+    extra.fill(0xa5);
+    let marker = b"SECOND STREAM PAYLOAD";
+    extra[..marker.len()].copy_from_slice(marker);
+
+    let fat = sector_mut(&mut file, FAT_SECTOR);
+    fat.fill(0xff);
+    put_u32(fat, 0, END);
+    for sector in 1..=10 {
+        put_u32(
+            fat,
+            sector * 4,
+            if sector == 10 {
+                END
+            } else {
+                u32::try_from(sector + 1).expect("fixture value fits u32")
+            },
+        );
+    }
+    for sector in EXTRA_FIRST_SECTOR..EXTRA_FIRST_SECTOR + EXTRA_SECTORS {
+        put_u32(
+            fat,
+            sector * 4,
+            if sector + 1 == EXTRA_FIRST_SECTOR + EXTRA_SECTORS {
+                END
+            } else {
+                u32::try_from(sector + 1).expect("fixture value fits u32")
+            },
+        );
+    }
+    put_u32(fat, FAT_SECTOR * 4, FAT);
+    file
+}
+
+fn cfb_directory_entry(
+    directory: &mut [u8],
+    index: usize,
+    name: &str,
+    object_type: u8,
+    start_sector: u32,
+    child: u32,
+    size: u64,
+) {
+    let entry = &mut directory[index * 128..(index + 1) * 128];
+    for (offset, unit) in name.encode_utf16().enumerate() {
+        put_u16(entry, offset * 2, unit);
+    }
+    put_u16(
+        entry,
+        64,
+        u16::try_from((name.encode_utf16().count() + 1) * 2).expect("fixture value fits u16"),
+    );
+    entry[66] = object_type;
+    entry[67] = 1;
+    put_u32(entry, 68, 0xffff_ffff);
+    put_u32(entry, 72, 0xffff_ffff);
+    put_u32(entry, 76, child);
+    put_u32(entry, 116, start_sector);
+    entry[120..128].copy_from_slice(&size.to_le_bytes());
+}
+
+fn sector_mut(file: &mut [u8], sector: usize) -> &mut [u8] {
+    let start = (sector + 1) * 512;
+    &mut file[start..start + 512]
+}

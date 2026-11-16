@@ -1,0 +1,1353 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::default_trait_access)]
+
+use cadmpeg_test_support::EditableDecodeResult;
+
+const TOLERANT_INTERSECTION_FIT: f64 = 1.0e-8;
+const EPS_TOPOLOGY_TOLERANCE: f64 = 1.0e-8;
+
+use crate::decode::blend::analytic_surface_offset;
+use crate::decode::build::{
+    ordered_curve_candidates, ordered_point_candidates, ordered_surface_candidates,
+};
+use crate::test_support::test_bytes::put_f64;
+use crate::test_support::test_bytes::put_ref;
+use crate::test_support::test_bytes::put_vec3;
+use crate::test_support::test_bytes::record;
+use crate::test_support::test_bytes::zlib_compress;
+use crate::test_support::test_deltas::topology_with_escaped_geometry_envelopes;
+use crate::test_support::test_om::offset_only_indexed_om_section_with_control;
+use crate::test_support::test_prt::prt_with_named_payloads;
+use crate::test_support::test_prt::prt_with_partition;
+use crate::test_support::test_prt::single_part_prt;
+use crate::test_support::test_prt::topology_part_prt;
+use crate::test_support::test_prt::without_footer;
+use crate::test_support::test_streams::external_reference_stream;
+use crate::test_support::test_streams::pcurve_topology_partition_stream;
+use crate::test_support::test_streams::quarter_disc_topology_partition_stream;
+use crate::test_support::test_streams::shared_region_shells_partition_stream;
+use crate::test_support::test_streams::topology_partition_stream;
+
+use crate::framing::node_kind::NodeKind;
+use std::io::Cursor;
+
+use cadmpeg_ir::codec::{Codec, DecodeOptions};
+
+use cadmpeg_ir::geometry::{
+    pcurve::PcurveGeometry, CurveGeometry, SolvedCurveGeometry, SolvedSurfaceGeometry,
+    SurfaceGeometry,
+};
+use cadmpeg_ir::math::{Point2, Vector3};
+use cadmpeg_ir::report::loss::{LossCategory, LossKind, LossTaxonomy};
+use cadmpeg_ir::Exactness;
+
+use crate::loss::NxLossCode;
+use crate::NxCodec;
+
+#[test]
+fn decode_refuses_when_max_entities_is_below_known_cardinality() {
+    use cadmpeg_core::decode::ResourceDimension;
+
+    let file = prt_with_partition(&topology_partition_stream());
+    let mut options = DecodeOptions::default();
+    options.policy.limits.max_entities = 1;
+    let error = NxCodec
+        .decode(&mut Cursor::new(file), &options)
+        .expect_err("max_entities below stream or IR cardinality must refuse");
+    assert!(
+        matches!(
+            error,
+            cadmpeg_ir::DecodeFailure::Codec(cadmpeg_core::CodecError::ResourceLimit(limit))
+                if limit.dimension == ResourceDimension::Entities
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn decode_keeps_stream_and_model_entity_admission_additive() {
+    use cadmpeg_core::decode::ResourceDimension;
+
+    let file = prt_with_partition(&topology_partition_stream());
+    let decoded = NxCodec
+        .decode(&mut Cursor::new(file.clone()), &DecodeOptions::default())
+        .expect("decode topology partition");
+    let model_entities = cadmpeg_core::decode::u64_from_index(decoded.ir().model.entity_count());
+    assert!(model_entities > 1);
+
+    let mut options = DecodeOptions::default();
+    options.policy.limits.max_entities = model_entities;
+    let error = NxCodec
+        .decode(&mut Cursor::new(file.clone()), &options)
+        .expect_err("one stream must remain additive to the model entities");
+    assert!(
+        matches!(
+            error,
+            cadmpeg_ir::DecodeFailure::Codec(cadmpeg_core::CodecError::ResourceLimit(limit))
+                if limit.dimension == ResourceDimension::Entities
+                    && limit.operation == "admit NX entities"
+        ),
+        "{error:?}"
+    );
+
+    options.policy.limits.max_entities = model_entities + 1;
+    NxCodec
+        .decode(&mut Cursor::new(file), &options)
+        .expect("the exact additive entity limit must admit the fixture");
+}
+
+#[test]
+fn nx_circular_cone_offsets_resolve_across_equivalent_axis_origins() {
+    use cadmpeg_ir::geometry::{SolvedSurfaceGeometry, SurfaceGeometry};
+    use cadmpeg_ir::math::{Point3, Vector3};
+
+    let angle = std::f64::consts::FRAC_PI_6;
+    let support = SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(
+        cadmpeg_ir::geometry::analytic::ConeSurface::try_new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            4.0,
+            1.0,
+            angle,
+        )
+        .unwrap(),
+    ));
+    let expected = 2.0;
+    let axial_shift = -expected * angle.sin();
+    let offset = SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(
+        cadmpeg_ir::geometry::analytic::ConeSurface::try_new(
+            Point3::new(0.0, 0.0, axial_shift),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            4.0 + expected * angle.cos(),
+            1.0,
+            angle,
+        )
+        .unwrap(),
+    ));
+
+    let distance = analytic_surface_offset(&support, &offset).expect("offset");
+    assert!((distance - expected).abs() <= 1.0e-12);
+    let reverse = analytic_surface_offset(&offset, &support).expect("reverse");
+    assert!((reverse + expected).abs() <= 1.0e-12);
+
+    let mut lateral = offset.clone();
+    let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(cone_surface)) = &mut lateral else {
+        unreachable!()
+    };
+    let origin = cone_surface.origin();
+    let axis = cone_surface.frame().axis().as_raw();
+    let ref_direction = cone_surface.frame().reference().as_raw();
+    let radius = cone_surface.radius().get();
+    let ratio = cone_surface.ratio().get();
+    let half_angle = cone_surface.half_angle().get();
+    let mut origin = *origin;
+    origin.x = 0.1;
+    *cone_surface = cadmpeg_ir::geometry::analytic::ConeSurface::try_new(
+        origin,
+        *axis,
+        *ref_direction,
+        radius,
+        ratio,
+        half_angle,
+    )
+    .unwrap();
+    assert!(analytic_surface_offset(&support, &lateral).is_none());
+
+    let mut shifted_parameterization = offset.clone();
+    let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(cone_surface)) =
+        &mut shifted_parameterization
+    else {
+        unreachable!()
+    };
+    let origin = cone_surface.origin();
+    let axis = cone_surface.frame().axis().as_raw();
+    let ref_direction = cone_surface.frame().reference().as_raw();
+    let radius = cone_surface.radius().get();
+    let ratio = cone_surface.ratio().get();
+    let half_angle = cone_surface.half_angle().get();
+    let mut origin = *origin;
+    origin.z += 0.1;
+    *cone_surface = cadmpeg_ir::geometry::analytic::ConeSurface::try_new(
+        origin,
+        *axis,
+        *ref_direction,
+        radius,
+        ratio,
+        half_angle,
+    )
+    .unwrap();
+    assert!(analytic_surface_offset(&support, &shifted_parameterization).is_none());
+
+    let mut elliptical = offset;
+    let SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cone(cone_surface)) = &mut elliptical else {
+        unreachable!()
+    };
+    let origin = cone_surface.origin();
+    let axis = cone_surface.frame().axis().as_raw();
+    let ref_direction = cone_surface.frame().reference().as_raw();
+    let radius = cone_surface.radius().get();
+    let half_angle = cone_surface.half_angle().get();
+
+    let ratio = 0.5;
+    *cone_surface = cadmpeg_ir::geometry::analytic::ConeSurface::try_new(
+        *origin,
+        *axis,
+        *ref_direction,
+        radius,
+        ratio,
+        half_angle,
+    )
+    .unwrap();
+    assert!(analytic_surface_offset(&support, &elliptical).is_none());
+}
+
+#[test]
+fn nx_sphere_offset_lineage_follows_signed_radius_orientation() {
+    use cadmpeg_ir::geometry::{SolvedSurfaceGeometry, SurfaceGeometry};
+    use cadmpeg_ir::math::{Point3, Vector3};
+
+    let sphere = |radius| {
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Sphere(
+            cadmpeg_ir::geometry::analytic::SphereSurface::try_new(
+                Point3::new(1.0, 2.0, 3.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                radius,
+            )
+            .unwrap(),
+        ))
+    };
+    assert_eq!(
+        analytic_surface_offset(&sphere(4.0), &sphere(6.5)),
+        Some(2.5)
+    );
+    assert_eq!(
+        analytic_surface_offset(&sphere(-4.0), &sphere(-6.5)),
+        Some(2.5)
+    );
+    assert_eq!(
+        analytic_surface_offset(&sphere(-6.5), &sphere(-4.0)),
+        Some(-2.5)
+    );
+    assert!(analytic_surface_offset(&sphere(4.0), &sphere(-6.5)).is_none());
+}
+
+#[test]
+fn nx_torus_offset_lineage_requires_one_ring_orientation() {
+    use cadmpeg_ir::geometry::{SolvedSurfaceGeometry, SurfaceGeometry};
+    use cadmpeg_ir::math::{Point3, Vector3};
+
+    let torus = |minor_radius| {
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Torus(
+            cadmpeg_ir::geometry::analytic::TorusSurface::try_new(
+                Point3::new(1.0, 2.0, 3.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                10.0,
+                minor_radius,
+            )
+            .unwrap(),
+        ))
+    };
+    assert_eq!(analytic_surface_offset(&torus(2.0), &torus(3.5)), Some(1.5));
+    assert_eq!(
+        analytic_surface_offset(&torus(-2.0), &torus(-3.5)),
+        Some(1.5)
+    );
+    assert_eq!(
+        analytic_surface_offset(&torus(-3.5), &torus(-2.0)),
+        Some(-1.5)
+    );
+    assert!(analytic_surface_offset(&torus(2.0), &torus(-3.5)).is_none());
+    assert!(analytic_surface_offset(&torus(2.0), &torus(10.0)).is_none());
+}
+
+#[test]
+fn decode_reports_unclassified_bounded_offset_store_controls() {
+    let file = prt_with_named_payloads(&[(
+        "/Root/UG_PART/UG_PART",
+        offset_only_indexed_om_section_with_control(&[1, 2, 3, 4]),
+    )]);
+    let result = NxCodec
+        .decode(&mut Cursor::new(file), &DecodeOptions::default())
+        .unwrap();
+    let attributes = &result.ir().source.as_ref().unwrap().attributes;
+    assert_eq!(attributes["offset_store_control_count"], "1");
+    assert_eq!(attributes["classified_offset_store_control_count"], "0");
+    assert_eq!(attributes["unclassified_offset_store_control_count"], "1");
+    assert!(result.report().losses.iter().any(|loss| {
+        loss.code.category() == LossCategory::Other
+            && loss
+                .message
+                .contains("1 of 1 bounded offset-store control block(s)")
+    }));
+}
+
+#[test]
+fn decode_synthesizes_vertex_for_closed_null_vertex_fin() {
+    let mut stream = topology_partition_stream();
+    let fin = stream
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("fin record");
+    put_ref(&mut stream, fin + 12, 1);
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    let edge = result.ir().model.edges.first().expect("closed edge");
+    assert_eq!(edge.start, edge.end);
+    assert!(edge.start.as_str().contains("closed-edge"));
+    assert_eq!(result.ir().model.loops.len(), 1);
+    assert_eq!(result.ir().model.coedges.len(), 1);
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_aliases_partner_closed_null_vertex_fin_to_edge_start() {
+    let mut stream = topology_partition_stream();
+    let fin = stream
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("fin record");
+    put_ref(&mut stream, fin + 12, 1);
+    put_ref(&mut stream, fin + 14, 20);
+
+    let mut partner = record(17, 23);
+    put_ref(&mut partner, 2, 20);
+    put_ref(&mut partner, 6, 1); // radial partner is not a loop member
+    put_ref(&mut partner, 8, 20); // self-forward closed endpoint
+    put_ref(&mut partner, 10, 20); // self-backward closed endpoint
+    put_ref(&mut partner, 12, 1); // null vertex
+    put_ref(&mut partner, 14, 7); // partner fin
+    put_ref(&mut partner, 16, 8); // same edge
+    put_ref(&mut partner, 18, 9); // same curve
+    partner[22] = b'+';
+    stream.extend(partner);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    let edge = result.ir().model.edges.first().expect("closed edge");
+    assert_eq!(edge.start, edge.end);
+    assert!(edge.start.as_str().contains("closed-edge"));
+    assert_eq!(result.ir().model.loops.len(), 1);
+    assert_eq!(result.ir().model.coedges.len(), 1);
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_does_not_alias_unresolved_edge_end_to_start_vertex() {
+    let mut stream = topology_partition_stream();
+    let first_fin = stream
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("first fin record");
+    put_ref(&mut stream, first_fin + 8, 20);
+    put_ref(&mut stream, first_fin + 10, 20);
+    put_ref(&mut stream, first_fin + 14, 20);
+
+    let mut second_fin = record(17, 23);
+    put_ref(&mut second_fin, 2, 20);
+    put_ref(&mut second_fin, 6, 5);
+    put_ref(&mut second_fin, 8, 7);
+    put_ref(&mut second_fin, 10, 7);
+    put_ref(&mut second_fin, 12, 21);
+    put_ref(&mut second_fin, 14, 7);
+    put_ref(&mut second_fin, 16, 8);
+    put_ref(&mut second_fin, 18, 9);
+    second_fin[22] = b'+';
+    stream.extend(second_fin);
+
+    let mut unresolved_vertex = record(18, 28);
+    put_ref(&mut unresolved_vertex, 2, 21);
+    put_ref(&mut unresolved_vertex, 16, 99);
+    put_f64(&mut unresolved_vertex, 18, 0.000_1);
+    stream.extend(unresolved_vertex);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert!(result.ir().model.edges.is_empty());
+    assert!(result.ir().model.coedges.is_empty());
+    assert!(result.ir().model.loops.is_empty());
+}
+
+#[test]
+fn decode_retains_topology_owned_point_at_origin() {
+    let mut stream = topology_partition_stream();
+    let point = stream
+        .windows(4)
+        .position(|window| window == [0, 29, 0, 11])
+        .expect("point record");
+    put_vec3(&mut stream, point + 16, [0.0, 0.0, 0.0]);
+
+    assert_eq!(crate::geometry::points(&stream).len(), 1);
+    let graph = crate::topology::Graph::parse(&stream);
+    assert_eq!(
+        graph
+            .get(NodeKind::Point, 11)
+            .and_then(crate::topology::Node::point_position)
+            .map(cadmpeg_ir::features::FinitePoint3::get),
+        Some(cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0))
+    );
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(result.ir().model.vertices.len(), 1);
+    assert_eq!(result.ir().model.bodies[0].transform, None);
+    assert_eq!(result.ir().model.edges.len(), 1);
+    assert_eq!(
+        result.ir().model.points[0].position().get(),
+        cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0)
+    );
+}
+
+fn single_point_candidate_stream() -> Vec<u8> {
+    let mut stream = record(29, 40);
+    put_ref(&mut stream, 2, 11);
+    put_vec3(&mut stream, 16, [0.0, 0.0, 0.0]);
+    stream
+}
+
+#[test]
+fn decode_orders_graph_only_origin_before_later_nonzero_point() {
+    let mut stream = topology_partition_stream();
+    let first = stream
+        .windows(4)
+        .position(|window| window == [0, 29, 0, 11])
+        .expect("point record");
+    put_vec3(&mut stream, first + 16, [0.0, 0.0, 0.0]);
+    let mut second = record(29, 40);
+    put_ref(&mut second, 2, 77);
+    put_vec3(&mut second, 16, [0.04, 0.05, 0.06]);
+    stream.extend(second);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    let points = ordered_point_candidates(&graph);
+    assert_eq!(points.len(), 2);
+    assert_eq!(points[0].1.pos(), first);
+    assert_eq!(points[0].0, cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0));
+    assert_eq!(points[0].1.xmt(), 11);
+    assert_eq!(points[1].1.pos(), stream.len() - 40);
+    assert_eq!(points[1].0, cadmpeg_ir::math::Point3::new(40.0, 50.0, 60.0));
+    assert_eq!(points[1].1.xmt(), 77);
+}
+
+#[test]
+fn decode_orders_graph_only_escaped_analytics_before_later_records() {
+    let mut stream = topology_with_escaped_geometry_envelopes();
+    let first_surface = stream
+        .windows(3)
+        .position(|window| window == [0, 50, 0xff])
+        .expect("escaped plane record");
+    let first_curve = stream
+        .windows(3)
+        .position(|window| window == [0, 30, 0xff])
+        .expect("escaped line record");
+
+    let second_surface_offset = stream.len();
+    let mut plane = record(50, 91);
+    put_ref(&mut plane, 2, 77);
+    plane[18] = b'+';
+    put_vec3(&mut plane, 19, [0.01, 0.02, 0.03]);
+    put_vec3(&mut plane, 43, [0.0, 0.0, 1.0]);
+    put_vec3(&mut plane, 67, [1.0, 0.0, 0.0]);
+    stream.extend(plane);
+
+    let second_curve_offset = stream.len();
+    let mut line = record(30, 67);
+    put_ref(&mut line, 2, 78);
+    line[18] = b'+';
+    put_vec3(&mut line, 19, [0.04, 0.05, 0.06]);
+    put_vec3(&mut line, 43, [0.0, 1.0, 0.0]);
+    stream.extend(line);
+
+    let graph = crate::topology::Graph::parse(&stream);
+    let surfaces = ordered_surface_candidates(&graph);
+    assert_eq!(surfaces.len(), 2);
+    assert_eq!(surfaces[0].1.pos(), first_surface);
+    assert_eq!(surfaces[0].1.xmt(), 6);
+    assert_eq!(surfaces[1].1.pos(), second_surface_offset);
+    assert_eq!(surfaces[1].1.xmt(), 77);
+
+    let curves = ordered_curve_candidates(&graph);
+    assert_eq!(curves.len(), 2);
+    assert_eq!(curves[0].1.pos(), first_curve);
+    assert_eq!(curves[0].1.xmt(), 9);
+    assert_eq!(curves[1].1.pos(), second_curve_offset);
+    assert_eq!(curves[1].1.xmt(), 78);
+}
+
+#[test]
+fn decode_rejects_scanner_geometry_with_an_ambiguous_record_identity() {
+    let mut plane = record(50, 91);
+    put_ref(&mut plane, 2, 77);
+    plane[18] = b'+';
+    put_vec3(&mut plane, 19, [0.01, 0.02, 0.03]);
+    put_vec3(&mut plane, 43, [0.0, 0.0, 1.0]);
+    put_vec3(&mut plane, 67, [1.0, 0.0, 0.0]);
+    let mut stream = plane.clone();
+    stream.extend(plane);
+
+    assert_eq!(crate::geometry::surfaces(&stream).len(), 2);
+    let graph = crate::topology::Graph::parse(&stream);
+    assert!(graph.get(NodeKind::Plane, 77).is_none());
+    assert!(ordered_surface_candidates(&graph).is_empty());
+}
+
+#[test]
+fn decode_does_not_attach_unreferenced_point_to_solid_topology() {
+    let mut stream = topology_partition_stream();
+    let mut point = record(29, 40);
+    put_ref(&mut point, 2, 77);
+    put_vec3(&mut point, 16, [0.04, 0.05, 0.06]);
+    stream.extend_from_slice(&point);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(result.ir().model.points.len(), 1);
+    assert_eq!(result.ir().model.vertices.len(), 1);
+    assert_eq!(result.ir().model.shells[0].free_vertices().len(), 0);
+    assert_eq!(result.ir().model.bodies.len(), 1);
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_retains_connected_topology_with_unknown_surface_carrier() {
+    let mut stream = topology_partition_stream();
+    let face = stream
+        .windows(2)
+        .position(|window| window == [0, 14])
+        .expect("face record");
+    put_ref(&mut stream, face + 26, 99);
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(result.ir().model.faces.len(), 1);
+    let surface = result
+        .ir()
+        .model
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == result.ir().model.faces[0].surface)
+        .expect("unknown face carrier");
+    assert!(matches!(
+        surface.geometry,
+        SurfaceGeometry::Solved(SolvedSurfaceGeometry::Unknown { .. })
+    ));
+    let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(validation.is_ok(), "findings: {:?}", validation.findings);
+}
+
+#[test]
+fn decode_retains_unknown_non_null_edge_curve_carrier() {
+    let mut stream = topology_partition_stream();
+    let edge = stream
+        .windows(2)
+        .position(|window| window == [0, 16])
+        .expect("edge record");
+    put_ref(&mut stream, edge + 24, 99);
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    let curve = result.ir().model.edges[0]
+        .curve()
+        .and_then(|id| {
+            result
+                .ir()
+                .model
+                .curves
+                .iter()
+                .find(|curve| &curve.id == id)
+        })
+        .expect("unknown edge carrier");
+    assert!(matches!(
+        curve.geometry,
+        CurveGeometry::Solved(SolvedCurveGeometry::Unknown { .. })
+    ));
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_drops_unknown_carrier_outside_emitted_topology() {
+    let mut stream = topology_partition_stream();
+    let mut orphan = record(16, 32);
+    put_ref(&mut orphan, 2, 88);
+    put_f64(&mut orphan, 10, 0.000_3);
+    put_ref(&mut orphan, 18, 1);
+    put_ref(&mut orphan, 24, 99);
+    stream.extend(orphan);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert!(result.ir().model.curves.iter().all(|curve| !matches!(
+        curve.geometry,
+        CurveGeometry::Solved(SolvedCurveGeometry::Unknown { .. })
+    )));
+    assert_eq!(result.ir().model.edges.len(), 1);
+}
+
+#[test]
+fn decode_retains_native_carrierless_edge() {
+    let mut stream = topology_partition_stream();
+    let edge = stream
+        .windows(2)
+        .position(|window| window == [0, 16])
+        .expect("edge record");
+    put_ref(&mut stream, edge + 24, 1);
+    let fin = stream
+        .windows(2)
+        .position(|window| window == [0, 17])
+        .expect("fin record");
+    put_ref(&mut stream, fin + 18, 1);
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    let edge = &result.ir().model.edges[0];
+    assert_eq!(edge.curve(), None);
+    assert_eq!(edge.param_range(), None);
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_attaches_dimension_two_bcurve_through_surface_curve() {
+    let stream = pcurve_topology_partition_stream();
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(result.ir().model.pcurves.len(), 1);
+    assert_eq!(
+        result.ir().model.coedges[0]
+            .pcurves
+            .first()
+            .map(|pcurve| &pcurve.pcurve),
+        Some(&result.ir().model.pcurves[0].id)
+    );
+    let PcurveGeometry::Nurbs { nurbs } = &result.ir().model.pcurves[0].geometry else {
+        panic!("expected NURBS pcurve");
+    };
+    assert_eq!(nurbs.degree(), 1);
+    assert_eq!(nurbs.knots().as_slice(), [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(
+        nurbs.control_points(),
+        [Point2::new(10.0, 20.0), Point2::new(10.0, 20.0)]
+    );
+    assert!(nurbs.weights().is_none());
+    assert!(!nurbs.periodic());
+    assert_eq!(
+        result.ir().model.pcurves[0]
+            .fit_tolerance()
+            .map(cadmpeg_ir::geometry::FitTolerance::get),
+        Some(0.01)
+    );
+    assert_eq!(
+        result.ir().model.points[0].position().get(),
+        cadmpeg_ir::math::Point3::new(10.0, 20.0, 0.0)
+    );
+    let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(
+        validation.findings.is_empty(),
+        "findings: {:?}",
+        validation.findings
+    );
+}
+
+#[test]
+fn decode_attaches_rational_pcurve_through_surface_curve() {
+    let mut stream = pcurve_topology_partition_stream();
+    let payload = stream
+        .windows(4)
+        .position(|window| window == [0, 135, 0, 22])
+        .expect("pcurve payload");
+    let mut rational_payload = record(135, 15 + 6 * 8);
+    put_ref(&mut rational_payload, 2, 22);
+    rational_payload[9..13].copy_from_slice(&6u32.to_be_bytes());
+    put_ref(&mut rational_payload, 13, 26);
+    // Homogeneous UV triples represent the same point with weights one and two.
+    for (index, value) in [0.01, 0.02, 1.0, 0.02, 0.04, 2.0].into_iter().enumerate() {
+        put_f64(&mut rational_payload, 15 + index * 8, value);
+    }
+    stream.splice(payload..payload + 15 + 4 * 8, rational_payload);
+    let descriptor = stream
+        .windows(4)
+        .position(|window| window == [0, 136, 0, 21])
+        .expect("pcurve descriptor");
+    put_ref(&mut stream, descriptor + 10, 3);
+    stream[descriptor + 19] = 1;
+    let result = NxCodec
+        .decode(
+            &mut Cursor::new(prt_with_partition(&stream)),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(result.ir().model.pcurves.len(), 1);
+    assert_eq!(
+        result.ir().model.coedges[0].pcurves[0].pcurve,
+        result.ir().model.pcurves[0].id
+    );
+    let PcurveGeometry::Nurbs { nurbs } = &result.ir().model.pcurves[0].geometry else {
+        panic!("expected rational NURBS pcurve");
+    };
+    assert_eq!(
+        nurbs.control_points(),
+        [Point2::new(10.0, 20.0), Point2::new(10.0, 20.0)]
+    );
+    assert_eq!(
+        nurbs.weights().map(|weights| weights
+            .into_iter()
+            .map(cadmpeg_ir::scalar::NonZeroReal::get)
+            .collect::<Vec<_>>()),
+        Some(vec![1.0, 2.0])
+    );
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("resource allocation did not fail")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_does_not_attach_fin_pcurve_from_a_distinct_coincident_support() {
+    for (trimmed, null_edge_curve) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut stream = pcurve_topology_partition_stream();
+        let plane = stream
+            .windows(4)
+            .position(|window| window == [0, 50, 0, 6])
+            .expect("face plane");
+        let mut distinct_support =
+            stream[plane..plane + crate::layout::plane_payload::LEN].to_vec();
+        put_ref(&mut distinct_support, 2, 26);
+        stream.extend(distinct_support);
+        let surface_curve = stream
+            .windows(4)
+            .position(|window| window == [0, 137, 0, 25])
+            .expect("surface curve");
+        put_ref(&mut stream, surface_curve + 19, 26);
+        if null_edge_curve {
+            let edge = stream
+                .windows(4)
+                .position(|window| window == [0, 16, 0, 8])
+                .expect("edge record");
+            put_ref(&mut stream, edge + 24, 1);
+            put_ref(&mut stream, surface_curve + 23, 1);
+        }
+
+        if trimmed {
+            let fin = stream
+                .windows(4)
+                .position(|window| window == [0, 17, 0, 7])
+                .expect("fin record");
+            put_ref(&mut stream, fin + 18, 27);
+            let mut trim = record(133, 85);
+            put_ref(&mut trim, 2, 27);
+            trim[18] = b'+';
+            put_ref(&mut trim, 19, 25);
+            put_f64(&mut trim, 69, 1.0);
+            put_f64(&mut trim, 77, 0.0);
+            stream.extend(trim);
+        }
+
+        let mut input = Cursor::new(prt_with_partition(&stream));
+        let result = NxCodec
+            .decode(&mut input, &DecodeOptions::default())
+            .unwrap();
+
+        assert_eq!(result.ir().model.coedges.len(), 1);
+        // An unattached standalone pcurve is pruned; an embedded parametric
+        // construction remains when it is the edge's only carrier.
+        assert!(result.ir().model.pcurves.is_empty());
+        if null_edge_curve {
+            assert_eq!(result.ir().model.procedural_curves.len(), 1);
+        }
+        assert_eq!(result.ir().model.surfaces.len(), 2);
+        // Equal geometry and endpoint incidence do not make distinct XT surface
+        // identities the same FIN/FACE support.
+        assert!(result.ir().model.coedges[0].pcurves.is_empty());
+        let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("resource allocation did not fail");
+        assert!(validation.is_ok(), "findings: {:?}", validation.findings);
+    }
+}
+
+#[test]
+fn decode_assigns_descending_pcurve_trim_to_the_coedge_use() {
+    let mut stream = pcurve_topology_partition_stream();
+    let fin = stream
+        .windows(4)
+        .position(|window| window == [0, 17, 0, 7])
+        .expect("fin record");
+    put_ref(&mut stream, fin + 18, 26);
+    let mut trim = record(133, 85);
+    put_ref(&mut trim, 2, 26);
+    trim[18] = b'+';
+    put_ref(&mut trim, 19, 25);
+    put_f64(&mut trim, 69, 1.0);
+    put_f64(&mut trim, 77, 0.0);
+    stream.extend(trim);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(result.ir().model.pcurves[0].parameter_range(), None);
+    assert_eq!(
+        result.ir().model.coedges[0].pcurves[0]
+            .parameter_range
+            .map(cadmpeg_ir::geometry::DirectedParameterRange::endpoints),
+        Some([0.0, 1.0])
+    );
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_omits_surface_curve_missing_tolerance_sentinel() {
+    let mut stream = pcurve_topology_partition_stream();
+    let surface_curve = stream
+        .windows(2)
+        .position(|window| window == [0, 137])
+        .expect("surface curve");
+    put_f64(
+        &mut stream,
+        surface_curve + 25,
+        crate::decode::MISSING_TOLERANCE,
+    );
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(result.ir().model.pcurves[0].fit_tolerance(), None);
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_rejects_overflowing_pcurve_parameter_conversion() {
+    let mut stream = pcurve_topology_partition_stream();
+    let payload = stream
+        .windows(4)
+        .position(|window| window == [0, 135, 0, 22])
+        .expect("pcurve payload");
+    put_f64(&mut stream, payload + 15, f64::MAX);
+
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert!(result.ir().model.pcurves.is_empty());
+    assert!(result.ir().model.coedges[0].pcurves.is_empty());
+    assert!(
+        cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+            .expect("validate the neutral model")
+            .is_ok()
+    );
+}
+
+#[test]
+fn decode_preserves_multiple_shells_in_one_region() {
+    let stream = shared_region_shells_partition_stream();
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+
+    assert_eq!(result.ir().model.bodies.len(), 1);
+    assert_eq!(result.ir().model.regions.len(), 1);
+    assert_eq!(result.ir().model.shells.len(), 2);
+    assert_eq!(result.ir().model.regions[0].shells.len(), 2);
+    assert_eq!(result.ir().model.bodies[0].regions.len(), 1);
+    let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(validation.is_ok(), "findings: {:?}", validation.findings);
+}
+
+#[test]
+fn decode_transfers_point_plane_cylinder_line() {
+    let mut cur = Cursor::new(single_part_prt());
+    let result =
+        EditableDecodeResult::from(NxCodec.decode(&mut cur, &DecodeOptions::default()).unwrap());
+
+    assert!(result.report().geometry_transferred());
+    assert_eq!(result.ir().model.points.len(), 1);
+    assert_eq!(result.ir().model.vertices.len(), 1);
+    // Point coordinate is scaled metres → millimetres, byte-exact.
+    let p = &result.ir().model.points[0].position().get();
+    assert!((p.x - 62.5).abs() < 1.0e-6 && (p.z - 12.7).abs() < 1.0e-6);
+
+    // One plane, one cylinder decoded.
+    let planes = result
+        .ir()
+        .model
+        .surfaces
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.geometry,
+                SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(_))
+            )
+        })
+        .count();
+    let cyls: Vec<_> = result
+        .ir()
+        .model
+        .surfaces
+        .iter()
+        .filter_map(|s| match &s.geometry {
+            SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(cylinder_surface)) => {
+                let radius = cylinder_surface.radius().get();
+                Some(radius)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(planes, 1);
+    assert_eq!(cyls.len(), 1);
+    assert!((cyls[0] - 4.05).abs() < 1.0e-6);
+    assert!(result.ir().model.surfaces.iter().any(
+        |surface| matches!(surface.geometry, SurfaceGeometry::Solved(SolvedSurfaceGeometry::Plane(plane_surface))
+        if {
+            let axis = plane_surface.frame().reference().as_raw();
+            *axis == Vector3::new(1.0, 0.0, 0.0)
+        })
+    ));
+    assert!(result.ir().model.surfaces.iter().any(
+        |surface| matches!(surface.geometry, SurfaceGeometry::Solved(SolvedSurfaceGeometry::Cylinder(cylinder_surface))
+        if {
+            let direction = cylinder_surface.frame().reference().as_raw();
+            *direction == Vector3::new(1.0, 0.0, 0.0)
+        })
+    ));
+
+    // One line decoded, with a unit direction.
+    let lines: Vec<_> = result
+        .ir()
+        .model
+        .curves
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.geometry,
+                CurveGeometry::Solved(SolvedCurveGeometry::Line(_))
+            )
+        })
+        .collect();
+    assert_eq!(lines.len(), 1);
+
+    assert!(result.ir().model.faces.is_empty() && result.ir().model.edges.is_empty());
+    assert!(result.report().losses.iter().any(|l| l.code.category()
+        == cadmpeg_ir::report::loss::LossCategory::Topology
+        && l.severity == cadmpeg_ir::report::Severity::Blocking));
+
+    // The Parasolid stream is preserved verbatim.
+    let unknowns = result.ir().native_unknowns("nx").unwrap();
+    assert_eq!(unknowns.len(), 1);
+    assert_eq!(
+        result
+            .source_fidelity()
+            .retained_records()
+            .values()
+            .next()
+            .expect("retained record")
+            .sha256()
+            .len(),
+        64
+    );
+    assert_eq!(
+        unknowns[0]
+            .links
+            .iter()
+            .map(cadmpeg_ir::ids::Identity::as_str)
+            .collect::<Vec<_>>(),
+        ["nx:s0:surf#0", "nx:s0:surf#1", "nx:s0:crv#0",]
+    );
+    assert_eq!(
+        {
+            let note =
+                &result.source_fidelity().annotations.exactness()[&unknowns[0].id.to_string()];
+            note.fields().get("links").copied().unwrap_or(note.entity())
+        },
+        Exactness::Derived
+    );
+
+    let report = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(report.is_ok(), "findings: {:?}", report.findings);
+}
+
+#[test]
+fn decode_runs_each_edge_along_its_curve_and_chains_loop_coedges() {
+    let result = NxCodec
+        .decode(
+            &mut Cursor::new(prt_with_partition(&quarter_disc_topology_partition_stream())),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+    let model = &result.ir().model;
+    let position = |vertex: &cadmpeg_ir::ids::VertexId| {
+        let point = &model
+            .vertices
+            .iter()
+            .find(|candidate| &candidate.id == vertex)
+            .expect("vertex")
+            .point;
+        let position = model
+            .points
+            .iter()
+            .find(|candidate| &candidate.id == point)
+            .expect("point")
+            .position()
+            .get();
+        [position.x, position.y, position.z]
+    };
+    let edge = |suffix: &str| {
+        model
+            .edges
+            .iter()
+            .find(|edge| edge.id.as_str().ends_with(suffix))
+            .expect("edge")
+    };
+
+    assert_eq!(model.edges.len(), 3);
+    assert_eq!(position(&edge("#8").start), [10.0, 0.0, 0.0]);
+    assert_eq!(position(&edge("#8").end), [0.0, 10.0, 0.0]);
+    assert_eq!(position(&edge("#15").start), [0.0, 10.0, 0.0]);
+    assert_eq!(position(&edge("#16").start), [10.0, 0.0, 0.0]);
+    assert_eq!(position(&edge("#16").end), [0.0, 0.0, 0.0]);
+    let traversal = |coedge: &cadmpeg_ir::ids::CoedgeId| {
+        let coedge = model
+            .coedges
+            .iter()
+            .find(|candidate| &candidate.id == coedge)
+            .expect("coedge");
+        let edge = model
+            .edges
+            .iter()
+            .find(|candidate| candidate.id == coedge.edge)
+            .expect("edge");
+        match coedge.sense {
+            cadmpeg_ir::topology::Sense::Forward => (edge.start.clone(), edge.end.clone()),
+            cadmpeg_ir::topology::Sense::Reversed => (edge.end.clone(), edge.start.clone()),
+        }
+    };
+    let coedges = model.loops[0].coedges();
+    assert_eq!(coedges.len(), 3);
+    for (index, coedge) in coedges.iter().enumerate() {
+        let next = &coedges[(index + 1) % coedges.len()];
+        assert_eq!(traversal(coedge).1, traversal(next).0);
+    }
+}
+
+#[test]
+fn decode_emits_the_same_brep_without_a_footer_region() {
+    let decode = |bytes: Vec<u8>| {
+        NxCodec
+            .decode(&mut Cursor::new(bytes), &DecodeOptions::default())
+            .unwrap()
+    };
+    let footed = decode(topology_part_prt());
+    let footerless = decode(without_footer(topology_part_prt()));
+
+    assert_eq!(footerless.ir().model.faces.len(), 1);
+    assert_eq!(footerless.ir().model.faces, footed.ir().model.faces);
+    assert_eq!(footerless.ir().model.edges, footed.ir().model.edges);
+    assert_eq!(footerless.ir().model.surfaces, footed.ir().model.surfaces);
+}
+
+#[test]
+fn face_orientation_composes_with_analytic_surface_sense() {
+    use cadmpeg_ir::topology::Sense;
+
+    let stream = topology_partition_stream();
+    let graph = crate::topology::Graph::parse_source(&stream).unwrap();
+    let face = graph.get(NodeKind::Face, 4).unwrap();
+    let face_bytes = &stream[face.pos()..face.end()];
+    let face_signs = face_bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, byte)| (*byte == b'+').then_some(offset))
+        .collect::<Vec<_>>();
+    let [face_sign] = face_signs.as_slice() else {
+        panic!("the synthetic face has one sense marker");
+    };
+    let face_at = face.pos() + face_sign;
+    let surface = graph.get(NodeKind::Plane, 6).unwrap();
+    let surface_at = surface.pos() + surface.common_header().unwrap().1 - 1;
+
+    for (face_sign, surface_sign, expected) in [
+        (b'+', b'+', Sense::Forward),
+        (b'-', b'+', Sense::Reversed),
+        (b'+', b'-', Sense::Reversed),
+        (b'-', b'-', Sense::Forward),
+    ] {
+        let mut input = stream.clone();
+        input[face_at] = face_sign;
+        input[surface_at] = surface_sign;
+        let decoded = NxCodec
+            .decode(
+                &mut Cursor::new(prt_with_partition(&input)),
+                &DecodeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(decoded.ir().model.faces[0].sense, expected);
+    }
+}
+
+#[test]
+fn decode_emits_connected_primitive_brep() {
+    let mut cur = Cursor::new(topology_part_prt());
+    let result = NxCodec.decode(&mut cur, &DecodeOptions::default()).unwrap();
+
+    assert_eq!(result.ir().model.bodies.len(), 1);
+    assert_eq!(result.ir().model.regions.len(), 1);
+    assert_eq!(result.ir().model.shells.len(), 1);
+    assert_eq!(result.ir().model.faces.len(), 1);
+    assert_eq!(result.ir().model.loops.len(), 1);
+    assert_eq!(result.ir().model.coedges.len(), 1);
+    assert_eq!(result.ir().model.edges.len(), 1);
+    assert_eq!(result.ir().model.vertices.len(), 1);
+    assert_eq!(
+        result.ir().model.bodies[0].kind,
+        cadmpeg_ir::topology::BodyKind::Sheet
+    );
+    assert_eq!(
+        result.ir().model.faces[0].loops,
+        vec![result.ir().model.loops[0].id.clone()]
+    );
+    assert_eq!(
+        result.ir().model.edges[0].curve(),
+        Some(&result.ir().model.curves[0].id)
+    );
+    assert_eq!(
+        result.ir().model.vertices[0]
+            .tolerance
+            .map(cadmpeg_ir::scalar::PositiveReal::get),
+        Some(0.1)
+    );
+    assert_eq!(
+        result.ir().model.edges[0]
+            .tolerance
+            .map(cadmpeg_ir::scalar::PositiveReal::get),
+        Some(0.3)
+    );
+    assert_eq!(
+        result.ir().model.faces[0]
+            .tolerance
+            .map(cadmpeg_ir::scalar::PositiveReal::get),
+        Some(0.2)
+    );
+    assert_eq!(
+        result.ir().model.coedges[0].radial_next,
+        result.ir().model.coedges[0].id
+    );
+    assert!(result
+        .report()
+        .losses
+        .iter()
+        .all(|loss| loss.code.category() != cadmpeg_ir::report::loss::LossCategory::Topology));
+    assert!(result
+        .report()
+        .losses
+        .iter()
+        .all(|loss| loss.code != LossKind::shared(LossTaxonomy::MaterialNotTransferred)));
+    assert!(result
+        .report()
+        .losses
+        .iter()
+        .all(|loss| loss.code != NxLossCode::AttributeValueUnresolved.kind()));
+    assert!(!result.report().losses.iter().any(|loss| {
+        loss.code == LossKind::shared(LossTaxonomy::AssemblyPlacementsNotTransferred)
+            && loss.message.contains("Assembly occurrence placements")
+    }));
+    let validation = cadmpeg_ir::validate::validate_neutral(result.ir(), Vec::new())
+        .expect("validate the neutral model");
+    assert!(validation.is_ok(), "findings: {:?}", validation.findings);
+}
+
+#[test]
+fn decode_does_not_report_assembly_placements_for_inline_external_metadata() {
+    let file = prt_with_named_payloads(&[
+        (
+            "/Root/UG_PART/UG_PART",
+            zlib_compress(&topology_partition_stream()),
+        ),
+        (
+            "/Root/UG_PART/ExternalReferences",
+            external_reference_stream(),
+        ),
+    ]);
+    let result = NxCodec
+        .decode(&mut Cursor::new(file), &DecodeOptions::default())
+        .unwrap();
+
+    assert!(!result
+        .report()
+        .losses
+        .iter()
+        .any(|loss| loss.code == LossKind::shared(LossTaxonomy::AssemblyPlacementsNotTransferred)));
+}
+
+#[test]
+fn decode_reports_external_assembly_boundary_without_inline_geometry() {
+    let file = prt_with_named_payloads(&[(
+        "/Root/UG_PART/ExternalReferences",
+        external_reference_stream(),
+    )]);
+    let result = NxCodec
+        .decode(&mut Cursor::new(file), &DecodeOptions::default())
+        .unwrap();
+
+    assert!(result.report().losses.iter().any(|loss| {
+        loss.code == NxLossCode::AssemblyComponentsExternal.kind()
+            && loss.message.contains("No inline Parasolid geometry")
+    }));
+    assert!(!result
+        .report()
+        .losses
+        .iter()
+        .any(|loss| loss.code == LossKind::shared(LossTaxonomy::AssemblyPlacementsNotTransferred)));
+    assert!(!result
+        .report()
+        .losses
+        .iter()
+        .any(|loss| loss.code == NxLossCode::AssemblyOccurrencesUnresolved.kind()));
+}
+
+#[test]
+fn decode_reports_untransferred_assembly_placement() {
+    let mut frame = crate::layout::assembly_placement_prefix::MAGIC_VALUE.to_vec();
+    frame.extend([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]);
+    frame.extend([0, 0, 0, 1, 1, 0xf0, 0, 0, 0]);
+    frame.extend(b"\x03\x03A\0\x03\x2601234567-89ab-cdef-0123-456789abcdef\0");
+    let file = prt_with_named_payloads(&[("/Root/UG_PART/UG_PART", frame)]);
+    let result = NxCodec
+        .decode(&mut Cursor::new(file), &DecodeOptions::default())
+        .unwrap();
+
+    assert!(result.ir().model.occurrences.is_empty());
+    assert!(result.ir().model.product_definitions.is_empty());
+    let namespace = result.ir().native.namespace("nx").unwrap();
+    let placements: Vec<serde_json::Value> = namespace.arena_as("assembly_placements").unwrap();
+    assert_eq!(placements.len(), 1);
+    assert!(!placements[0]["raw_frame"].as_str().unwrap().is_empty());
+    assert!(result
+        .report()
+        .losses
+        .iter()
+        .any(|loss| loss.code == NxLossCode::AssemblyPlacementFrameUnresolved.kind()));
+}
+
+#[test]
+fn decode_reports_untransferred_repeated_component_uses() {
+    let mut roster = vec![1, 2, 0x42, 0, 1, 2, 4, 7];
+    roster.extend(b"MODEL\0");
+    roster.extend([1, 3, 0, 0, 1, 3, b'9', b'9']);
+    roster.extend([1, 2, 0xff, 0xff, 0xff, 0xff, 1, 2, 4, 5]);
+    roster.extend(b"pin\0");
+    roster.extend([1, 3, 1, 1, 1, 2, 3, 38]);
+    roster.extend(b"01234567-89ab-cdef-0123-456789abcdef\0");
+    roster.extend([1, 3, 1, 1]);
+    let mut structure = vec![0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+    structure.extend(u32::try_from(roster.len()).unwrap().to_be_bytes());
+    structure.extend(roster);
+    let file = prt_with_named_payloads(&[("/Root/FastLoad/Structure", structure)]);
+    let result = NxCodec
+        .decode(&mut Cursor::new(file), &DecodeOptions::default())
+        .unwrap();
+
+    assert!(result.ir().model.occurrences.is_empty());
+    let namespace = result.ir().native.namespace("nx").unwrap();
+    let uses: Vec<serde_json::Value> = namespace
+        .arena_as("fast_load_component_occurrences")
+        .unwrap();
+    assert_eq!(uses.len(), 2);
+    assert!(result
+        .report()
+        .losses
+        .iter()
+        .any(|loss| loss.code == NxLossCode::AssemblyOccurrencesUnresolved.kind()));
+}
+
+mod document_metadata;
+
+mod intersection_charts;
+
+#[test]
+fn graph_analytic_candidates_do_not_scan_discarded_fallbacks() {
+    let stream = single_point_candidate_stream();
+    let graph = crate::topology::Graph::parse(&stream);
+    let candidates = ordered_point_candidates(&graph);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].0.get(),
+        cadmpeg_ir::math::Point3::new(0.0, 0.0, 0.0)
+    );
+}
+
+#[test]
+fn decode_does_not_use_forward_fin_for_zero_partner_reference() {
+    let mut stream = topology_partition_stream();
+    let fin = stream.windows(4).position(|w| w == [0, 17, 0, 7]).unwrap();
+    put_ref(&mut stream, fin + 14, 0);
+    let mut input = Cursor::new(prt_with_partition(&stream));
+    let result = NxCodec
+        .decode(&mut input, &DecodeOptions::default())
+        .unwrap();
+    assert!(result.ir().model.edges.is_empty());
+    assert!(result.ir().model.coedges.is_empty());
+    assert!(result.ir().model.loops.is_empty());
+}

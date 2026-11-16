@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Transmit headers always start at inflated offset zero.
+
+use super::ParasolidDeltasTransmitHeader;
+use cadmpeg_parasolid::deltas::transmit_state::TransmitState;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+pub(super) struct TransmitHeaderWire {
+    id: String,
+    stream_ordinal: u32,
+    #[serde(flatten)]
+    state: TransmitState,
+    byte_len: u64,
+    sha256: cadmpeg_ir::hash::digest::Sha256Digest,
+    inflated_offset: u64,
+}
+
+#[derive(Serialize)]
+struct TransmitHeaderRef<'a> {
+    id: &'a str,
+    stream_ordinal: u32,
+    #[serde(flatten)]
+    state: &'a TransmitState,
+    byte_len: u64,
+    sha256: &'a cadmpeg_ir::hash::digest::Sha256Digest,
+    inflated_offset: u64,
+}
+
+impl Serialize for ParasolidDeltasTransmitHeader {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        TransmitHeaderRef {
+            id: &self.id,
+            stream_ordinal: self.stream_ordinal,
+            state: &self.state,
+            byte_len: self.byte_len,
+            sha256: &self.sha256,
+            inflated_offset: 0,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+impl From<ParasolidDeltasTransmitHeader> for TransmitHeaderWire {
+    fn from(header: ParasolidDeltasTransmitHeader) -> Self {
+        Self {
+            id: header.id,
+            stream_ordinal: header.stream_ordinal,
+            state: header.state,
+            byte_len: header.byte_len,
+            sha256: header.sha256,
+            inflated_offset: 0,
+        }
+    }
+}
+
+impl TryFrom<TransmitHeaderWire> for ParasolidDeltasTransmitHeader {
+    type Error = &'static str;
+    fn try_from(wire: TransmitHeaderWire) -> Result<Self, Self::Error> {
+        if wire.inflated_offset != 0 {
+            return Err("inflated_offset: transmit header must start at zero");
+        }
+        Ok(Self {
+            id: wire.id,
+            stream_ordinal: wire.stream_ordinal,
+            state: wire.state,
+            byte_len: wire.byte_len,
+            sha256: wire.sha256,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParasolidDeltasTransmitHeader;
+
+    #[test]
+    fn header_wire_emits_zero_offset_and_rejects_displaced_header() {
+        let json = r#"{"id":"header","stream_ordinal":0,"description":"Transmit (deltas)","schema":"SCH_3501171_35102_13006","maximum_node_type":239,"user_field_size":0,"byte_len":42,"sha256":"d04b98f48e8f8bcc15c6ae5ac050801cd6dcfd428fb5f9e65c4e16e7807340fa","inflated_offset":0}"#;
+        let header: ParasolidDeltasTransmitHeader = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&header).unwrap(), json);
+        assert_eq!(
+            serde_json::to_vec(&header).unwrap(),
+            serde_json::to_vec(&super::TransmitHeaderWire::from(header.clone())).unwrap()
+        );
+        let displaced = json.replace("\"inflated_offset\":0", "\"inflated_offset\":1");
+        assert!(
+            serde_json::from_str::<ParasolidDeltasTransmitHeader>(&displaced)
+                .unwrap_err()
+                .to_string()
+                .contains("inflated_offset")
+        );
+    }
+
+    #[test]
+    fn transmit_header_native_limit_refuses_before_state_copy() {
+        let json = r#"{"id":"nx:parasolid:transmit-header#0","stream_ordinal":0,"description":"Transmit (deltas)","schema":"SCH_3501171_35102_13006","maximum_node_type":239,"user_field_size":0,"byte_len":42,"sha256":"d04b98f48e8f8bcc15c6ae5ac050801cd6dcfd428fb5f9e65c4e16e7807340fa","inflated_offset":0}"#;
+        let header: ParasolidDeltasTransmitHeader = serde_json::from_str(json).unwrap();
+        cadmpeg_test_support::native_serialization::assert_native_limit(
+            &header,
+            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+        );
+    }
+}

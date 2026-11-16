@@ -237,7 +237,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             st.bodies.push(ModelBody::new(name, made, f.id));
             Ok(())
         }
-        FeatureKind::SurfaceMatch { body, faces, target, edges, order } => {
+        FeatureKind::SurfaceMatch { body, faces, target, edges, order, source_edges, cross_scale, reverse_target } => {
             let i = st.bodies.iter().position(|b| &b.name == body).ok_or_else(|| DocError::Unknown(format!("body `{body}`")))?;
             let Some(mb) = st.bodies.get(i).cloned() else { return Err(DocError::Invalid("body".into())) };
             let tb = st.body(target).ok_or_else(|| DocError::Unknown(format!("body `{target}`")))?.body.clone();
@@ -251,7 +251,11 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             } else {
                 crate::plain(faces)
             };
-            let made = kernel::match_surface(&mb.body, &picked, &tb, &crate::plain(edges), *order)?;
+            let made = if source_edges.is_empty() {
+                kernel::match_surface(&mb.body, &picked, &tb, &crate::plain(edges), *order)?
+            } else {
+                kernel::matched_trimmed(&mb.body, &crate::plain(source_edges), &tb, &crate::plain(edges), *order, *cross_scale, *reverse_target)?.0
+            };
             // A match rebuilds the face in place: the body keeps its name, and whatever meets it
             // downstream still finds it.
             if let Some(slot) = st.bodies.get_mut(i) {
@@ -529,7 +533,18 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
                 RuledCorners::Mitre => kernel::RuledCorners::Mitre,
                 RuledCorners::Round => kernel::RuledCorners::Round,
             };
-            let mb = st.body(body).cloned().ok_or_else(|| DocError::Unknown(format!("body `{body}`")))?;
+            // The picked edge and requested vector share the feature's authoring frame.
+            // Move only the source surface, including its occurrence or per-body offset.
+            let frame = doc.component_transform(f.component);
+            let mb = if let Some(source) = st.body(body) {
+                let inverse = crate::mat_inverse(&frame).ok_or_else(|| DocError::Invalid("invalid surface feature placement".into()))?;
+                st.body_in_frame(source, &crate::mat_mul(&inverse, &body_world(doc, source)))?
+            } else {
+                with_placed_copies(doc, st, std::borrow::Cow::Borrowed(st), &frame, &[body.as_ref()])
+                    .body(body)
+                    .cloned()
+                    .ok_or_else(|| DocError::Unknown(format!("body `{body}`")))?
+            };
             let r = kernel::Ruled { distance: d, mode, flip: *flip, corners, face: face.map(Vec3::from) };
             let handles: Vec<Option<Vec<Vec3>>> = far.iter().map(|h| h.as_ref().map(|pts| crate::plain(pts))).collect();
             let made = Traced::step(kernel::ruled_surface_with(&mb.body, &crate::plain(edges), &r, &handles)?, &[&mb.traced()]);
