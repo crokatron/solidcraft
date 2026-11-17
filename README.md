@@ -1,3 +1,5 @@
+**[Set up our version on your Windows work PC with MCP](docs/work-pc-setup.md)**
+
 > **Unofficial crokatron development branch.** See [fork information](FORK.md), the [changelog](FORK_CHANGELOG.md) and [feature requests](FEATURE_REQUESTS.md). These changes are experimental. Download badges below refer to upstream releases, not this modified version. No modified binary release is provided here; distribution permission has not been granted.
 
 <p align="center">
