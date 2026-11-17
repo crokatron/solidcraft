@@ -138,11 +138,42 @@ fn emit_body_instance(w: &mut Writer, model: &ModelBody, body_id: usize, ref_ins
     }
     let record = model.body.record();
     record.validate().map_err(|e| IoError::Invalid(e.to_string()))?;
-    let [Shell::Faces { faces: uses, wires }] = record.shells.as_slice() else {
-        return Err(unsupported("multiple or non-face shells"));
+    // Every closed boundary has one material side and one void side. Preserve the
+    // bounded void regions too: omitting them fills cavities on exchange.
+    let material_regions: Vec<_> = record.regions.iter().enumerate().skip(1).filter(|(_, r)| !r.void).map(|(i, _)| i).collect();
+    let [material_region] = material_regions.as_slice() else {
+        return Err(unsupported("the body must have one material region"));
     };
-    if !wires.is_empty() || record.regions.len() != 2 || uses.len() != record.faces.len() || record.faces.is_empty() {
-        return Err(unsupported("the body is not one closed shell"));
+    if record.faces.is_empty() || record.shells.is_empty() {
+        return Err(unsupported("empty solid boundary"));
+    }
+    let mut uses = Vec::new();
+    let mut face_shells = Vec::new();
+    let mut shell_ranges = Vec::new();
+    let mut void_regions = Vec::new();
+    for (si, source_shell) in record.shells.iter().enumerate() {
+        let Shell::Faces { faces, wires } = source_shell else {
+            return Err(unsupported("non-face shell"));
+        };
+        if !wires.is_empty() || faces.is_empty() {
+            return Err(unsupported("wire or empty shell"));
+        }
+        let members: Vec<_> = record.regions.iter().enumerate().filter(|(_, r)| r.shells.contains(&(si as u32))).map(|(i, _)| i).collect();
+        if members.len() != 2 || !members.contains(material_region) {
+            return Err(unsupported("open or non-material shell boundary"));
+        }
+        let other = members.iter().copied().find(|i| i != material_region).ok_or_else(|| unsupported("missing void region"))?;
+        if other != 0 && !record.regions[other].void {
+            return Err(unsupported("non-void cavity region"));
+        }
+        void_regions.push(other);
+        let first = uses.len();
+        uses.extend(faces.iter().copied());
+        face_shells.extend(std::iter::repeat_n(si, faces.len()));
+        shell_ranges.push(first..uses.len());
+    }
+    if uses.len() != record.faces.len() {
+        return Err(unsupported("incomplete or repeated face boundary"));
     }
     if record.faces.len() + record.edges.len() + record.vertices.len() > 100_000 {
         return Err(unsupported("the export exceeds the 100,000 topology-item limit"));
@@ -152,7 +183,7 @@ fn emit_body_instance(w: &mut Writer, model: &ModelBody, body_id: usize, ref_ins
     let mut faces = Vec::new();
     let mut edge_fins = vec![Vec::new(); record.edges.len()];
     let mut vertex_fins = vec![None; record.vertices.len()];
-    for use_face in uses {
+    for use_face in &uses {
         let face_index = use_face.face as usize;
         let face = record.faces.get(face_index).ok_or_else(|| unsupported("invalid face reference"))?;
 
@@ -212,10 +243,11 @@ fn emit_body_instance(w: &mut Writer, model: &ModelBody, body_id: usize, ref_ins
     }
     use Field::{C, I, NullReal as Q, P, R, V};
     let node_start = w.nodes.len();
-    let outside = w.reserve();
-    let front_shell = w.reserve();
-    let region = w.reserve();
-    let shell = w.reserve();
+    let region_ids: Vec<_> = record.regions.iter().map(|_| w.reserve()).collect();
+    let material_shell_ids: Vec<_> = record.shells.iter().map(|_| w.reserve()).collect();
+    let void_shell_ids: Vec<_> = record.shells.iter().map(|_| w.reserve()).collect();
+    let outside = region_ids[0];
+    let shell = material_shell_ids[0];
     let face_ids: Vec<_> = faces.iter().map(|_| w.reserve()).collect();
     let loop_ids: Vec<_> = loops.iter().map(|_| w.reserve()).collect();
     let surface_ids: Vec<_> = faces.iter().map(|_| w.reserve()).collect();
@@ -224,13 +256,61 @@ fn emit_body_instance(w: &mut Writer, model: &ModelBody, body_id: usize, ref_ins
     let curve_ids: Vec<_> = record.edges.iter().map(|_| w.reserve()).collect();
     let vertex_ids: Vec<_> = record.vertices.iter().map(|_| w.reserve()).collect();
     let point_ids: Vec<_> = record.vertices.iter().map(|_| w.reserve()).collect();
-    w.node(19, outside, vec![I(outside + 1), P(0), P(body_id), P(region), P(0), P(front_shell), C('V')])?;
-    w.node(19, region, vec![I(region + 1), P(0), P(body_id), P(0), P(outside), P(shell), C('S')])?;
-    w.node(13, front_shell, vec![I(front_shell + 1), P(0), P(0), P(0), P(0), P(0), P(0), P(outside), P(face_ids[0])])?;
-    w.node(13, shell, vec![I(shell + 1), P(0), P(body_id), P(0), P(face_ids[0]), P(0), P(0), P(region), P(0)])?;
+    for (ri, source_region) in record.regions.iter().enumerate() {
+        let sides: Vec<_> = source_region
+            .shells
+            .iter()
+            .map(|si| {
+                let si = *si as usize;
+                if ri == *material_region { material_shell_ids[si] } else { void_shell_ids[si] }
+            })
+            .collect();
+        let id = region_ids[ri];
+        w.node(
+            19,
+            id,
+            vec![
+                I(id + 1),
+                P(0),
+                P(body_id),
+                P(region_ids.get(ri + 1).copied().unwrap_or(0)),
+                P(ri.checked_sub(1).map_or(0, |i| region_ids[i])),
+                P(sides.first().copied().unwrap_or(0)),
+                C(if ri == *material_region { 'S' } else { 'V' }),
+            ],
+        )?;
+        for (position, si) in source_region.shells.iter().enumerate() {
+            let si = *si as usize;
+            let first_face = face_ids[shell_ranges[si].start];
+            let material = ri == *material_region;
+            if !material && void_regions[si] != ri {
+                return Err(unsupported("inconsistent void-side ownership"));
+            }
+            let id = sides[position];
+            w.node(
+                13,
+                id,
+                vec![
+                    I(id + 1),
+                    P(0),
+                    P(if material { body_id } else { 0 }),
+                    P(sides.get(position + 1).copied().unwrap_or(0)),
+                    P(if material { first_face } else { 0 }),
+                    P(0),
+                    P(0),
+                    P(region_ids[ri]),
+                    P(if material { 0 } else { first_face }),
+                ],
+            )?;
+        }
+    }
     for (i, (source, forward, first, last)) in faces.iter().enumerate() {
         let id = face_ids[i];
         let face = &record.faces[*source];
+        let si = face_shells[i];
+        let range = &shell_ranges[si];
+        let next_face = if i + 1 < range.end { face_ids[i + 1] } else { 0 };
+        let previous_face = if i > range.start { face_ids[i - 1] } else { 0 };
         w.node(
             14,
             id,
@@ -238,17 +318,17 @@ fn emit_body_instance(w: &mut Writer, model: &ModelBody, body_id: usize, ref_ins
                 I(id + 1),
                 P(0),
                 Q,
-                P(face_ids.get(i + 1).copied().unwrap_or(0)),
-                P(i.checked_sub(1).map_or(0, |j| face_ids[j])),
+                P(next_face),
+                P(previous_face),
                 P(loop_ids[*first]),
-                P(shell),
+                P(material_shell_ids[si]),
                 P(surface_ids[i]),
                 C(if *forward { '+' } else { '-' }),
                 P(0),
                 P(0),
-                P(face_ids.get(i + 1).copied().unwrap_or(0)),
-                P(i.checked_sub(1).map_or(0, |j| face_ids[j])),
-                P(front_shell),
+                P(next_face),
+                P(previous_face),
+                P(void_shell_ids[si]),
             ],
         )?;
         geometry::surface(w, surface_ids[i], id, face.nurbs.as_ref().unwrap_or(&face.surface))?;

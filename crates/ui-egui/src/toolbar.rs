@@ -627,6 +627,11 @@ pub(crate) fn download_design(app: &mut SolveApp) {
 }
 
 pub(crate) fn export(app: &mut SolveApp, ext: &str) {
+    let id = match ext { "step" | "stp" => Some("file.export_step"), "x_t" => Some("file.export_parasolid"), _ => None };
+    if let Some(id) = id {
+        app.start_interactive(id, None);
+        return;
+    }
     export_as(app, ext, None);
 }
 
@@ -2671,6 +2676,9 @@ mod header_report_tests {
             assert_eq!(crate::keymap::effective(&h.app, id).as_deref(), Some(key), "the File menu shows it");
         }
         crate::keymap::press(&mut h.app, "Alt+Shift+F7", false);
+        let dialog = h.app.dialog.take().expect("STEP opens body selection");
+        let crate::dialogs::Kind::SaveMesh(k) = dialog.kind else { panic!("CAD body picker") };
+        crate::dialogs_save_mesh::run(&mut h.app, &k, &dialog.inputs).unwrap();
         h.frames(3);
         h.settle();
         assert_eq!(offered.borrow().last().cloned(), Some(("Bracket.step".to_string(), vec!["step".to_string()])));

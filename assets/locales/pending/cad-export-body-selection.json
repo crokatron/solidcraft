@@ -1,0 +1,10 @@
+{
+  "en": {
+    "ui.cad_export_all": "Add all CAD bodies",
+    "ui.cad_export_visible": "Add visible CAD bodies",
+    "ui.cad_export_scan_note": "Select CAD bodies to export. Reference scan meshes are excluded.",
+    "ui.cad_export_pick_bodies": "Select at least one CAD body to export.",
+    "ui.cad_export_parasolid_title": "Export Parasolid",
+    "ui.cad_export_step_title": "Export STEP"
+  }
+}

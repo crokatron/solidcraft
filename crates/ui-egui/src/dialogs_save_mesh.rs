@@ -44,6 +44,8 @@ const MAX_CUSTOM: usize = 24;
 /// The dialog's values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SaveMesh {
+    /// Exact CAD export shares the body-selection host, without mesh quality or slicer controls.
+    cad: Option<&'static str>,
     format: usize,
     /// Send to Slicer: only the bodies and the slicer are asked.
     open: bool,
@@ -129,7 +131,9 @@ impl SlicerMenu {
 
 /// The dialog for `file.save_mesh` or `file.send_to_slicer`, with the choices of last time.
 pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
+    let cad = match id { "file.export_step" => Some("step"), "file.export_parasolid" => Some("x_t"), _ => None };
     let open = match id {
+        "file.export_step" | "file.export_parasolid" => false,
         "file.save_mesh" => false,
         "file.send_to_slicer" | "file.open_in_easyprint" => true,
         _ => return None,
@@ -142,11 +146,11 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         _ => String::new(),
     };
     let quality = QUALITIES.iter().position(|q| q.1 == p.save_mesh_quality).unwrap_or(0);
-    let kind = Kind::SaveMesh(SaveMesh { format, quality, open, slicer, stale: true, shown: None });
+    let kind = Kind::SaveMesh(SaveMesh { cad, format, quality, open, slicer, stale: true, shown: None });
     let mut inputs = vec![SelInput::new("Bodies", BODIES, true)];
     // The design's only body is the one to export (#13098); with more, nothing says which.
     let only = body_picks(app, false);
-    if app.preferences.export_selects_only_body
+    if cad.is_none() && app.preferences.export_selects_only_body
         && only.len() == 1
         && let Some(input) = inputs.first_mut()
     {
@@ -329,6 +333,33 @@ fn paint_icon(ui: &egui::Ui, rect: egui::Rect, tex: Option<egui::TextureId>, nam
     }
 }
 
+/// Initial CAD picks use the current selection, otherwise visible exact CAD bodies.
+pub(crate) fn init_cad(app: &SolveApp, kind: &Kind, inputs: &mut [SelInput]) {
+    if !matches!(kind, Kind::SaveMesh(k) if k.cad.is_some()) { return; }
+    retain_cad_bodies(app, inputs);
+    if let Some(input) = inputs.first_mut() && input.items.is_empty() {
+        input.items = cad_body_picks(app, true);
+    }
+}
+
+fn cad_body_picks(app: &SolveApp, visible: bool) -> Vec<Sel> {
+    let state = crate::open_meshing::session_world(&app.session);
+    state.bodies.iter()
+        .filter(|body| !body.body.is_mesh() && (!visible || app.session.body_visible(&body.name)))
+        .map(|body| Sel::Body { name: body.name.clone() }).collect()
+}
+
+fn retain_cad_bodies(app: &SolveApp, inputs: &mut [SelInput]) {
+    let allowed = cad_body_picks(app, false).body_names();
+    if let Some(input) = inputs.first_mut() {
+        input.items.retain(|item| matches!(item, Sel::Body { name } if allowed.contains(name)));
+    }
+}
+
+pub(crate) fn title(k: &SaveMesh) -> &'static str {
+    match k.cad { Some("x_t") => "ui.cad_export_parasolid_title", Some(_) => "ui.cad_export_step_title", None => "SAVE AS MESH" }
+}
+
 /// Every body of the design, in model order; with `visible`, only the bodies the viewport shows.
 pub(crate) fn body_picks(app: &SolveApp, visible: bool) -> Vec<Sel> {
     let st = crate::open_meshing::session_world(&app.session);
@@ -378,6 +409,20 @@ fn sync_print_face(app: &mut SolveApp, k: &mut SaveMesh, inputs: &mut [SelInput]
 
 /// The rows after the Bodies input; true when Enter was pressed in a field.
 pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut SaveMesh, inputs: &mut [SelInput]) -> bool {
+    if k.cad.is_some() {
+        retain_cad_bodies(app, inputs);
+        for (key, visible) in [("ui.cad_export_all", false), ("ui.cad_export_visible", true)] {
+            form_row(ui, "", |ui| {
+                if crate::ui_kit::button(ui, solidcraft_ui_text::tr(key), crate::ui_kit::Button::Small).clicked()
+                    && let Some(input) = inputs.first_mut()
+                {
+                    input.items = cad_body_picks(app, visible);
+                }
+            });
+        }
+        ui.label(solidcraft_ui_text::tr("ui.cad_export_scan_note"));
+        return false;
+    }
     if k.open {
         sync_print_face(app, k, inputs);
     }
@@ -556,6 +601,13 @@ fn add_custom(app: &mut SolveApp, path: &str) -> Result<(), String> {
 /// What the Save (or Send) button asks `file.save_mesh` or `file.send_to_slicer` to do; Save is
 /// without the file name.
 pub fn commands(k: &SaveMesh, inputs: &[SelInput]) -> Result<Vec<(String, Value)>, String> {
+    if let Some(format) = k.cad {
+        let names = crate::selection::items(inputs, 0).body_names();
+        if names.is_empty() {
+            return Err(solidcraft_ui_text::tr("ui.cad_export_pick_bodies").into());
+        }
+        return Ok(vec![("file.export".into(), json!({"bodies": names, "format": format}))]);
+    }
     let format = FORMATS.get(k.format).map_or("stl", |f| f.1);
     let mut p = json!({ "format": format });
     // Standard is the command's own default, so it is left out. Sending has no quality row.
@@ -588,18 +640,35 @@ pub fn ready(inputs: &[SelInput]) -> bool {
 
 /// The command the dialog is for: its name is the dialog's title.
 pub fn command_id(k: &SaveMesh) -> &'static str {
-    if k.open { "file.send_to_slicer" } else { "file.save_mesh" }
+    match k.cad { Some("x_t") => "file.export_parasolid", Some(_) => "file.export_step", None if k.open => "file.send_to_slicer", None => "file.save_mesh" }
 }
 
 /// The button's label: Save, or Send when the file goes to a slicer.
 pub fn button(k: &SaveMesh) -> &'static str {
-    if k.open { "Send" } else { "Save" }
+    if k.cad.is_some() { "Export…" } else if k.open { "Send" } else { "Save" }
 }
 
 /// Save: ask for a file name and write the file. Send: write it to the slicer folder and start the
 /// slicer with it, with no file dialog.
 pub fn run(app: &mut SolveApp, k: &SaveMesh, inputs: &[SelInput]) -> Result<(), String> {
     let (_, params) = commands(k, inputs)?.into_iter().next().ok_or("nothing to save")?;
+    if let Some(ext) = k.cad {
+        let picked = crate::selection::items(inputs, 0).body_names();
+        let allowed = cad_body_picks(app, false).body_names();
+        if picked.iter().any(|name| !allowed.contains(name)) {
+            return Err(solidcraft_ui_text::tr("ui.cad_export_pick_bodies").into());
+        }
+        let body = picked.first().map(String::as_str);
+        let name = crate::export_name::offered(app, body, body.unwrap_or(&app.session.doc.name));
+        app.pick_save(&format!("{name}.{ext}"), &[ext], move |app, path| {
+            if let Some(path) = path {
+                let mut params = params;
+                params["path"] = json!(path);
+                let _ = app.run("file.export", params);
+            }
+        });
+        return Ok(());
+    }
     if k.open {
         app.preferences.send_slicer = k.slicer.clone();
         if k.slicer == EASYPRINT {
@@ -663,6 +732,56 @@ fn report(app: &mut SolveApp, result: &Value) {
 mod tests {
     use super::*;
     use solidcraft_engine::Sel;
+
+    #[test]
+    fn cad_export_defaults_to_visible_cad_and_preserves_selected_body_scope() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        for name in ["Housing", "Hidden cover"] {
+            h.app.run("solid.box", json!({"length":10,"width":12,"height":8,"body_name":name})).unwrap();
+        }
+        let scan = h.dir.join("reference.stl");
+        h.app.run("file.save_mesh", json!({"path":scan,"bodies":["Housing"]})).unwrap();
+        h.app.run("file.insert_mesh", json!({"path":scan})).unwrap();
+        h.app.run("browser.visibility", json!({"items":["Hidden cover"],"visible":false})).unwrap();
+        for id in ["file.export_step", "file.export_parasolid"] {
+            h.app.run("select.clear", json!({})).unwrap();
+            h.app.start(id);
+            let d = h.app.dialog.take().expect("CAD body picker");
+            assert_eq!(d.command(), Some(id));
+            assert_eq!(crate::selection::items(&d.inputs, 0).body_names(), ["Housing"]);
+            let Kind::SaveMesh(k) = &d.kind else { panic!("CAD export form") };
+            let cmd = commands(k, &d.inputs).unwrap().remove(0);
+            assert_eq!(cmd.0, "file.export");
+            assert_eq!(cmd.1["bodies"], json!(["Housing"]));
+            assert_eq!(cmd.1["format"], if id.ends_with("parasolid") { "x_t" } else { "step" });
+            h.app.run("select.set", json!({"items":[{"type":"body","name":"Hidden cover"}]})).unwrap();
+            h.app.start(id);
+            let d = h.app.dialog.take().expect("selected CAD body");
+            assert_eq!(crate::selection::items(&d.inputs, 0).body_names(), ["Hidden cover"]);
+        }
+    }
+
+    #[test]
+    fn cad_body_picker_runs_export_only_for_chosen_body_after_confirmation() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.box", json!({"length":10,"width":12,"height":8,"body_name":"Housing"})).unwrap();
+        let dir = h.dir.clone();
+        h.app.services.pick_save = Some(Box::new(move |name, _| {
+            Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))
+        }));
+        for (id, ext) in [("file.export_step", "step"), ("file.export_parasolid", "x_t")] {
+            h.app.start(id);
+            assert!(!h.dir.join(format!("Housing.{ext}")).exists());
+            let d = h.app.dialog.take().expect("selection comes before saving");
+            let Kind::SaveMesh(k) = d.kind else { panic!("CAD body picker") };
+            run(&mut h.app, &k, &d.inputs).unwrap();
+            h.frames(3);
+            h.settle();
+            assert!(h.dir.join(format!("Housing.{ext}")).is_file(), "{id} writes the selected body");
+        }
+    }
 
     #[test]
     fn without_a_program_dialog_send_to_slicer_is_unavailable_and_starts_nothing() {
@@ -951,7 +1070,7 @@ mod tests {
 
     #[test]
     fn send_to_slicer_asks_for_bodies_and_a_slicer_but_not_a_format() {
-        let k = SaveMesh { format: 0, quality: 0, open: true, slicer: "prusa".into(), stale: false, shown: None };
+        let k = SaveMesh { cad: None, format: 0, quality: 0, open: true, slicer: "prusa".into(), stale: false, shown: None };
         let mut input = SelInput::new("Bodies", BODIES, true);
         assert!(commands(&k, std::slice::from_ref(&input)).is_err());
         input.items = vec![Sel::Body { name: "Part".into() }];
@@ -970,7 +1089,7 @@ mod tests {
     fn a_remembered_quality_goes_to_save_but_not_to_send() {
         let mut input = SelInput::new("Bodies", BODIES, true);
         input.items = vec![Sel::Body { name: "Part".into() }];
-        let k = SaveMesh { format: 0, quality: 2, open: true, slicer: "prusa".into(), stale: false, shown: None };
+        let k = SaveMesh { cad: None, format: 0, quality: 2, open: true, slicer: "prusa".into(), stale: false, shown: None };
         let (_, sent) = commands(&k, std::slice::from_ref(&input)).unwrap().remove(0);
         assert_eq!(sent.get("quality"), None, "sending has no quality row: the default applies");
         let (_, saved) = commands(&SaveMesh { open: false, ..k }, &[input]).unwrap().remove(0);
@@ -993,10 +1112,13 @@ mod tests {
         h.app.session.doc_mut().name = "Bracket".into();
         let mut bodies = SelInput::new("Bodies", BODIES, true);
         bodies.items = vec![Sel::Body { name: "Base".into() }];
-        let stl = SaveMesh { format: 0, quality: 0, open: false, slicer: String::new(), stale: false, shown: None };
+        let stl = SaveMesh { cad: None, format: 0, quality: 0, open: false, slicer: String::new(), stale: false, shown: None };
         let offer = |h: &mut crate::scenario::Harness| {
             // One file picker at a time: the STEP export finishes before the mesh asks.
             crate::toolbar::export(&mut h.app, "step");
+            let d = h.app.dialog.take().expect("CAD export asks for bodies");
+            let Kind::SaveMesh(k) = d.kind else { panic!("CAD body picker") };
+            run(&mut h.app, &k, &d.inputs).unwrap();
             h.frames(3);
             h.settle();
             run(&mut h.app, &stl, std::slice::from_ref(&bodies)).unwrap();
@@ -1093,7 +1215,7 @@ mod tests {
             assert_eq!(bodies(&mut h, id), one, "{id}");
         }
         let (_, p) = commands(
-            &SaveMesh { format: 0, quality: 0, open: false, slicer: String::new(), stale: true, shown: None },
+            &SaveMesh { cad: None, format: 0, quality: 0, open: false, slicer: String::new(), stale: true, shown: None },
             &h.app.dialog.as_ref().unwrap().inputs,
         )
         .map(|mut c| c.remove(0))

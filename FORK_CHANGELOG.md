@@ -48,6 +48,8 @@ Freedom is local/instantaneous, not proof of unrestricted finite motion. Current
 
 ### Import, export and notifications — experimental
 
+- STEP and Parasolid export now ask which CAD bodies to write, using the current selection or visible CAD bodies by default. Reference scan meshes are excluded from this panel.
+- Parasolid export preserves internal cavities through separate shell sides and bounded void regions. Regression checks cover one and two cavities; the selected PSU enclosure also reimports as a closed solid with two shells and unchanged volume.
 - Dedicated Import / Export ribbon and persistent export notifications with copy-folder-path action and session notification history.
 - Independent readers for supported NX `.prt` and Parasolid `.x_t`/`.x_b` representations; no installed NX is required. Unsupported/incomplete geometry is refused, and native source feature history is not reconstructed.
 - Parasolid text export for supported closed CAD solids, including assembly/instance records and component grouping. Explicit body-subset export produces independent placed bodies.

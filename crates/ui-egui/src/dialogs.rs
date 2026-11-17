@@ -1474,6 +1474,7 @@ impl Dialog {
             crate::scan_alignment_ui::init_plane(s, &mut d);
         }
         Self::take_component_bodies(app, &mut d);
+        crate::dialogs_save_mesh::init_cad(app, &d.kind, &mut d.inputs);
         // A primitive goes where a face or vertex is picked, standing on a planar face. The Box,
         // Sphere and Torus also go to a sketch point (#9403).
         if let Kind::Primitive { cmd, at, .. } = &mut d.kind {
@@ -2963,7 +2964,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Assembly(k) => k.title(),
         Kind::Sheet(k) => k.title(),
         Kind::Surface(k) => k.title(),
-        Kind::SaveMesh(_) => "SAVE AS MESH",
+        Kind::SaveMesh(k) => crate::dialogs_save_mesh::title(k),
         Kind::ViewDxf { .. } => "Export Current View as DXF",
         Kind::ViewNavigator(_) => "CUSTOM VIEW NAVIGATOR",
         Kind::InsertDrawing(p) => crate::dialogs_insert_drawing::title(p),

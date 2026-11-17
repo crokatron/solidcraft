@@ -236,3 +236,44 @@ fn parasolid_rotated_placement_and_mesh_refusal() {
     let mesh = solidcraft_doc::ModelBody::new("Scan".into(), mesh, 2);
     assert!(crate::parasolid_out::export(&[&mesh]).unwrap_err().to_string().contains("scan mesh"));
 }
+
+#[test]
+fn parasolid_enclosed_cavity_export_keeps_void_shells() {
+    use solidcore_record::Vec3;
+    use solidcraft_kernel as k;
+    let outer = k::box_solid(Vec3::ZERO, Vec3::new(20., 20., 20.)).unwrap();
+    let tool = k::box_solid(Vec3::new(5., 5., 5.), Vec3::new(15., 15., 15.)).unwrap();
+    let hollow = k::boolean(&outer, &tool, k::BoolOp::Cut).unwrap().unwrap();
+    assert_eq!(hollow.record().shells.len(), 2);
+    let body = solidcraft_doc::ModelBody::new("Enclosed cavity".into(), hollow, 1);
+    let bytes = crate::parasolid_out::export(&[&body]).unwrap();
+    let imported = crate::step_import_feature(&bytes, "cavity.x_t").unwrap();
+    assert_eq!(imported.import.bodies.len(), 1);
+    let b = &imported.import.bodies[0];
+    assert!(b.closed);
+    let measured = k::measure(&b.body).unwrap();
+    assert!((measured.volume - 7000.).abs() < 1e-5, "{}", measured.volume);
+    assert_eq!(b.body.record().shells.len(), 2);
+    assert!(b.body.record().regions.iter().any(|r| r.void));
+}
+
+#[test]
+fn parasolid_two_enclosed_cavities_keep_separate_void_regions() {
+    use solidcore_record::Vec3;
+    use solidcraft_kernel as k;
+    let outer = k::box_solid(Vec3::ZERO, Vec3::new(30., 20., 20.)).unwrap();
+    let left = k::box_solid(Vec3::new(3., 5., 5.), Vec3::new(10., 15., 15.)).unwrap();
+    let right = k::box_solid(Vec3::new(20., 5., 5.), Vec3::new(27., 15., 15.)).unwrap();
+    let body = k::boolean(&outer, &left, k::BoolOp::Cut).unwrap().unwrap();
+    let body = k::boolean(&body, &right, k::BoolOp::Cut).unwrap().unwrap();
+    let body = solidcraft_doc::ModelBody::new("Two cavities".into(), body, 1);
+    let bytes = crate::parasolid_out::export(&[&body]).unwrap();
+    let imported = crate::step_import_feature(&bytes, "two-cavities.x_t").unwrap();
+    assert_eq!(imported.import.bodies.len(), 1);
+    let b = &imported.import.bodies[0];
+    assert!(b.closed);
+    let measured = k::measure(&b.body).unwrap();
+    assert!((measured.volume - 10600.).abs() < 1e-5, "{}", measured.volume);
+    assert_eq!(b.body.record().shells.len(), 3);
+    assert_eq!(b.body.record().regions.iter().filter(|r| r.void).count(), 2);
+}
